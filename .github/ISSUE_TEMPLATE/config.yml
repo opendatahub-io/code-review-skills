@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: code-review-skills documentation
+    url: https://github.com/opendatahub-io/code-review-skills
+    about: Plugin documentation and usage guide
+  - name: ai-helpers ecosystem
+    url: https://github.com/opendatahub-io/ai-helpers
+    about: The broader AI helpers ecosystem
