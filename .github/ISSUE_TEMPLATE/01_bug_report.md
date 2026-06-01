@@ -10,9 +10,9 @@ assignees: ''
 
 ### Affected Component
 <!-- Check all that apply -->
-- [ ] Code review skill (SKILL.md)
-- [ ] Review script (review.py)
-- [ ] Plugin metadata (plugin.json)
+- [ ] GitLab code review skill (`skills/gitlab-code-review`)
+- [ ] Review script (`review.py`)
+- [ ] Plugin metadata (`plugin.json`)
 - [ ] Documentation
 - [ ] CI/tooling
 

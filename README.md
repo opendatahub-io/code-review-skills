@@ -1,15 +1,15 @@
 # code-review-skills
 
-Claude Code plugin for AI-powered code review. Reviews GitLab MR diffs or local branch changes, produces structured feedback with inline comments, and posts results to GitLab or displays them in the terminal.
+Claude Code plugin for AI-powered code review of GitLab merge requests. Reviews MR diffs, produces structured feedback with inline comments, and posts results directly to the GitLab MR or displays them in the terminal for preview.
 
 ## Overview
 
-This plugin provides a `code-review` skill that:
+This plugin provides a `gitlab-code-review` skill that:
 
-- Reviews all commits since the base branch using git diffs
+- Reviews all commits in a GitLab MR since the base branch using git diffs
 - Produces structured JSON output with summary, positive aspects, and inline comments
-- Posts inline comments and a summary note to GitLab MRs (in CI)
-- Falls back to formatted terminal display when run locally
+- Posts inline comments and a summary note to the GitLab MR (in CI)
+- Falls back to formatted terminal display when run outside GitLab CI
 - Supports chill mode to filter suggestion-level comments
 - Deduplicates comments across review iterations
 
@@ -24,14 +24,14 @@ claude plugin install /path/to/code-review-skills
 
 Once installed, invoke the skill in Claude Code:
 
-```
-/code-review
+```text
+/gitlab-code-review
 ```
 
 Or with additional review instructions:
 
-```
-/code-review Focus on security and error handling
+```text
+/gitlab-code-review Focus on security and error handling
 ```
 
 ### Environment Variables
