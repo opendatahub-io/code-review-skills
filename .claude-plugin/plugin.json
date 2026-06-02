@@ -1,7 +1,7 @@
 {
   "name": "code-review-skills",
   "version": "0.1.0",
-  "description": "AI code review skill for GitLab MRs and local branches",
+  "description": "AI code review skill for GitLab merge requests",
   "author": { "name": "opendatahub-io" },
   "license": "Apache-2.0",
   "homepage": "https://github.com/opendatahub-io/code-review-skills"

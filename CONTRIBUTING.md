@@ -1,6 +1,6 @@
 # Contributing to code-review-skills
 
-Thank you for your interest in contributing to code-review-skills! This plugin provides AI code review for GitLab MRs and local branches.
+Thank you for your interest in contributing to code-review-skills! This plugin provides AI code review for GitLab merge requests.
 
 ## Getting Started
 
@@ -26,7 +26,7 @@ Read [CLAUDE.md](CLAUDE.md) for architecture details and conventions.
 
 ## Ways to Contribute
 
-- **Improve the code review skill** in `skills/code-review/`
+- **Improve the code review skill** in `skills/gitlab-code-review/`
 - **Add platform support** (e.g. GitHub PR posting)
 - **Fix a bug** or improve existing functionality
 - **Improve documentation**

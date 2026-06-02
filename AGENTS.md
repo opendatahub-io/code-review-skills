@@ -1,20 +1,20 @@
 # code-review-skills
 
-Claude Code plugin providing AI code review for GitLab MRs and local branches.
+Claude Code plugin providing AI code review for GitLab merge requests.
 
 ## Repository Structure
 
-```
+```text
 .claude-plugin/plugin.json   Plugin packaging metadata
 skills/                      Skill directories (each contains SKILL.md + scripts/)
-  code-review/               AI code review skill
+  gitlab-code-review/        GitLab code review skill
     SKILL.md                 Skill definition and review instructions
     scripts/review.py        Review posting and display script
 ```
 
 ## Architecture
 
-This plugin provides a single skill (`code-review`) that performs structured AI code review.
+This plugin provides a single skill (`gitlab-code-review`) that performs structured AI code review of GitLab merge requests.
 
 **SKILL.md** is the orchestrator: it instructs the agent to review the git diff, produce structured JSON output, and invoke the posting script.
 

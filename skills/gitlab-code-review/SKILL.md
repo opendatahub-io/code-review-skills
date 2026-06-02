@@ -1,10 +1,11 @@
 ---
-name: code-review
+name: gitlab-code-review
 description: >
-  Perform AI code review on a GitLab MR or local branch. Reviews all commits
-  since the base branch, produces structured JSON feedback with inline comments,
-  and posts results to GitLab (CI) or displays them locally.
-  Use when asked to review code changes, do a code review, or run ai-review.
+  Perform AI code review on a GitLab merge request. Reviews all commits since
+  the base branch, produces structured JSON feedback with inline comments, and
+  posts results to the GitLab MR (in CI) or displays them locally for preview.
+  Use when asked to review a GitLab merge request, do a GitLab code review, or
+  run ai-review on a GitLab project.
 allowed-tools: Bash Read Grep Glob
 user-invocable: true
 argument-hint: "[additional review instructions]"
@@ -12,13 +13,13 @@ compatibility: Requires python3, uv, and git. For CI posting requires GITLAB_API
 metadata:
   author: ODH
   version: "1.0"
-  tags: code-review, gitlab, ci
+  tags: code-review, gitlab, ci, merge-request
 ---
 
-# AI Code Review
+# GitLab Code Review
 
 Perform a structured code review of the current branch's changes and post
-results to GitLab (in CI) or display them locally.
+results to a GitLab merge request (in CI) or display them locally for preview.
 
 ## Step 1: Review Code Changes
 
