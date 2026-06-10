@@ -23,17 +23,32 @@ results to a GitLab merge request (in CI) or display them locally for preview.
 
 ## Step 1: Review Code Changes
 
-Review ALL commits in the branch since the base branch. The git workspace is
-already checked out with the branch to review. Use git commands to inspect the
-changes — do NOT access remote APIs (e.g., `glab` commands).
+Review ALL commits in the branch since the base branch. Use git commands to
+inspect the changes — do NOT access remote APIs (e.g., `glab` commands).
+
+**IMPORTANT**: In CI, always use `$CI_MERGE_REQUEST_DIFF_BASE_SHA` and
+`$CI_COMMIT_SHA` to define the diff range. Never use `origin/main..HEAD` in
+CI because the checkout may leave HEAD detached at the target branch tip,
+producing an empty diff. The CI variables point to the exact commits that
+define the MR diff. Fall back to `origin/main..HEAD` only for local runs.
 
 ```bash
-git log --oneline origin/main..HEAD
-git diff origin/main..HEAD
+# Set the diff range — CI variables are authoritative when present
+if [ -n "$CI_MERGE_REQUEST_DIFF_BASE_SHA" ] && [ -n "$CI_COMMIT_SHA" ]; then
+  BASE="$CI_MERGE_REQUEST_DIFF_BASE_SHA"
+  HEAD_REF="$CI_COMMIT_SHA"
+else
+  BASE="origin/main"  # adjust if default branch differs (e.g., master, develop)
+  HEAD_REF="HEAD"
+fi
 ```
 
-Adjust the base branch name if different from `main` (e.g., `master`, `develop`).
-In CI, `$CI_MERGE_REQUEST_DIFF_BASE_SHA` identifies the exact base commit.
+Use `$BASE` and `$HEAD_REF` for all git commands:
+
+```bash
+git log --oneline ${BASE}..${HEAD_REF}
+git diff ${BASE}..${HEAD_REF}
+```
 
 **Only review the committed diff between branches.** Do NOT run `git status`,
 do NOT report on untracked files, and do NOT include uncommitted working-tree
