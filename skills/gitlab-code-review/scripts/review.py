@@ -650,7 +650,7 @@ def _gitlab_post(args: argparse.Namespace) -> None:
         _gitlab_delete_previous_discussions(session, api_base, verbose=verbose)
 
         inline = data.get("inline_comments", [])
-        posted = 0
+        posted_comments: list[dict[str, Any]] = []
         failed = 0
 
         if inline:
@@ -671,14 +671,19 @@ def _gitlab_post(args: argparse.Namespace) -> None:
                     start_sha,
                     verbose=verbose,
                 ):
-                    posted += 1
+                    posted_comments.append(c)
                 else:
                     failed += 1
 
-            _success(f"Posted {posted}/{len(inline)} inline comments ({failed} failed)")
+            _success(
+                f"Posted {len(posted_comments)}/{len(inline)} inline comments ({failed} failed)"
+            )
         else:
             _step("No inline comments to post")
 
+        data["inline_comments"] = posted_comments
+        if failed > 0:
+            data.pop("fix_prompt", None)
         summary_body = _gitlab_build_summary_body(data, review_marker, job_name, job_url)
         if _gitlab_upsert_summary_note(session, api_base, summary_body, verbose=verbose):
             _success(f"Summary posted to merge request !{mr_iid}")
@@ -687,7 +692,7 @@ def _gitlab_post(args: argparse.Namespace) -> None:
             sys.exit(1)
 
         if failed > 0:
-            _error(f"{failed}/{len(inline)} inline comments failed to post")
+            _error(f"{failed}/{len(posted_comments) + failed} inline comments failed to post")
             sys.exit(1)
     except requests.exceptions.HTTPError as e:
         _error(f"GitLab API error: {e}")
