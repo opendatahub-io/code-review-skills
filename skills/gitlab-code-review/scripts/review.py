@@ -681,7 +681,9 @@ def _gitlab_post(args: argparse.Namespace) -> None:
         else:
             _step("No inline comments to post")
 
+        # Rebuild inline_comments so the summary counts only what's visible on the MR.
         data["inline_comments"] = posted_comments
+        # Drop fix_prompt when it would reference findings the reviewer can't see.
         if failed > 0:
             data.pop("fix_prompt", None)
         summary_body = _gitlab_build_summary_body(data, review_marker, job_name, job_url)
