@@ -10,8 +10,9 @@ AI code review comment manager.
 Post, update, and display AI-generated code review results on GitLab MRs.
 
 Subcommands:
-  post     Post review as inline comments + summary to a GitLab MR
-  display  Display review results in the terminal
+  post               Post review as inline comments + summary to a GitLab MR
+  display            Display review results in the terminal
+  suggest-reviewers  Suggest reviewers based on git history of modified files
 
 Environment variables (for 'post' with GitLab):
   GITLAB_API_TOKEN              GitLab Personal Access Token (required)
@@ -28,6 +29,7 @@ Environment variables (for 'post' with GitLab):
 Usage:
   review.py post review.json [--chill|--no-chill] [--verbose]
   review.py display review.json [--chill|--no-chill]
+  review.py suggest-reviewers [--verbose]
 """
 
 from __future__ import annotations
@@ -267,15 +269,10 @@ def _display_review(data: dict[str, Any]) -> None:
 def _detect_platform() -> str:
     """Detect the CI platform from environment variables.
 
-    Returns 'gitlab', 'github', or 'local'.
+    Returns 'gitlab' or 'local'.
     """
     if os.environ.get("CI_MERGE_REQUEST_IID") and os.environ.get("CI"):
         return "gitlab"
-    if (
-        os.environ.get("GITHUB_PULL_REQUEST_NUMBER")
-        or os.environ.get("GITHUB_EVENT_NAME") == "pull_request"
-    ):
-        return "github"
     return "local"
 
 
@@ -702,16 +699,235 @@ def _gitlab_post(args: argparse.Namespace) -> None:
 
 
 # ===========================================================================
-# GitHub backend (not yet implemented)
+# Suggest reviewers
 # ===========================================================================
 
+AI_REVIEW_REVIEWERS_MARKER = "<!-- ai-review-reviewers -->"
 
-def _github_post(args: argparse.Namespace) -> None:
-    """Post review results to a GitHub PR (not yet implemented)."""
-    _error("GitHub support is not yet implemented.")
-    _error("Currently only GitLab is supported for posting reviews.")
-    _error("Use 'display' to view review results locally instead.")
-    sys.exit(1)
+_FILES_PER_GRAPHQL_BATCH = 20
+_MAX_SUGGESTED_REVIEWERS = 5
+_BOT_USERNAME_SUFFIXES = ("_bot", "-bot", "[bot]")
+
+
+def graphql_query(
+    session: requests.Session, gitlab_url: str, query: str, variables: dict[str, Any]
+) -> dict[str, Any]:
+    """Execute a GitLab GraphQL query."""
+    resp = session.post(
+        f"{gitlab_url}/api/graphql",
+        json={"query": query, "variables": variables},
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if "errors" in data:
+        error_msgs = "; ".join(e.get("message", "") for e in data["errors"])
+        _warning(f"GraphQL errors: {error_msgs}")
+    return data
+
+
+def get_modified_files(base_sha: str, head_sha: str) -> list[str]:
+    """Get files modified in the MR, excluding deleted files."""
+    try:
+        output = subprocess.check_output(
+            ["git", "diff", "--name-only", "--diff-filter=d", f"{base_sha}..{head_sha}"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        _error("Failed to get modified files from git diff")
+        return []
+    return [f for f in output.strip().split("\n") if f]
+
+
+def get_file_authors(
+    session: requests.Session,
+    gitlab_url: str,
+    project_path: str,
+    files: list[str],
+    ref: str,
+) -> dict[str, dict[str, Any]]:
+    """Query GitLab GraphQL for commit authors on each file.
+
+    Returns {username: {"name": str, "commit_count": int, "state": str}}.
+    """
+    authors: dict[str, dict[str, Any]] = {}
+
+    for batch_start in range(0, len(files), _FILES_PER_GRAPHQL_BATCH):
+        batch = files[batch_start : batch_start + _FILES_PER_GRAPHQL_BATCH]
+
+        alias_fragments = []
+        for i, filepath in enumerate(batch):
+            escaped = filepath.replace("\\", "\\\\").replace('"', '\\"')
+            alias_fragments.append(
+                f'file{i}: commits(ref: $ref, path: "{escaped}", first: 50) {{\n'
+                f"  nodes {{ author {{ username name state }} }}\n"
+                f"}}"
+            )
+
+        query = (
+            "query($projectPath: ID!, $ref: String!) {\n"
+            "  project(fullPath: $projectPath) {\n"
+            "    repository {\n"
+            "      " + "\n      ".join(alias_fragments) + "\n"
+            "    }\n"
+            "  }\n"
+            "}"
+        )
+
+        result = graphql_query(
+            session, gitlab_url, query, {"projectPath": project_path, "ref": ref}
+        )
+        repo_data = result.get("data", {}).get("project", {}).get("repository", {})
+
+        for i in range(len(batch)):
+            commits = repo_data.get(f"file{i}", {}).get("nodes", [])
+            for commit in commits:
+                author = commit.get("author")
+                if not author or not author.get("username"):
+                    continue
+                username = author["username"]
+                if username not in authors:
+                    authors[username] = {
+                        "name": author.get("name", username),
+                        "commit_count": 0,
+                        "state": author.get("state", "unknown"),
+                    }
+                authors[username]["commit_count"] += 1
+
+    return authors
+
+
+def get_mr_author(
+    session: requests.Session, gitlab_url: str, project_path: str, mr_iid: str
+) -> str | None:
+    """Get the MR author's username via GraphQL."""
+    query = """
+    query($projectPath: ID!, $mrIid: String!) {
+      project(fullPath: $projectPath) {
+        mergeRequest(iid: $mrIid) {
+          author { username }
+        }
+      }
+    }
+    """
+    result = graphql_query(
+        session, gitlab_url, query, {"projectPath": project_path, "mrIid": mr_iid}
+    )
+    mr = result.get("data", {}).get("project", {}).get("mergeRequest")
+    if mr and mr.get("author"):
+        return mr["author"]["username"]
+    return None
+
+
+def build_reviewer_comment(reviewers: list[dict[str, Any]]) -> str:
+    """Format the reviewer suggestion MR note body."""
+    lines = ["## Suggested Reviewers", ""]
+    lines.append(
+        "The following users have recently contributed to the files modified "
+        "in this MR and may be well-suited to review these changes:"
+    )
+    lines.append("")
+    lines.append("| Reviewer | Commits on modified files |")
+    lines.append("|----------|--------------------------|")
+    for r in reviewers:
+        lines.append(f"| @{r['username']} | {r['commit_count']} |")
+    lines.append("")
+
+    mentions = " ".join(f"@{r['username']}" for r in reviewers)
+    lines.append(f"{mentions} — please consider reviewing this merge request.")
+    lines.append("")
+    lines.append(AI_REVIEW_REVIEWERS_MARKER)
+    return "\n".join(lines)
+
+
+def gitlab_has_reviewer_suggestion(session: requests.Session, api_base: str) -> bool:
+    """Check whether a reviewer suggestion note already exists on the MR."""
+    for note in _gitlab_paginated_get(session, f"{api_base}/notes"):
+        if note.get("position") is not None:
+            continue
+        if AI_REVIEW_REVIEWERS_MARKER in note.get("body", ""):
+            return True
+    return False
+
+
+def cmd_suggest_reviewers(args: argparse.Namespace) -> None:
+    """Identify and suggest reviewers for the MR based on git history."""
+    token = os.environ.get("GITLAB_API_TOKEN")
+    if not token:
+        _error("GITLAB_API_TOKEN environment variable is required")
+        sys.exit(1)
+
+    project_path = os.environ.get("CI_PROJECT_PATH")
+    project_id = os.environ.get("CI_PROJECT_ID")
+    mr_iid = os.environ.get("CI_MERGE_REQUEST_IID")
+    base_sha = os.environ.get("CI_MERGE_REQUEST_DIFF_BASE_SHA")
+    head_sha = os.environ.get("CI_COMMIT_SHA")
+
+    if not all([project_path, project_id, mr_iid, base_sha, head_sha]):
+        _error(
+            "Missing required CI variables: CI_PROJECT_PATH, CI_PROJECT_ID, "
+            "CI_MERGE_REQUEST_IID, CI_MERGE_REQUEST_DIFF_BASE_SHA, CI_COMMIT_SHA"
+        )
+        sys.exit(1)
+
+    gitlab_url = os.environ.get("CI_SERVER_URL", "https://gitlab.com").rstrip("/")
+    verbose = _resolve_verbose(args)
+
+    session = _SafeSession()
+    session.headers.update({"PRIVATE-TOKEN": token})
+
+    api_base = f"{gitlab_url}/api/v4/projects/{project_id}/merge_requests/{mr_iid}"
+
+    if gitlab_has_reviewer_suggestion(session, api_base):
+        _success("Reviewers already requested, skipping")
+        return
+
+    _step("Getting modified files...")
+    files = get_modified_files(base_sha, head_sha)
+    if not files:
+        _step("No modified files found, skipping reviewer suggestion")
+        return
+    _step(f"Found {len(files)} modified file(s)")
+
+    _step("Querying git history for file authors...")
+    authors = get_file_authors(session, gitlab_url, project_path, files, "HEAD")
+
+    if not authors:
+        _step("No file authors found, skipping reviewer suggestion")
+        return
+
+    mr_author = get_mr_author(session, gitlab_url, project_path, mr_iid)
+    _step(f"MR author: @{mr_author}" if mr_author else "Could not determine MR author")
+
+    reviewers = []
+    for username, info in authors.items():
+        if mr_author and username == mr_author:
+            continue
+        if info["state"] != "active":
+            continue
+        if any(username.endswith(suffix) for suffix in _BOT_USERNAME_SUFFIXES):
+            continue
+        reviewers.append({"username": username, **info})
+
+    reviewers.sort(key=lambda r: r["commit_count"], reverse=True)
+    reviewers = reviewers[:_MAX_SUGGESTED_REVIEWERS]
+
+    if not reviewers:
+        _step("No suitable reviewers found after filtering")
+        return
+
+    _step(f"Suggesting {len(reviewers)} reviewer(s)")
+    comment_body = build_reviewer_comment(reviewers)
+
+    _step(f"Posting reviewer suggestion to MR !{mr_iid}...")
+    resp = session.post(f"{api_base}/notes", json={"body": comment_body})
+    if 200 <= resp.status_code < 300:
+        _success(f"Reviewer suggestion posted to MR !{mr_iid}")
+    else:
+        _error(f"Failed to post reviewer suggestion (HTTP {resp.status_code})")
+        if verbose:
+            print(resp.text, file=sys.stderr)
+        sys.exit(1)
 
 
 # ---------------------------------------------------------------------------
@@ -742,8 +958,6 @@ def cmd_post(args: argparse.Namespace) -> None:
 
     if platform == "gitlab":
         _gitlab_post(args)
-    elif platform == "github":
-        _github_post(args)
     else:
         _step("No CI platform detected — displaying review locally.")
         cmd_display(args)
@@ -799,6 +1013,12 @@ def main() -> None:
     display_parser = subparsers.add_parser("display", help="Display review in terminal")
     _add_common_args(display_parser)
     display_parser.set_defaults(func=cmd_display)
+
+    suggest_parser = subparsers.add_parser(
+        "suggest-reviewers", help="Suggest reviewers based on git history"
+    )
+    suggest_parser.add_argument("--verbose", action="store_true", help="Verbose output")
+    suggest_parser.set_defaults(func=cmd_suggest_reviewers)
 
     args = parser.parse_args()
     args.func(args)
