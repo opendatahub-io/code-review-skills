@@ -142,6 +142,20 @@ The script auto-detects the platform (GitLab CI, GitHub, or local) and handles:
 If the script reports a JSON parse error, fix the JSON in
 `/tmp/ai-review-output.json` and re-run the command.
 
+## Step 3.5: Suggest Reviewers (Optional)
+
+If the `$SUGGEST_REVIEWERS` environment variable is set to `"true"`, run:
+
+```bash
+./scripts/review.py suggest-reviewers
+```
+
+This identifies potential reviewers based on git history of the modified files
+and posts a separate comment on the MR tagging them. It uses the GitLab GraphQL
+API to resolve git commit authors to GitLab usernames.
+
+If the script fails, report the error but continue to Step 4.
+
 ## Step 4: Report Results
 
 After the script completes successfully:
@@ -171,6 +185,7 @@ set automatically — no manual configuration needed.
 | `CI_MERGE_REQUEST_IID` | CI/MR | — | Merge request IID |
 | `CI_MERGE_REQUEST_DIFF_BASE_SHA` | CI/MR | — | Base SHA for diff positioning |
 | `CI_COMMIT_SHA` | CI/MR | — | Head commit SHA |
+| `CI_PROJECT_PATH` | suggest-reviewers | — | Full project path for GraphQL queries |
 | `CI_JOB_NAME` | — | `ai-review` | Job name for summary footer |
 | `CI_JOB_URL` | — | `#` | Job URL for summary footer |
 
@@ -180,3 +195,4 @@ set automatically — no manual configuration needed.
 |----------|-------------|---------|-------------|
 | `CHILL_MODE` | — | `true` | Filter out suggestion-level comments |
 | `VERBOSE` | — | `false` | Show detailed API error responses |
+| `SUGGEST_REVIEWERS` | — | `false` | Suggest reviewers based on git history |
