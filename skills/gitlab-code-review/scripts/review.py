@@ -739,17 +739,46 @@ def get_modified_files(base_sha: str, head_sha: str) -> list[str]:
     return [f for f in output.strip().split("\n") if f]
 
 
+def get_ignored_shas() -> set[str]:
+    """Read commit SHAs to ignore from .git-blame-ignore-revs at the repo root."""
+    try:
+        toplevel = subprocess.check_output(
+            ["git", "rev-parse", "--show-toplevel"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return set()
+
+    ignore_file = Path(toplevel) / ".git-blame-ignore-revs"
+    if not ignore_file.is_file():
+        return set()
+
+    shas = set()
+    for line in ignore_file.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        shas.add(line.lower())
+    return shas
+
+
 def get_file_authors(
     session: requests.Session,
     gitlab_url: str,
     project_path: str,
     files: list[str],
     ref: str,
+    ignored_shas: set[str] | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Query GitLab GraphQL for commit authors on each file.
 
+    Commits whose SHA matches an entry in ignored_shas (as read from
+    .git-blame-ignore-revs) are excluded from authorship counts.
+
     Returns {username: {"name": str, "commit_count": int, "state": str}}.
     """
+    ignored_shas = ignored_shas or set()
     authors: dict[str, dict[str, Any]] = {}
 
     for batch_start in range(0, len(files), _FILES_PER_GRAPHQL_BATCH):
@@ -760,7 +789,7 @@ def get_file_authors(
             escaped = filepath.replace("\\", "\\\\").replace('"', '\\"')
             alias_fragments.append(
                 f'file{i}: commits(ref: $ref, path: "{escaped}", first: 50) {{\n'
-                f"  nodes {{ author {{ username name state }} }}\n"
+                f"  nodes {{ sha author {{ username name state }} }}\n"
                 f"}}"
             )
 
@@ -782,6 +811,9 @@ def get_file_authors(
         for i in range(len(batch)):
             commits = repo_data.get(f"file{i}", {}).get("nodes", [])
             for commit in commits:
+                sha = commit.get("sha", "")
+                if sha and sha.lower() in ignored_shas:
+                    continue
                 author = commit.get("author")
                 if not author or not author.get("username"):
                     continue
@@ -889,8 +921,12 @@ def cmd_suggest_reviewers(args: argparse.Namespace) -> None:
         return
     _step(f"Found {len(files)} modified file(s)")
 
+    ignored_shas = get_ignored_shas()
+    if ignored_shas:
+        _step(f"Ignoring {len(ignored_shas)} commit(s) listed in .git-blame-ignore-revs")
+
     _step("Querying git history for file authors...")
-    authors = get_file_authors(session, gitlab_url, project_path, files, "HEAD")
+    authors = get_file_authors(session, gitlab_url, project_path, files, "HEAD", ignored_shas)
 
     if not authors:
         _step("No file authors found, skipping reviewer suggestion")

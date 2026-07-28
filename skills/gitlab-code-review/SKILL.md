@@ -154,6 +154,10 @@ This identifies potential reviewers based on git history of the modified files
 and posts a separate comment on the MR tagging them. It uses the GitLab GraphQL
 API to resolve git commit authors to GitLab usernames.
 
+If a `.git-blame-ignore-revs` file exists at the repo root, commits listed in
+it are excluded from authorship counts, the same way `git blame
+--ignore-revs-file` would treat them.
+
 If the script fails, report the error but continue to Step 4.
 
 ## Step 4: Report Results
