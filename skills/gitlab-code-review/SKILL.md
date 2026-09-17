@@ -87,7 +87,12 @@ The JSON **must** be a valid object matching this schema exactly:
       "file": "path/to/file (relative to repo root)",
       "line": 42,
       "severity": "critical|major|minor|suggestion",
-      "comment": "Description of the issue and suggested fix (markdown allowed inside this string)"
+      "comment": "Description of the issue and suggested fix (markdown allowed inside this string)",
+      "fix": {
+        "start_line": 42,
+        "end_line": 42,
+        "code": "Optional: exact replacement for lines start_line..end_line (whole lines, new file numbering)"
+      }
     }
   ],
   "fix_prompt": "Optional: a copy-paste prompt to fix all issues found. Omit this field if there are no actionable fixes."
@@ -108,6 +113,46 @@ The JSON **must** be a valid object matching this schema exactly:
   - **suggestion**: Optional improvements for code quality
 - Each comment should be self-contained and actionable.
 - If there are no inline issues to report, use an empty array `[]`.
+
+### Applicable fix rules (`fix`)
+
+When a finding has a small, unambiguous code fix, attach a `fix` object. The
+posting script turns it into a GitLab
+[suggestion](https://docs.gitlab.com/user/project/merge_requests/reviews/suggestions/)
+that the MR author applies with one click, so the replacement must be exact.
+
+- `fix` is optional. Omit it for design-level findings, findings that need
+  changes in several places, or whenever you are not certain the replacement
+  is complete and correct in context.
+- `start_line` and `end_line` are inclusive line numbers in the NEW version of
+  the file, and `line` must fall inside that range. Use `start_line ==
+  end_line == line` for a one-line replacement.
+- `code` replaces the whole lines `start_line..end_line`. Copy the exact
+  indentation (tabs vs spaces) from the file. Do not include diff markers
+  (`+`/`-`), line numbers, or a code fence. Do not include a trailing newline.
+- An empty `code` string deletes the range.
+- Keep it small: a few lines, never more than about 20. The script drops
+  ranges above 50 lines, ranges outside the file, and replacements identical
+  to the current code, and posts the comment as prose instead.
+- The `comment` text must still explain the change; the suggestion block is
+  appended after it, not instead of it.
+
+Example: the diff adds an `else:` at line 74 that should only run when the
+wheel is absent from the target set.
+
+```json
+{
+  "file": "src/pulp_qualify_wheels.py",
+  "line": 74,
+  "severity": "major",
+  "comment": "Only record a QA failure when the wheel is also absent from production; otherwise an already-published dependency blocks its promotion unit.",
+  "fix": {
+    "start_line": 74,
+    "end_line": 74,
+    "code": "            elif wheel not in target_wheel_set:"
+  }
+}
+```
 
 ### Summary rules
 
@@ -134,6 +179,8 @@ Execute it directly (not via `python`) to invoke uv via the shebang:
 The script auto-detects the platform (GitLab CI, GitHub, or local) and handles:
 
 - JSON validation and chill-mode filtering (controlled by `$CHILL_MODE` env var)
+- Rendering `fix` objects as applicable GitLab suggestions (disabled when
+  `$INLINE_FIXES` is `false`)
 - Deduplication against previous reviews (skips comments on unchanged code)
 - Deleting previous AI review discussions on the MR (GitLab)
 - Posting inline comments and a summary note to the MR (GitLab)
@@ -171,6 +218,7 @@ After the script completes successfully:
 ## Gotchas
 
 - Line numbers in `inline_comments` must reference the NEW file version, not the old one; using old-side line numbers causes comments to land on the wrong line in GitLab.
+- A `fix` replaces whole lines. Partial-line edits, wrong indentation, or a range that does not contain `line` produce a suggestion that breaks the file when applied, or get dropped by the script.
 - The JSON output must be strict JSON (no trailing commas, no comments). Invalid JSON will cause the posting script to fail.
 - Running `git status` or reviewing uncommitted changes will produce false findings that are not part of the MR diff.
 
@@ -198,5 +246,6 @@ set automatically — no manual configuration needed.
 | Variable | Required for | Default | Description |
 |----------|-------------|---------|-------------|
 | `CHILL_MODE` | — | `true` | Filter out suggestion-level comments |
+| `INLINE_FIXES` | — | `true` | Render `fix` objects as applicable GitLab suggestions |
 | `VERBOSE` | — | `false` | Show detailed API error responses |
 | `SUGGEST_REVIEWERS` | — | `false` | Suggest reviewers based on git history |
