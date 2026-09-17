@@ -24,11 +24,13 @@ Environment variables (for 'post' with GitLab):
   CI_JOB_NAME                   Job name for footer (optional)
   CI_JOB_URL                    Job URL for footer (optional)
   CHILL_MODE                    Filter suggestion-level comments (default: true)
+  INLINE_FIXES                  Post GitLab applicable suggestions from
+                                inline_comments[].fix (default: true)
   VERBOSE                       Enable verbose output (default: false)
 
 Usage:
-  review.py post review.json [--chill|--no-chill] [--verbose]
-  review.py display review.json [--chill|--no-chill]
+  review.py post review.json [--chill|--no-chill] [--inline-fixes|--no-inline-fixes] [--verbose]
+  review.py display review.json [--chill|--no-chill] [--inline-fixes|--no-inline-fixes]
   review.py suggest-reviewers [--verbose]
 """
 
@@ -61,6 +63,11 @@ SEVERITY_ICONS = {
 
 SEVERITY_ORDER = ["critical", "major", "minor", "suggestion"]
 _VALID_SEVERITIES = frozenset(SEVERITY_ORDER)
+
+# Upper bound on the number of lines a single applicable suggestion may replace.
+# GitLab caps multi-line suggestions; anything this large is unlikely to be a
+# safe one-click fix anyway.
+_FIX_MAX_LINES = 50
 _API_TIMEOUT = 30
 
 _RED = "\033[0;31m"
@@ -96,8 +103,15 @@ def _header(msg: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def parse_review_json(filepath: str, chill_mode: bool = True) -> dict[str, Any]:
-    """Parse, validate, and optionally filter review JSON from a file."""
+def parse_review_json(
+    filepath: str, chill_mode: bool = True, inline_fixes: bool = True
+) -> dict[str, Any]:
+    """Parse, validate, and optionally filter review JSON from a file.
+
+    Structural errors in required fields raise ValueError so the agent can
+    repair the JSON. A malformed optional ``fix`` object never fails the
+    review: it is dropped with a warning and the comment posts as prose.
+    """
     raw = Path(filepath).read_text(encoding="utf-8", errors="replace").strip()
 
     m = re.search(r"`{3,}(?:json)?\s*\n(.+?)\s*`{3,}", raw, re.DOTALL)
@@ -135,6 +149,12 @@ def parse_review_json(filepath: str, chill_mode: bool = True) -> dict[str, Any]:
                 f"inline_comments[{i}].severity: expected one of "
                 f"{sorted(_VALID_SEVERITIES)}, got {sev!r}"
             )
+        if "fix" in c:
+            problem = _validate_fix(c["fix"], c["line"])
+            if problem or not inline_fixes:
+                if problem:
+                    _warning(f"inline_comments[{i}].fix dropped: {problem}")
+                del c["fix"]
 
     if chill_mode:
         before = len(data["inline_comments"])
@@ -146,6 +166,89 @@ def parse_review_json(filepath: str, chill_mode: bool = True) -> dict[str, Any]:
             _step(f"Chill mode: filtered out {filtered} suggestion(s)")
 
     return data
+
+
+# ---------------------------------------------------------------------------
+# Applicable fixes (GitLab suggestion blocks)
+# ---------------------------------------------------------------------------
+
+
+def _validate_fix(fix: Any, line: int) -> str | None:
+    """Return a reason to drop ``fix``, or None when it is structurally sound.
+
+    ``fix`` replaces whole lines ``start_line..end_line`` (inclusive, new file
+    numbering) with ``code``. The anchored comment ``line`` must fall inside
+    that range because GitLab expresses suggestions as offsets from the note.
+    An empty ``code`` string deletes the range.
+    """
+    if not isinstance(fix, dict):
+        return f"expected object, got {type(fix).__name__}"
+    for key in ("start_line", "end_line"):
+        val = fix.get(key)
+        if not isinstance(val, int) or isinstance(val, bool) or val <= 0:
+            return f"{key}: expected positive int, got {val!r}"
+    code = fix.get("code")
+    if not isinstance(code, str):
+        return f"code: expected str, got {type(code).__name__}"
+    start, end = fix["start_line"], fix["end_line"]
+    if start > end:
+        return f"start_line {start} is after end_line {end}"
+    if not start <= line <= end:
+        return f"comment line {line} is outside fix range {start}-{end}"
+    if end - start + 1 > _FIX_MAX_LINES:
+        return f"range spans {end - start + 1} lines, limit is {_FIX_MAX_LINES}"
+    if "```" in code:
+        return "code contains a ``` fence, which would break the suggestion block"
+    return None
+
+
+def _format_fix_block(fix: dict[str, Any], line: int) -> str:
+    """Render ``fix`` as a GitLab ``suggestion`` fenced block anchored at ``line``."""
+    above = line - fix["start_line"]
+    below = fix["end_line"] - line
+    header = "```suggestion" if above == 0 and below == 0 else f"```suggestion:-{above}+{below}"
+    code = fix["code"].rstrip("\n")
+    if code:
+        return f"{header}\n{code}\n```"
+    return f"{header}\n```"
+
+
+def _verify_fix_against_head(
+    comment: dict[str, Any], head_sha: str, *, verbose: bool = False
+) -> None:
+    """Drop ``comment['fix']`` when it does not fit the file at ``head_sha``.
+
+    Keeps the fix when git is unavailable: GitLab rejects a bad range itself
+    and the comment still posts.
+    """
+    fix = comment.get("fix")
+    if not fix:
+        return
+    file_path = comment["file"]
+    try:
+        content = subprocess.check_output(
+            ["git", "show", f"{head_sha}:{file_path}"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        if verbose:
+            _warning(f"Could not read {file_path} at {head_sha[:8]}; keeping fix unverified")
+        return
+    lines = content.split("\n")
+    if content.endswith("\n"):
+        lines.pop()
+    if fix["end_line"] > len(lines):
+        _warning(
+            f"Dropping fix on {file_path}:{comment['line']}: "
+            f"end_line {fix['end_line']} exceeds file length {len(lines)}"
+        )
+        del comment["fix"]
+        return
+    current = "\n".join(lines[fix["start_line"] - 1 : fix["end_line"]])
+    if current == fix["code"].rstrip("\n"):
+        _warning(f"Dropping fix on {file_path}:{comment['line']}: replacement equals current code")
+        del comment["fix"]
 
 
 # ---------------------------------------------------------------------------
@@ -252,6 +355,12 @@ def _display_review(data: dict[str, Any]) -> None:
             print(f"  {icon} [{c['severity'].upper()}] {c['file']}:{c['line']}")
             for ln in c["comment"].split("\n"):
                 print(f"     {ln}")
+            fix = c.get("fix")
+            if fix:
+                span = f"{fix['start_line']}-{fix['end_line']}"
+                print(f"     Suggested replacement for lines {span}:")
+                for ln in fix["code"].rstrip("\n").split("\n"):
+                    print(f"     + {ln}")
             print()
 
     fix_prompt = data.get("fix_prompt")
@@ -566,6 +675,12 @@ def _gitlab_build_summary_body(
             if sev in severity_counts:
                 icon = SEVERITY_ICONS.get(sev, "")
                 parts.append(f"- {icon} {sev.capitalize()}: {severity_counts[sev]}")
+        fixes = sum(1 for c in inline if c.get("fix"))
+        if fixes:
+            parts.append(
+                f"- \U0001f6e0\ufe0f With applicable suggestion: {fixes} "
+                "(use **Apply suggestion** on the inline comment)"
+            )
         parts.append("\n*See inline comments on the diff for details.*")
 
     fix_prompt = data.get("fix_prompt")
@@ -624,9 +739,10 @@ def _gitlab_post(args: argparse.Namespace) -> None:
     job_url = os.environ.get("CI_JOB_URL")
     verbose = _resolve_verbose(args)
     chill = _resolve_chill(args)
+    inline_fixes = _resolve_inline_fixes(args)
 
     try:
-        data = parse_review_json(args.review_file, chill_mode=chill)
+        data = parse_review_json(args.review_file, chill_mode=chill, inline_fixes=inline_fixes)
     except (json.JSONDecodeError, ValueError) as e:
         _error(f"Failed to parse review JSON: {e}")
         sys.exit(1)
@@ -665,10 +781,12 @@ def _gitlab_post(args: argparse.Namespace) -> None:
         if inline:
             _step(f"Posting {len(inline)} inline comment(s) to MR !{mr_iid}...")
             for c in inline:
+                _verify_fix_against_head(c, head_sha, verbose=verbose)
                 icon = SEVERITY_ICONS.get(c["severity"], "\U0001f4ac")
-                comment_body = (
-                    f"{icon} **{c['severity'].capitalize()}**: {c['comment']}\n\n{review_marker}"
-                )
+                comment_body = f"{icon} **{c['severity'].capitalize()}**: {c['comment']}"
+                if c.get("fix"):
+                    comment_body += f"\n\n{_format_fix_block(c['fix'], c['line'])}"
+                comment_body += f"\n\n{review_marker}"
                 if _gitlab_post_inline_comment(
                     session,
                     api_base,
@@ -990,6 +1108,13 @@ def _resolve_chill(args: argparse.Namespace) -> bool:
     return os.environ.get("CHILL_MODE", "true").lower() == "true"
 
 
+def _resolve_inline_fixes(args: argparse.Namespace) -> bool:
+    """Resolve inline fixes: CLI flag > env var > default True."""
+    if getattr(args, "inline_fixes", None) is not None:
+        return args.inline_fixes
+    return os.environ.get("INLINE_FIXES", "true").lower() == "true"
+
+
 def _resolve_verbose(args: argparse.Namespace) -> bool:
     """Resolve verbose: CLI flag > env var > default False."""
     if getattr(args, "verbose", False):
@@ -1014,9 +1139,10 @@ def cmd_post(args: argparse.Namespace) -> None:
 def cmd_display(args: argparse.Namespace) -> None:
     """Display review results in terminal."""
     chill = _resolve_chill(args)
+    inline_fixes = _resolve_inline_fixes(args)
 
     try:
-        data = parse_review_json(args.review_file, chill_mode=chill)
+        data = parse_review_json(args.review_file, chill_mode=chill, inline_fixes=inline_fixes)
     except (json.JSONDecodeError, ValueError) as e:
         _error(f"Failed to parse review JSON: {e}")
         sys.exit(1)
@@ -1044,6 +1170,20 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
         action="store_false",
         dest="chill",
         help="Include suggestion-level comments",
+    )
+    fix_group = parser.add_mutually_exclusive_group()
+    fix_group.add_argument(
+        "--inline-fixes",
+        action="store_true",
+        default=None,
+        dest="inline_fixes",
+        help="Post applicable GitLab suggestions from inline_comments[].fix (default)",
+    )
+    fix_group.add_argument(
+        "--no-inline-fixes",
+        action="store_false",
+        dest="inline_fixes",
+        help="Drop inline_comments[].fix and post comments as prose only",
     )
 
 

@@ -26,5 +26,6 @@ This plugin provides a single skill (`gitlab-code-review`) that performs structu
 - Review output is written to `/tmp/ai-review-output.json` following a strict schema
 - The posting script is invoked directly (not via `python`) to use the uv shebang
 - `CHILL_MODE` (default: true) filters suggestion-level comments
+- `INLINE_FIXES` (default: true) renders optional `fix` objects as applicable GitLab suggestion blocks
 - Previous AI review discussions are deleted before posting new ones (GitLab)
 - Comments on unchanged code are deduplicated across review iterations
