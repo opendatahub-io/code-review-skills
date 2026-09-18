@@ -639,11 +639,26 @@ def _gitlab_upsert_summary_note(
     return False
 
 
+_AGENT_TOOL_HARNESS = {
+    "claude": "claude-code",
+    "claude-code": "claude-code",
+    "opencode": "opencode",
+    "codex": "codex",
+}
+
+
 def _detect_harness() -> str:
+    # agentic-ci exports AGENT_TOOL in every sandbox; prefer it over binary
+    # sniffing so images that bundle more than one CLI report the right one.
+    agent_tool = os.environ.get("AGENT_TOOL", "").strip().lower()
+    if agent_tool in _AGENT_TOOL_HARNESS:
+        return _AGENT_TOOL_HARNESS[agent_tool]
     if shutil.which("claude"):
         return "claude-code"
     if shutil.which("opencode"):
         return "opencode"
+    if shutil.which("codex"):
+        return "codex"
     return "unknown"
 
 
