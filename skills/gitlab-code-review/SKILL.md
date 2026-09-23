@@ -240,6 +240,8 @@ set automatically — no manual configuration needed.
 | `CI_PROJECT_PATH` | suggest-reviewers | — | Full project path for GraphQL queries |
 | `CI_JOB_NAME` | — | `ai-review` | Job name for summary footer |
 | `CI_JOB_URL` | — | `#` | Job URL for summary footer |
+| `AGENT_MODEL` | — | — | Model shown in the summary footer (set by agentic-ci) |
+| `AGENT_REASONING_EFFORT` | — | — | Reasoning effort shown in the summary footer (set by agentic-ci) |
 
 ### Common
 
