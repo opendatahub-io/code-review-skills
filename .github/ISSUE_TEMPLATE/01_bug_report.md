@@ -12,6 +12,9 @@ assignees: ''
 <!-- Check all that apply -->
 - [ ] GitLab code review skill (`skills/gitlab-code-review`)
 - [ ] Review script (`review.py`)
+- [ ] Review panel skill (`skills/code-review-panel`)
+- [ ] Panel script (`panel.py`)
+- [ ] Security diff review skill (`skills/security-diff-review`)
 - [ ] Plugin metadata (`plugin.json`)
 - [ ] Documentation
 - [ ] CI/tooling

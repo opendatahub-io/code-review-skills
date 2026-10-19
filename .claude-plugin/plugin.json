@@ -1,7 +1,7 @@
 {
   "name": "code-review-skills",
-  "version": "0.1.0",
-  "description": "AI code review skill for GitLab merge requests",
+  "version": "0.2.0",
+  "description": "AI code review skills: a GitLab MR reviewer, a risk-tiered review panel, and a security diff review",
   "author": { "name": "opendatahub-io" },
   "license": "Apache-2.0",
   "homepage": "https://github.com/opendatahub-io/code-review-skills"

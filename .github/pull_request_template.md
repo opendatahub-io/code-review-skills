@@ -18,7 +18,7 @@
 
 ### Required Checks
 - [ ] Ran `make lint` and all checks pass
-- [ ] Tested the new functionality locally with Claude Code
+- [ ] Tested the new functionality locally with Claude Code or Codex
 
 ### How to Test
 <!-- Describe how reviewers can test this change -->

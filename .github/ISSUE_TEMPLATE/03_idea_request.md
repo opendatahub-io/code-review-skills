@@ -1,6 +1,6 @@
 ---
 name: Idea
-about: Share an idea for the code review skill
+about: Share an idea for the code review skills
 title: '[Idea] '
 labels: ['enhancement', 'help wanted', 'idea']
 assignees: ''
