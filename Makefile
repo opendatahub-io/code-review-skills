@@ -41,4 +41,8 @@ lint: ## Run skillsaw, ruff, and shellcheck
 		exit 1; \
 	fi
 
+.PHONY: test
+test: ## Run the panel.py test suite
+	python3 -m unittest discover -s tests -t .
+
 .DEFAULT_GOAL := help

@@ -58,6 +58,13 @@ The `lint` target runs:
 - **ruff** checks and formats Python code
 - **shellcheck** lints shell scripts
 
+Then run the tests, which use the standard library only and build throwaway git repos (the
+GitLab JSON checks also need `uv`):
+
+```bash
+make test
+```
+
 ### Test Locally
 
 Check what the review panel would run on your branch, without starting any subagent:
@@ -85,6 +92,7 @@ codex
 1. **Run validation** before committing:
    ```bash
    make lint
+   make test
    ```
 2. **Commit your changes** with a clear, descriptive commit message.
 3. **Push to your fork** and open a Pull Request against `main`.
@@ -103,7 +111,7 @@ Example: `feat: add GitHub PR posting support`
 
 ## Pull Request Process
 
-1. **All PRs must pass CI checks**, including `make lint`.
+1. **All PRs must pass CI checks**, including `make lint` and `make test`.
 2. **Fill out the PR template completely**.
 3. **At least one maintainer review** is required before merging.
 4. **Keep PRs focused**: one logical change per PR.

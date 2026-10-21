@@ -92,6 +92,7 @@ Code owners tune the panel and the security review with a `REVIEW.md` file at th
 
 ```bash
 make lint
+make test
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the full development workflow.

@@ -20,6 +20,7 @@ skills/                      Skill directories (each contains SKILL.md, plus scr
     references/finder.md     Security finder persona
     references/filter.md     Exclusion rules (E1..), precedents (P1..), REVIEW.md grammar
     LICENSE-MIT              License of the adapted upstream text
+tests/                       unittest suite for panel.py (make test), run against throwaway git repos
 ```
 
 ## Architecture
@@ -42,6 +43,7 @@ The plugin provides three skills. Each SKILL.md orchestrates. Deterministic work
 - Bump the version in [.claude-plugin/plugin.json](.claude-plugin/plugin.json) on every skill change
 - Markdown code blocks for Python snippets and prompt text use `text` fences, not `python`, because ruff formats `python` blocks; shell commands may use `bash`
 - Each SKILL.md stays within 12,000 characters and each description within 800
+- A change to `panel.py` behavior comes with a test in `tests/`, which checks report.md's and skeptics.md's rules against the script; `make test` runs it on Python 3.10 and later
 
 ### gitlab-code-review
 
