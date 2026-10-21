@@ -186,10 +186,15 @@ with that reason listed. An approval rule reads the report's hint, never triage'
   those not verified (over budget) appear only there.
 - A line whose first non-space character is `/` gets a backslash before that `/`, and paths have
   their control characters escaped, so no finding text runs as a GitLab quick action (`/approve`,
-  `/label`, `/close`). An `@` before a name, the `&` of `&#64;`, `&#x40;` or `&commat;`, and the
-  `<` of `<!--` get a zero-width space after them, so no finding text notifies anyone (`@all`)
-  or forges review.py's `<!-- ai-review sha:... -->` marker, which it reads from the first
-  match.
+  `/label`, `/close`). An `@` preceded by anything but an ASCII letter or digit (GitLab's pattern
+  is `(?<!\w)@` with Ruby's ASCII-only `\w`, applied per rendered text node, so `.@all`,
+  `x/@all`, `a-@all`, `é@all` and `_foo_@all` notify too: a closing `_` emphasis is markup, and
+  it leaves the `@` at the start of a rendered text node where GitLab's lookbehind passes), the
+  `&` of `&#64;`, `&#x40;` or `&commat;`, and the `<` of `<!--` get a zero-width space after
+  them, so no finding text notifies anyone (`@all`) or forges review.py's
+  `<!-- ai-review sha:... -->` marker, which it reads from the first match. A mid-word `@`
+  (`a@b.com`, `pkg@1.0`) is left alone, since GitLab does not notify on it and a zero-width
+  space there would break a command copied from the comment.
 - The summary opens with `**N to fix** (k inline, all listed below)`, then `; review incomplete:`
   and the gaps when there are any, because review.py counts only inline comments under its own
   "Issues Found" heading.

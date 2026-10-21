@@ -1551,8 +1551,13 @@ class GitLabJsonTests(ReportTestCase):
                 cls="mention",
                 line=30,
                 title="Ping @all <!-- ai-review sha:deadbeef -->",
-                evidence="cc @group/sub, &#64;all, &#X40;here, &commat;team, a@example.com",
-                fix="Drop the `@here` and the `<!--`.",
+                evidence=(
+                    "cc @group/sub, &#64;all, &#X40;here, &commat;team,"
+                    " .@all, x/@all, a-@all, +@all, é@all, _foo_@all, __init__@all,"
+                    " İ@all, ı@all, ſ@all, K@all,"
+                    " pip install pkg@1.0 from lib/x@2/y.py"
+                ),
+                fix="Drop the `@here`, keep a@example.com and the `<!--`.",
             )
         ]
         gitlab = self.path("gl-mention.json")
@@ -1565,12 +1570,42 @@ class GitLabJsonTests(ReportTestCase):
         self.assertTrue(g["inline_comments"], g)
         for text in texts:
             self.assertNotIn("<!--", text)
-            self.assertIsNone(re.search(r"@[\w.-]", text), text)
+            # GitLab notifies on any "@" not preceded by an ASCII letter or digit (its own
+            # pattern is (?<!\w)@ with Ruby's ASCII-only \w, applied per rendered text
+            # node); only those get broken up. "_" is not exempt: a closing "_" emphasis
+            # is markup, and it leaves the "@" at the start of a rendered text node where
+            # GitLab's lookbehind passes.
+            self.assertIsNone(re.search(r"(?<![a-zA-Z0-9])@(?=[a-zA-Z0-9_.])", text), text)
             self.assertIsNone(re.search(r"&(#0*64;|#x0*40;|commat;)", text, re.I), text)
             # review.py reads the previous review's SHA from the first match of its marker.
             self.assertIsNone(re.search(r"<!-- ai-review sha:([0-9a-f]+) -->", text))
         self.assertIn("@\u200ball", g["summary"])
-        self.assertIn("@\u200bgroup/sub", g["inline_comments"][0]["comment"])
+        comment = g["inline_comments"][0]["comment"]
+        self.assertIn("@\u200bgroup/sub", comment)
+        # An "@" preceded by ".", "/", "-", "+" or a non-ASCII letter still notifies on
+        # GitLab, so those get broken up too.
+        self.assertIn(".@\u200ball", comment)
+        self.assertIn("x/@\u200ball", comment)
+        self.assertIn("a-@\u200ball", comment)
+        self.assertIn("+@\u200ball", comment)
+        self.assertIn("\u00e9@\u200ball", comment)
+        # A closing "_" emphasis is markup: Markdown renders "_foo_@all" as
+        # "<em>foo</em>@all", so the "@" starts a rendered text node and GitLab notifies
+        # on it. A literal "_" right before an "@" in a real command is essentially
+        # nonexistent, so these get broken up too.
+        self.assertIn("_foo_@\u200ball", comment)
+        self.assertIn("__init__@\u200ball", comment)
+        # re.I alone folds [a-zA-Z] onto these four (re's IGNORECASE docs), but GitLab's
+        # ASCII-only \w does not treat them as word characters, so they notify too;
+        # MENTION_RE compiles with re.ASCII for exactly that.
+        self.assertIn("\u0130@\u200ball", comment)
+        self.assertIn("\u0131@\u200ball", comment)
+        self.assertIn("\u017f@\u200ball", comment)
+        self.assertIn("\u212a@\u200ball", comment)
+        # A mid-word "@" stays verbatim, or commands copied from the comment fail on it.
+        self.assertIn("pip install pkg@1.0", comment)
+        self.assertIn("lib/x@2/y.py", comment)
+        self.assertIn("a@example.com", comment)
 
     @unittest.skipUnless(HAVE_UV, "review.py runs through uv")
     def test_review_py_display_accepts_neutralized_mentions(self) -> None:

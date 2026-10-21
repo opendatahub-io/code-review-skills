@@ -2864,8 +2864,19 @@ QUICK_ACTION_RE = re.compile(r"(^|[\r\n])([^\S\r\n]*)/")
 # "@name" notifies people ("@all" a whole project), and so does "&#64;name", which
 # Markdown turns into "@" first; "<!--" can open a fake "<!-- ai-review sha:... -->"
 # marker that review.py reads before its own. A zero-width space breaks each of them and
-# stays invisible, in code spans too.
-MENTION_RE = re.compile(r"@(?=[\w.-])|&(?=#0*64;|#x0*40;|commat;)", re.I)
+# stays invisible, in code spans too. GitLab's reference pattern is (?<!\w)@ with Ruby's
+# ASCII-only \w, applied per rendered text node, so an "@" preceded by anything but an
+# ASCII letter or digit notifies (".@all", "x/@all", "a-@all", "é@all" and "_foo_@all"
+# included — a closing "_" emphasis is markup, and it leaves the "@" at the start of a
+# rendered text node) and gets one; only a mid-word one ("a@b.com", "pkg@1.0",
+# "lib/x@2/y.py") must survive verbatim, or commands copied from the comment fail on it.
+# The lookahead mirrors GitLab's username start char ([a-zA-Z0-9_.]): "@é" or "@-x" is
+# not a username, so breaking it would only corrupt the text. re.ASCII because re.I
+# alone also folds [a-zA-Z] onto "İ", "ı", "ſ" and "K" (U+212A), which GitLab's
+# ASCII-only \w does not treat as word characters, so those would exempt the "@".
+MENTION_RE = re.compile(
+    r"(?<![a-zA-Z0-9])@(?=[a-zA-Z0-9_.])|&(?=#0*64;|#x0*40;|commat;)", re.I | re.ASCII
+)
 ZWSP = "\u200b"
 
 
