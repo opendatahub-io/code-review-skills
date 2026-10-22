@@ -507,7 +507,7 @@ def _gitlab_find_summary_note_ids(session: requests.Session, api_base: str) -> l
 def _gitlab_delete_previous_discussions(
     session: requests.Session, api_base: str, *, verbose: bool = False
 ) -> None:
-    """Delete previous AI review inline discussions on the MR."""
+    """Delete unresolved AI review discussions without human responses."""
     _step("Checking for previous AI review discussions to delete...")
 
     discussions = _gitlab_paginated_get(session, f"{api_base}/discussions")
@@ -528,6 +528,12 @@ def _gitlab_delete_previous_discussions(
         body = first_note.get("body", "")
         if not _is_ai_review_comment(body):
             continue
+        resolved_by = first_note.get("resolved_by")
+        if first_note.get("resolved") or (
+            isinstance(resolved_by, dict) and resolved_by and resolved_by.get("bot") is not True
+        ):
+            skipped += 1
+            continue
         human_replies = [
             n
             for n in notes[1:]
@@ -540,14 +546,14 @@ def _gitlab_delete_previous_discussions(
 
     if not to_delete:
         if skipped:
-            _step(f"Keeping {skipped} discussion(s) with human replies")
+            _step(f"Keeping {skipped} discussion(s) with replies or resolutions")
         else:
             _step("No previous AI review discussions found")
         return
 
     _step(f"Deleting {len(to_delete)} previous AI review discussion(s)...")
     if skipped:
-        _step(f"Keeping {skipped} discussion(s) with human replies")
+        _step(f"Keeping {skipped} discussion(s) with replies or resolutions")
 
     deleted = 0
     for disc_id, note_id in to_delete:

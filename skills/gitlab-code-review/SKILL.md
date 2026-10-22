@@ -182,7 +182,7 @@ The script auto-detects the platform (GitLab CI, GitHub, or local) and handles:
 - Rendering `fix` objects as applicable GitLab suggestions (disabled when
   `$INLINE_FIXES` is `false`)
 - Deduplication against previous reviews (skips comments on unchanged code)
-- Deleting previous AI review discussions on the MR (GitLab)
+- Deleting unresolved AI review discussions without human responses on the MR (GitLab)
 - Posting inline comments and a summary note to the MR (GitLab)
 - Falling back to formatted terminal display when no CI platform is detected
 
