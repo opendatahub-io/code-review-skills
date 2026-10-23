@@ -51,7 +51,7 @@ The plugin provides three skills. Each SKILL.md orchestrates. Deterministic work
 - The posting script is invoked directly (not via `python`) to use the uv shebang
 - `CHILL_MODE` (default: true) filters suggestion-level comments
 - `INLINE_FIXES` (default: true) renders optional `fix` objects as applicable GitLab suggestion blocks
-- Previous AI review discussions are deleted before posting new ones (GitLab)
+- Unresolved AI review discussions without human responses are deleted before posting new ones (GitLab)
 - Comments on unchanged code are deduplicated across review iterations
 
 ## Change Together
