@@ -21,6 +21,19 @@ metadata:
 Perform a structured code review of the current branch's changes and post
 results to a GitLab merge request (in CI) or display them locally for preview.
 
+## Unattended CI
+
+When `$CI` is set, there is no human to answer questions. Treat any action
+that repository instructions gate behind interactive confirmation as denied:
+do not perform it and do not ask for it. Being unable to ask never authorizes
+an action the repository withholds.
+
+A denied action is not a reason to abandon the review. Review whatever is
+reachable without it, name what was gated in the `summary` field so
+maintainers can pre-authorize it, and post as usual in Step 3. An empty
+`inline_comments` array is valid, so a fully blocked review still posts its
+summary.
+
 ## Step 1: Review Code Changes
 
 Review ALL commits in the branch since the base branch. Use git commands to
@@ -158,6 +171,7 @@ wheel is absent from the target set.
 
 - Keep it short (2-4 sentences). The inline comments carry the detail.
 - Mention the overall quality and any critical concerns.
+- If anything was skipped because it required interactive approval, say so here.
 
 ### Positive aspects rules
 
