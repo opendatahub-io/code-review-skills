@@ -58,5 +58,13 @@ class GitLabDiscussionCleanupTests(unittest.TestCase):
         )
 
 
+class GitLabSummaryBodyTests(unittest.TestCase):
+    def test_asks_for_reply_when_dismissing(self):
+        for data in ({"summary": "Clean."}, {"summary": "Issues.", "inline_comments": []}):
+            body = review._gitlab_build_summary_body(data, "<!-- ai-review -->")
+            self.assertIn("Reply with a short reason", body)
+            self.assertLess(body.index("Reply with a short reason"), body.index("\n---\n"))
+
+
 if __name__ == "__main__":
     unittest.main()
