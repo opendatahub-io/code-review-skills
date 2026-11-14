@@ -72,6 +72,11 @@ When referencing coding standards, security norms, best practices, or
 component-specific behavior, search for and cite the authoritative source
 (official documentation, RFCs, upstream references) to back up the claim.
 
+For changes to recovery, retries, persisted state, artifacts or budgets, apply
+[references/recovery-review.md](references/recovery-review.md) to the affected
+paths before producing the final review. After a correction, inspect the
+accumulated committed diff and sibling handlers as well as the reported line.
+
 ## Step 2: Produce Review JSON
 
 Write your review output as a JSON file at `/tmp/ai-review-output.json`.
