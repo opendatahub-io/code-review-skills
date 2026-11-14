@@ -89,6 +89,11 @@ The panel works because each judgment is independent; these rules keep it so in 
    changed paths, per-path specs, intent, each rule file's `show` command, settings block,
    ignored lines, known findings) and the sections that follow it. For security, paste
    finder.md, then filter.md (`security.filter`), then the brief with its security variant.
+   For correctness and testing finders in normal mode, also paste
+   [recovery-review.md](../gitlab-code-review/references/recovery-review.md),
+   applying it only to changed recovery, retry, persisted-state, artifact or budget
+   contracts and keeping each lens in its own lane. If the reference is missing,
+   stop and report an incomplete install.
    List a lens that fails, whose output you cannot parse, that reports a refused diff command,
    or whose answer says the review did not complete (security:
    `analysis_summary.review_completed` false), in `not_covered`.
