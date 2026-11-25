@@ -1,6 +1,6 @@
 # Contributing to code-review-skills
 
-Thank you for your interest in contributing to code-review-skills! This plugin provides agent skills for AI code review: a GitLab MR reviewer, a risk-tiered review panel and a security diff review.
+Thank you for your interest in contributing to code-review-skills! This plugin provides agent skills for AI code review: a GitLab MR reviewer, a GitHub PR reviewer with a composite GitHub Action, a risk-tiered review panel and a security diff review.
 
 ## Getting Started
 
@@ -21,8 +21,11 @@ Thank you for your interest in contributing to code-review-skills! This plugin p
 .claude-plugin/plugin.json   Plugin packaging metadata
 skills/                      Skill directories (SKILL.md, plus scripts/ or references/)
   gitlab-code-review/        Single-pass GitLab MR review (scripts/review.py)
+  github-code-review/        Single-pass GitHub PR review, run by the GitHub Action
   code-review-panel/         Risk-tiered review panel (references/lenses/, scripts/panel.py)
   security-diff-review/      Security-only diff review (references/finder.md, references/filter.md)
+action.yml                   Composite GitHub Action that reviews a pull request
+action/review-pr.sh          The action's steps, so shellcheck covers them
 ```
 
 Read [CLAUDE.md](CLAUDE.md) for architecture details and conventions.
@@ -32,7 +35,7 @@ Read [CLAUDE.md](CLAUDE.md) for architecture details and conventions.
 - **Improve a skill** in `skills/<name>/`
 - **Add a lens** to the review panel: write one persona in `skills/code-review-panel/references/lenses/<lens>.md` with the four headings `## Stance`, `## Grounding`, `## Checklist` and `## Output`, and add one `LENS_RULES` entry to `skills/code-review-panel/scripts/panel.py` with the lens's own path and content regexes. Add a path-category row to `panel.py` only when those paths should also change the tier, the approval hint, or whether a change counts as docs or tests only. `panel.py triage` exits 3 when the persona files and `LENS_RULES` disagree.
 - **Add a security rule** to `skills/security-diff-review/references/filter.md` under the next free id (E18 and up for exclusions, P14 and up for precedents). Keep existing ids as they are, and list a retired rule as retired: repos drop rules by id in their REVIEW.md. The ids differ from upstream's numbering: upstream printed 16 twice, so E15 covers regex injection and regex DoS (upstream 15 and the first 16), E16 is insecure documentation and E17 is audit logs. E10 is narrowed to safe code of a memory-safe language, and P13 is ours.
-- **Add platform support** (e.g. GitHub PR posting)
+- **Add platform support** (e.g. Gerrit or Bitbucket review posting)
 - **Fix a bug** or improve existing functionality
 - **Improve documentation**
 

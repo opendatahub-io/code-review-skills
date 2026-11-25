@@ -9,9 +9,9 @@ description: >
   reviewer subagent runs per lens, skeptic subagents verify each finding, and
   the ranked report blocks on security. Use when asked for a panel, multi-lens,
   verified or risk-tiered review, or a review that should block on security.
-  Not for a quick single-pass review, posting to a GitLab MR in CI
-  (gitlab-code-review), a security-only pass (security-diff-review), or a
-  whole-repo audit.
+  Not for a quick single-pass review, posting to a GitLab MR or GitHub PR in
+  CI (gitlab-code-review, github-code-review), a security-only pass
+  (security-diff-review), or a whole-repo audit.
 license: Apache-2.0
 compatibility: Requires git and Python 3.10+; gh or glab optional, to read a PR or MR. Works in any agent harness; uses subagents when the harness has them.
 metadata:
