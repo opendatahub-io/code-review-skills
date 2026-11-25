@@ -7,9 +7,9 @@ description: >
   filter subagent per finding scores it, and only findings scoring 8 or more
   out of 10 are kept. A repo tunes the exclusions and precedents in REVIEW.md
   at the base ref. Use when asked for a security review of a diff, branch, PR
-  or MR. Not for general code review (code-review-panel, gitlab-code-review),
-  dependency or CVE scanning, whole-repo security audits, or a harness's own
-  single-pass review commands.
+  or MR. Not for general code review (code-review-panel, gitlab-code-review,
+  github-code-review), dependency or CVE scanning, whole-repo security audits,
+  or a harness's own single-pass review commands.
 license: Apache-2.0; references adapted from MIT-licensed text (LICENSE-MIT)
 compatibility: Requires git. Works in any agent harness; uses subagents when the harness has them.
 metadata:

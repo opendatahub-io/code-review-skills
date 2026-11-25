@@ -1,0 +1,123 @@
+name: AI Code Review
+description: >-
+  Review a pull request with Claude and post inline comments, applicable
+  suggestions and a summary. The agent only reads code. A separate step posts.
+author: opendatahub-io
+
+inputs:
+  harness:
+    description: >-
+      Agent harness agentic-ci runs: 'claude-code' or 'codex'. The credentials
+      are not inputs: set the keys agentic-ci reads in the job environment (see
+      the README).
+    required: false
+    default: 'claude-code'
+  model:
+    description: Model for the review. Empty uses the harness default.
+    required: false
+    default: ''
+  agentic_ci_version:
+    description: Version of the agentic-ci package that runs the agent in a container. The default is the one the action was checked against.
+    required: false
+    default: '0.5.15'
+  image:
+    description: >-
+      Container image the agent runs in. Empty picks the runner image that
+      matches the harness. The default tag floats, so pin a digest to freeze it.
+    required: false
+    default: ''
+  review_instructions:
+    description: Extra review guidance, such as focus areas or team standards. Passed to the review as a file.
+    required: false
+    default: ''
+  timeout_minutes:
+    description: Wall-clock limit for the agent step, in minutes. The step fails when the review takes longer.
+    required: false
+    default: '20'
+  chill_mode:
+    description: Drop suggestion-level comments ('true' or 'false').
+    required: false
+    default: 'true'
+  inline_fixes:
+    description: Post applicable suggestions from fix objects ('true' or 'false').
+    required: false
+    default: 'true'
+
+runs:
+  using: composite
+  steps:
+    - name: Check the event and credentials
+      id: check
+      shell: bash
+      run: '"$GITHUB_ACTION_PATH/action/review-pr.sh" check'
+      env:
+        AI_REVIEW_EVENT: ${{ github.event_name }}
+        AI_REVIEW_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+        AI_REVIEW_ACTOR: ${{ github.actor }}
+        AI_REVIEW_TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+        AI_REVIEW_HARNESS: ${{ inputs.harness }}
+
+    - name: Check out the pull request head
+      if: steps.check.outputs.skip != 'true'
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      with:
+        ref: ${{ github.event.pull_request.head.sha }}
+        fetch-depth: 0
+        persist-credentials: false
+        # Outside .ai-review: the container mounts that directory and must not reach the checkout's .git.
+        path: .ai-review-head
+
+    - name: Prepare the diff
+      if: steps.check.outputs.skip != 'true'
+      shell: bash
+      working-directory: .ai-review-head
+      run: '"$GITHUB_ACTION_PATH/action/review-pr.sh" prepare'
+      env:
+        AI_REVIEW_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        AI_REVIEW_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        AI_REVIEW_INSTRUCTIONS: ${{ inputs.review_instructions }}
+
+    - name: Set up uv
+      if: steps.check.outputs.skip != 'true'
+      uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+      with:
+        # uvx runs agentic-ci and uv runs review.py. The default cache would hash the PR's whole tree.
+        enable-cache: false
+
+    - name: Review the pull request
+      if: steps.check.outputs.skip != 'true'
+      shell: bash
+      # Not the checkout: uvx must not read a uv.toml or pyproject.toml that arrives with the PR.
+      working-directory: .ai-review
+      run: '"$GITHUB_ACTION_PATH/action/review-pr.sh" review'
+      env:
+        AI_REVIEW_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        AI_REVIEW_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        AI_REVIEW_HARNESS: ${{ inputs.harness }}
+        AI_REVIEW_MODEL: ${{ inputs.model }}
+        AI_REVIEW_TIMEOUT_MINUTES: ${{ inputs.timeout_minutes }}
+        AI_REVIEW_AGENTIC_CI_VERSION: ${{ inputs.agentic_ci_version }}
+        AI_REVIEW_IMAGE: ${{ inputs.image }}
+        # The agent never holds a token that can write to the repository.
+        GITHUB_TOKEN: ''
+        GH_TOKEN: ''
+        ACTIONS_ID_TOKEN_REQUEST_TOKEN: ''
+        ACTIONS_ID_TOKEN_REQUEST_URL: ''
+
+    - name: Post the review
+      if: steps.check.outputs.skip != 'true'
+      shell: bash
+      working-directory: .ai-review-head
+      run: '"$GITHUB_ACTION_PATH/action/review-pr.sh" post'
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+        CHILL_MODE: ${{ inputs.chill_mode }}
+        INLINE_FIXES: ${{ inputs.inline_fixes }}
+        AGENT_MODEL: ${{ inputs.model }}
+        AI_REVIEW_HARNESS: ${{ inputs.harness }}
+
+    # Composite actions have no post hook, so this step always runs.
+    - name: Remove the checkout
+      if: always()
+      shell: bash
+      run: '"$GITHUB_ACTION_PATH/action/review-pr.sh" cleanup'

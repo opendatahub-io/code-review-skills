@@ -11,6 +11,8 @@ assignees: ''
 ### Affected Component
 <!-- Check all that apply -->
 - [ ] GitLab code review skill (`skills/gitlab-code-review`)
+- [ ] GitHub code review skill (`skills/github-code-review`)
+- [ ] GitHub Action (`action.yml`)
 - [ ] Review script (`review.py`)
 - [ ] Review panel skill (`skills/code-review-panel`)
 - [ ] Panel script (`panel.py`)
