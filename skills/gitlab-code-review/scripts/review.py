@@ -7,10 +7,10 @@
 """
 AI code review comment manager.
 
-Post, update, and display AI-generated code review results on GitLab MRs.
+Post, update, and display AI-generated code review results on GitLab MRs and GitHub PRs.
 
 Subcommands:
-  post               Post review as inline comments + summary to a GitLab MR
+  post               Post review as inline comments + summary to a GitLab MR or GitHub PR
   display            Display review results in the terminal
   suggest-reviewers  Suggest reviewers based on git history of modified files
 
@@ -26,12 +26,23 @@ Environment variables (for 'post' with GitLab):
   AGENT_MODEL                   Model for footer, set by agentic-ci (optional)
   AGENT_REASONING_EFFORT        Reasoning effort for footer, set by agentic-ci (optional)
   CHILL_MODE                    Filter suggestion-level comments (default: true)
-  INLINE_FIXES                  Post GitLab applicable suggestions from
+  INLINE_FIXES                  Post applicable suggestions from
                                 inline_comments[].fix (default: true)
   VERBOSE                       Enable verbose output (default: false)
 
+Environment variables (for 'post --platform github', which is never auto-detected):
+  GITHUB_TOKEN                  Token that can write pull requests (required)
+  GITHUB_API_URL                REST API URL, must be https (default: https://api.github.com)
+  GITHUB_GRAPHQL_URL            GraphQL URL, same host as the API (default: <API URL>/graphql)
+  GITHUB_REPOSITORY             owner/repo (required)
+  GITHUB_EVENT_PATH             Path to the pull_request event payload (required)
+  GITHUB_SERVER_URL             Server URL, for the run link in the footer (optional)
+  GITHUB_RUN_ID                 Run ID, for the run link in the footer (optional)
+  CHILL_MODE, INLINE_FIXES, VERBOSE, AGENT_MODEL, AGENT_REASONING_EFFORT apply as above
+
 Usage:
   review.py post review.json [--chill|--no-chill] [--inline-fixes|--no-inline-fixes] [--verbose]
+  review.py post review.json --platform github
   review.py display review.json [--chill|--no-chill] [--inline-fixes|--no-inline-fixes]
   review.py suggest-reviewers [--verbose]
 """
@@ -46,7 +57,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 from urllib.parse import urlparse
 
 import requests
@@ -180,7 +191,8 @@ def _validate_fix(fix: Any, line: int) -> str | None:
 
     ``fix`` replaces whole lines ``start_line..end_line`` (inclusive, new file
     numbering) with ``code``. The anchored comment ``line`` must fall inside
-    that range because GitLab expresses suggestions as offsets from the note.
+    that range: GitLab expresses suggestions as offsets from the note, and the
+    GitHub backend anchors the suggestion on the range itself.
     An empty ``code`` string deletes the range.
     """
     if not isinstance(fix, dict):
@@ -220,8 +232,8 @@ def _verify_fix_against_head(
 ) -> None:
     """Drop ``comment['fix']`` when it does not fit the file at ``head_sha``.
 
-    Keeps the fix when git is unavailable: GitLab rejects a bad range itself
-    and the comment still posts.
+    Keeps the fix when git is unavailable: the platform rejects a bad range
+    itself and the comment still posts.
     """
     fix = comment.get("fix")
     if not fix:
@@ -280,7 +292,14 @@ def filter_already_reviewed(
 
     try:
         diff_output = subprocess.check_output(
-            ["git", "diff", f"{previous_sha}..{head_sha}", "--unified=0"],
+            [
+                "git",
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                f"{previous_sha}..{head_sha}",
+                "--unified=0",
+            ],
             text=True,
             stderr=subprocess.DEVNULL,
         )
@@ -854,6 +873,856 @@ def _gitlab_post(args: argparse.Namespace) -> None:
 
 
 # ===========================================================================
+# Summary helpers (platform-neutral)
+# ===========================================================================
+
+
+def _summary_positive_lines(positives: list[str]) -> list[str]:
+    """Markdown lines for the "Positive Aspects" section, empty when there are none."""
+    if not positives:
+        return []
+    return ["\n### Positive Aspects", *(f"- {p}" for p in positives)]
+
+
+def _summary_count_lines(inline: list[dict[str, Any]], apply_hint: str) -> list[str]:
+    """Markdown lines with severity counts and the applicable-suggestion count."""
+    if not inline:
+        return []
+    severity_counts: dict[str, int] = {}
+    for c in inline:
+        severity_counts[c["severity"]] = severity_counts.get(c["severity"], 0) + 1
+
+    lines = [f"\n### Issues Found ({len(inline)} total)"]
+    for sev in SEVERITY_ORDER:
+        if sev in severity_counts:
+            icon = SEVERITY_ICONS.get(sev, "")
+            lines.append(f"- {icon} {sev.capitalize()}: {severity_counts[sev]}")
+    fixes = sum(1 for c in inline if c.get("fix"))
+    if fixes:
+        lines.append(f"- \U0001f6e0️ With applicable suggestion: {fixes} ({apply_hint})")
+    lines.append("\n*See inline comments on the diff for details.*")
+    return lines
+
+
+def _keep_fix_prompt(failed: int, unanchored: list[dict[str, Any]]) -> bool:
+    """Whether the fix prompt may stay: it must not cover findings nobody can see.
+
+    Those are the failed posts and the findings left out of the capped list of unanchored ones.
+    """
+    return not failed and len(unanchored) <= _GITHUB_LISTED_FINDINGS
+
+
+def _footer_facts() -> str:
+    """Footer text naming the harness, model and effort of the run."""
+    extras = f" • Harness: {_detect_harness()}"
+    model = os.environ.get("AGENT_MODEL")
+    if model:
+        extras += f" • Model: {model}"
+    # agentic-ci exports the effective effort (including its default) next to
+    # AGENT_MODEL; it is unset when the effort is "none".
+    effort = os.environ.get("AGENT_REASONING_EFFORT")
+    if effort:
+        extras += f" • Effort: {effort}"
+    return extras
+
+
+# ===========================================================================
+# GitHub backend
+# ===========================================================================
+
+# GitHub rejects issue and review comment bodies above this many characters.
+_GITHUB_BODY_LIMIT = 65536
+_ZWSP = "\u200b"
+# Past this many, the rest of the findings are listed in the summary instead.
+MAX_INLINE_COMMENTS = 50
+# The summary lists the findings that were not posted inline, capped at this many. When the body
+# would not fit in full, each finding is cut to the character limit as well, so that the list
+# leaves room in the body for the rest of the summary.
+_GITHUB_LISTED_FINDING_CHARS = 500
+_GITHUB_LISTED_FINDINGS = 100
+
+# Only the workflow token is supported, so our comments come from this bot.
+_GITHUB_BOT_REST_LOGIN = "github-actions[bot]"
+_GITHUB_BOT_GRAPHQL_LOGIN = "github-actions"
+
+# Our comments end with the marker; one earlier in the body (a fence, a path)
+# never counts.
+_GITHUB_TRAILING_MARKER_RE = re.compile(r"<!-- ai-review(?: sha:([0-9a-f]+))? -->\Z")
+
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
+_GITHUB_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+_GITHUB_SHA_RE = re.compile(r"^[0-9a-f]{40,64}$")
+_GITHUB_NEXT_LINK_RE = re.compile(r'<([^>]+)>\s*;\s*rel="next"')
+
+# A backtick fence's info string may not contain a backtick.
+_FENCE_OPEN_RE = re.compile(r"^ {0,3}(`{3,}(?=[^`]*$)|~{3,})")
+_FENCE_CLOSE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})[ \t]*$")
+# A backslash pair is consumed first, so an escaped backtick opens no span.
+_CODE_SPAN_RE = re.compile(r"\\.|(?<!`)(`+)(?!`)(.+?)(?<!`)\1(?!`)")
+_MENTION_RE = re.compile(r"(?<![A-Za-z0-9])(@|&#0*64;|&#[xX]0*40;|&commat;)(?=[A-Za-z0-9])")
+
+_GITHUB_THREADS_QUERY = """
+query($owner: String!, $name: String!, $number: Int!, $after: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      reviewThreads(first: 100, after: $after) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          isResolved
+          isOutdated
+          path
+          line
+          startLine
+          comments(first: 100) {
+            pageInfo { hasNextPage }
+            nodes { fullDatabaseId author { __typename login } body }
+          }
+        }
+      }
+    }
+  }
+}
+"""
+
+
+class _GitHubContext(NamedTuple):
+    api_url: str
+    graphql_url: str
+    token: str
+    owner: str
+    repo: str
+    number: int
+    head_sha: str
+    run_url: str | None
+
+    @property
+    def repo_url(self) -> str:
+        return f"{self.api_url}/repos/{self.owner}/{self.repo}"
+
+
+def _github_annotation(level: str, msg: str) -> None:
+    """Emit a GitHub Actions workflow command (notice, warning or error)."""
+    data = msg.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+    print(f"::{level}::{data}")
+
+
+def _github_load_context() -> _GitHubContext:
+    """Read the token, API URLs and pull request from the Actions environment.
+
+    Exits 1 on anything missing or unsafe, the way ``_gitlab_post`` does.
+    """
+    token = os.environ.get("GITHUB_TOKEN")
+    if not token:
+        _error("GITHUB_TOKEN environment variable is required")
+        sys.exit(1)
+
+    api_url = (os.environ.get("GITHUB_API_URL") or "https://api.github.com").rstrip("/")
+    api = urlparse(api_url)
+    if api.scheme != "https" or not api.hostname:
+        _error(f"GITHUB_API_URL must be an https URL, got: {api_url}")
+        sys.exit(1)
+    graphql_url = os.environ.get("GITHUB_GRAPHQL_URL") or f"{api_url}/graphql"
+    graphql = urlparse(graphql_url)
+    if graphql.scheme != "https" or graphql.netloc != api.netloc:
+        _error(f"GITHUB_GRAPHQL_URL must be an https URL on {api.netloc}, got: {graphql_url}")
+        sys.exit(1)
+
+    repository = os.environ.get("GITHUB_REPOSITORY", "")
+    if not _GITHUB_REPO_RE.match(repository):
+        _error(f"GITHUB_REPOSITORY must look like owner/repo, got: {repository!r}")
+        sys.exit(1)
+    owner, repo = repository.split("/")
+
+    event_path = os.environ.get("GITHUB_EVENT_PATH")
+    if not event_path:
+        _error("GITHUB_EVENT_PATH environment variable is required")
+        sys.exit(1)
+    try:
+        event = json.loads(Path(event_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        _error(f"Cannot read the event payload at GITHUB_EVENT_PATH: {e}")
+        sys.exit(1)
+    pull_request = event.get("pull_request") if isinstance(event, dict) else None
+    if not isinstance(pull_request, dict):
+        _error("GITHUB_EVENT_PATH does not hold a pull_request event payload")
+        sys.exit(1)
+
+    number = pull_request.get("number")
+    if not isinstance(number, int) or isinstance(number, bool) or number <= 0:
+        _error(f"pull_request.number: expected positive int, got {number!r}")
+        sys.exit(1)
+    head = pull_request.get("head")
+    head_sha = head.get("sha") if isinstance(head, dict) else None
+    if not isinstance(head_sha, str) or not _GITHUB_SHA_RE.match(head_sha):
+        _error(f"pull_request.head.sha: expected a hex commit SHA, got {head_sha!r}")
+        sys.exit(1)
+
+    server_url = os.environ.get("GITHUB_SERVER_URL", "").rstrip("/")
+    run_id = os.environ.get("GITHUB_RUN_ID", "")
+    run_url = None
+    if server_url.startswith("https://") and run_id.isdigit():
+        run_url = f"{server_url}/{repository}/actions/runs/{run_id}"
+
+    return _GitHubContext(
+        api_url=api_url,
+        graphql_url=graphql_url,
+        token=token,
+        owner=owner,
+        repo=repo,
+        number=number,
+        head_sha=head_sha,
+        run_url=run_url,
+    )
+
+
+def _github_paginated_get(
+    session: requests.Session, ctx: _GitHubContext, url: str, *, strict: bool = False
+) -> list[Any]:
+    """Fetch all pages from a GitHub list endpoint.
+
+    Follows ``Link: rel="next"`` only when it stays on the API host over
+    https, so the token never goes anywhere else. Raises requests.HTTPError
+    when the first page fails, or any page when ``strict`` is set: a caller
+    that looks for the newest item cannot work from a truncated list.
+    """
+    api_netloc = urlparse(ctx.api_url).netloc
+    results: list[Any] = []
+    params: dict[str, int] | None = {"per_page": 100}
+    first_page = True
+    while True:
+        resp = session.get(url, params=params)
+        params = None
+        if resp.status_code != 200:
+            if first_page or strict:
+                # raise_for_status() lets a redirect through, and redirects are never followed.
+                raise requests.exceptions.HTTPError(f"GitHub API returned HTTP {resp.status_code}")
+            _warning(f"GitHub API returned HTTP {resp.status_code} during pagination")
+            break
+        results.extend(resp.json())
+        first_page = False
+        m = _GITHUB_NEXT_LINK_RE.search(resp.headers.get("Link", ""))
+        if not m:
+            break
+        next_url = urlparse(m.group(1))
+        if next_url.scheme != "https" or next_url.netloc != api_netloc:
+            _warning(f"Ignoring pagination link to {next_url.netloc or m.group(1)}")
+            break
+        url = m.group(1)
+    return results
+
+
+def _github_rest_is_ours(user: Any) -> bool:
+    return (
+        isinstance(user, dict)
+        and user.get("login") == _GITHUB_BOT_REST_LOGIN
+        and user.get("type") == "Bot"
+    )
+
+
+def _github_graphql_is_ours(author: Any) -> bool:
+    # A deleted account comes back as a null author, which counts as human.
+    return (
+        isinstance(author, dict)
+        and author.get("login") == _GITHUB_BOT_GRAPHQL_LOGIN
+        and author.get("__typename") == "Bot"
+    )
+
+
+def _github_trailing_marker(body: Any) -> re.Match[str] | None:
+    return _GITHUB_TRAILING_MARKER_RE.search(body.strip()) if isinstance(body, str) else None
+
+
+def _github_find_summary(
+    session: requests.Session, ctx: _GitHubContext
+) -> tuple[int | None, str | None]:
+    """Return the id and review SHA of our newest summary comment on the PR.
+
+    Lists sort ascending, so the last match is the newest. A comment is ours
+    only when the workflow bot wrote it and its body ends with the marker.
+    """
+    comment_id: int | None = None
+    sha: str | None = None
+    url = f"{ctx.repo_url}/issues/{ctx.number}/comments"
+    for comment in _github_paginated_get(session, ctx, url, strict=True):
+        marker = _github_trailing_marker(comment.get("body"))
+        if marker and _github_rest_is_ours(comment.get("user")):
+            comment_id = comment["id"]
+            sha = marker.group(1)
+    return comment_id, sha
+
+
+def _github_thread_covers_dropped(thread: dict[str, Any], dropped: set[tuple[str, int]]) -> bool:
+    """Whether a dropped finding sits on the thread's line or inside its multi-line range."""
+    path, line = thread.get("path"), thread.get("line")
+    if (path, line) in dropped:
+        return True
+    start = thread.get("startLine")
+    if not isinstance(line, int) or not isinstance(start, int) or start > line:
+        return False
+    return any(p == path and start <= n <= line for p, n in dropped)
+
+
+def _github_thread_ours_unanswered(thread: Any) -> list[Any] | None:
+    """Return the comment nodes of an unresolved thread that only we wrote, else None."""
+    if not isinstance(thread, dict) or thread.get("isResolved"):
+        return None
+    comments = thread.get("comments") or {}
+    if (comments.get("pageInfo") or {}).get("hasNextPage"):
+        return None
+    nodes = comments.get("nodes") or []
+    if not nodes:
+        return None
+    for node in nodes:
+        if not isinstance(node, dict):
+            return None
+        if not (
+            _github_graphql_is_ours(node.get("author"))
+            and _github_trailing_marker(node.get("body"))
+        ):
+            return None
+    return nodes
+
+
+def _github_thread_is_protected(thread: Any, dropped: set[tuple[str, int]]) -> bool:
+    """Whether cleanup keeps our thread only because a dropped finding still sits on it."""
+    return (
+        _github_thread_ours_unanswered(thread) is not None
+        and not thread.get("isOutdated")
+        and _github_thread_covers_dropped(thread, dropped)
+    )
+
+
+def _github_thread_is_carried(thread: Any, dropped: set[tuple[str, int]]) -> bool:
+    """Whether our thread is still open on a dropped finding, whoever replied to it."""
+    if not isinstance(thread, dict) or thread.get("isResolved") or thread.get("isOutdated"):
+        return False
+    nodes = (thread.get("comments") or {}).get("nodes") or []
+    root = nodes[0] if nodes else None
+    return (
+        isinstance(root, dict)
+        and _github_graphql_is_ours(root.get("author"))
+        and bool(_github_trailing_marker(root.get("body")))
+        and _github_thread_covers_dropped(thread, dropped)
+    )
+
+
+def _github_thread_root_to_delete(thread: Any, dropped: set[tuple[str, int]]) -> int | None:
+    """Return the root comment id of a review thread that is safe to delete, else None.
+
+    Safe means unresolved, written only by us (no human reply), and not a
+    still-valid finding on unchanged code that dedup just dropped from this run.
+    """
+    nodes = _github_thread_ours_unanswered(thread)
+    if nodes is None or _github_thread_is_protected(thread, dropped):
+        return None
+    # fullDatabaseId is a BigInt and arrives as a decimal string. databaseId is deprecated
+    # because it cannot hold 64-bit ids.
+    root_id = nodes[0].get("fullDatabaseId")
+    if isinstance(root_id, str) and root_id.isascii() and root_id.isdigit() and len(root_id) <= 19:
+        value = int(root_id)
+        if 0 < value < 2**63:
+            return value
+    return None
+
+
+def _github_fetch_review_threads(
+    session: requests.Session, ctx: _GitHubContext
+) -> list[Any] | None:
+    """Return every review thread of the PR, or None when GraphQL did not answer cleanly."""
+    threads: list[Any] = []
+    after: str | None = None
+    while True:
+        resp = session.post(
+            ctx.graphql_url,
+            json={
+                "query": _GITHUB_THREADS_QUERY,
+                "variables": {
+                    "owner": ctx.owner,
+                    "name": ctx.repo,
+                    "number": ctx.number,
+                    "after": after,
+                },
+            },
+        )
+        if resp.status_code != 200:
+            _github_annotation(
+                "warning", f"Review thread query failed (HTTP {resp.status_code}); skipping cleanup"
+            )
+            return None
+        try:
+            payload = resp.json()
+        except ValueError:
+            payload = None
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(payload, dict) or payload.get("errors") or not data:
+            _github_annotation(
+                "warning", "Review thread query returned errors or no data; skipping cleanup"
+            )
+            return None
+        pull_request = (data.get("repository") or {}).get("pullRequest")
+        connection = (pull_request or {}).get("reviewThreads")
+        if not isinstance(connection, dict):
+            _github_annotation(
+                "warning", "Review thread query found no pull request; skipping cleanup"
+            )
+            return None
+        threads.extend(connection.get("nodes") or [])
+        page_info = connection.get("pageInfo") or {}
+        if not page_info.get("hasNextPage"):
+            return threads
+        after = page_info.get("endCursor")
+
+
+def _github_delete_previous_threads(
+    session: requests.Session,
+    ctx: _GitHubContext,
+    dropped: set[tuple[str, int]],
+    *,
+    verbose: bool = False,
+) -> int:
+    """Delete unresolved AI review threads without human responses.
+
+    Returns how many of our threads, replied to or not, are still open on a
+    dropped finding, or 0 when the cleanup was skipped.
+    """
+    _step("Checking for previous AI review threads to delete...")
+    threads = _github_fetch_review_threads(session, ctx)
+    if threads is None:
+        return 0
+
+    protected = sum(1 for t in threads if _github_thread_is_carried(t, dropped))
+    to_delete = [
+        root_id
+        for root_id in (_github_thread_root_to_delete(t, dropped) for t in threads)
+        if root_id is not None
+    ]
+    kept = len(threads) - len(to_delete)
+    if not to_delete:
+        _step(f"No previous AI review threads to delete ({kept} thread(s) kept)")
+        return protected
+
+    _step(f"Deleting {len(to_delete)} previous AI review thread(s)...")
+    deleted = 0
+    for comment_id in to_delete:
+        resp = session.delete(f"{ctx.repo_url}/pulls/comments/{comment_id}")
+        if 200 <= resp.status_code < 300:
+            deleted += 1
+        else:
+            _warning(f"Failed to delete review comment {comment_id} (HTTP {resp.status_code})")
+            if verbose:
+                print(resp.text, file=sys.stderr)
+    _success(f"Deleted {deleted}/{len(to_delete)} previous thread(s)")
+    return protected
+
+
+def _scan_fences(text: str) -> tuple[list[tuple[str, bool]], str | None]:
+    """Split ``text`` into lines flagged as inside a fenced block (fences included).
+
+    Also returns the opening fence still unclosed at the end, if any.
+    """
+    lines: list[tuple[str, bool]] = []
+    fence: str | None = None
+    for line in text.split("\n"):
+        if fence is None:
+            opened = _FENCE_OPEN_RE.match(line)
+            if opened:
+                fence = opened.group(1)
+            lines.append((line, bool(opened)))
+            continue
+        lines.append((line, True))
+        closed = _FENCE_CLOSE_RE.match(line)
+        if closed and closed.group(1)[0] == fence[0] and len(closed.group(1)) >= len(fence):
+            fence = None
+    return lines, fence
+
+
+def _neutralize_mentions(line: str) -> str:
+    """Put a zero-width space after each @ (or its HTML entity) outside inline code spans."""
+
+    def defuse(chunk: str) -> str:
+        return _MENTION_RE.sub(lambda m: m.group(1) + _ZWSP, chunk)
+
+    parts: list[str] = []
+    pos = 0
+    for span in _CODE_SPAN_RE.finditer(line):
+        if span.group(1) is None:
+            continue
+        parts.append(defuse(line[pos : span.start()]))
+        parts.append(span.group(0))
+        pos = span.end()
+    parts.append(defuse(line[pos:]))
+    return "".join(parts)
+
+
+def _github_text(text: str, *, mentions: bool = True) -> str:
+    """Make model-written text safe to post as a GitHub comment.
+
+    ``<!--`` gets a zero-width space everywhere, fences and code spans
+    included, because the ownership marker is matched on the raw text.
+    Mentions (``@user``, ``@org/team``) are defused outside code spans and
+    fenced blocks, so code such as ``@property`` stays copy-pasteable. Pass
+    ``mentions=False`` for text that goes inside a fenced block anyway.
+    """
+    text = text.replace("<!--", f"<{_ZWSP}!--")
+    if not mentions:
+        return text
+    lines, open_fence = _scan_fences(text)
+    safe = "\n".join(line if in_code else _neutralize_mentions(line) for line, in_code in lines)
+    # A fence left open would swallow the next fragment of the body and hide its mentions.
+    return f"{safe}\n{open_fence}" if open_fence else safe
+
+
+def _longest_backtick_run(text: str) -> int:
+    return max((len(run) for run in re.findall(r"`+", text)), default=0)
+
+
+def _github_code_span(text: str) -> str:
+    """Render ``text`` as an inline code span whose delimiter outlasts any backtick run in it."""
+    text = " ".join(text.split())
+    delimiter = "`" * (_longest_backtick_run(text) + 1)
+    return f"{delimiter} {text} {delimiter}"
+
+
+def _github_cap(text: str, marker: str, limit: int = _GITHUB_BODY_LIMIT) -> str:
+    """Return ``text`` plus the marker, truncated so the result fits in ``limit`` characters.
+
+    The marker always survives, and a fenced block cut in half is closed again
+    before the marker.
+    """
+    body = f"{text}\n\n{marker}"
+    if len(body) <= limit:
+        return body
+
+    note = "\n\n*(truncated)*"
+    keep = limit - len(marker) - len(note) - 2
+    for _ in range(2):
+        cut = text[:keep]
+        _, open_fence = _scan_fences(cut)
+        if open_fence is None:
+            break
+        keep -= len(open_fence) + 1
+    cut = text[:keep]
+    _, open_fence = _scan_fences(cut)
+    if open_fence:
+        cut += f"\n{open_fence}"
+    return f"{cut}{note}\n\n{marker}"
+
+
+def _github_format_fix_block(fix: dict[str, Any]) -> str:
+    """Render ``fix`` as a GitHub ``suggestion`` fenced block.
+
+    GitHub takes the replaced range from the comment's own ``start_line`` and
+    ``line``, so the fence needs no offsets. ``_validate_fix`` already rejects
+    code that contains a ``` fence.
+    """
+    code = fix["code"].rstrip("\n")
+    if code:
+        return f"```suggestion\n{code}\n```"
+    return "```suggestion\n```"
+
+
+def _github_comment_body(c: dict[str, Any], marker: str) -> str:
+    """Build the inline comment body, dropping a fix that would not fit rather than cutting it."""
+    icon = SEVERITY_ICONS.get(c["severity"], "\U0001f4ac")
+    # Defuse the whole line: the severity prefix can turn a fence opener in the comment into prose.
+    text = _github_text(f"{icon} **{c['severity'].capitalize()}**: {c['comment']}")
+    fix = c.get("fix")
+    if fix:
+        with_fix = f"{text}\n\n{_github_format_fix_block(fix)}"
+        if len(with_fix) + len(marker) + 2 <= _GITHUB_BODY_LIMIT:
+            return f"{with_fix}\n\n{marker}"
+        _warning(f"Dropping fix on {c['file']}:{c['line']}: comment is too large for GitHub")
+        del c["fix"]
+    return _github_cap(text, marker)
+
+
+def _github_post_inline_comment(
+    session: requests.Session,
+    ctx: _GitHubContext,
+    c: dict[str, Any],
+    marker: str,
+    *,
+    verbose: bool = False,
+) -> str:
+    """Post one inline review comment.
+
+    Returns "posted", "unanchored" (GitHub answered 422: the line is not in
+    the diff) or "failed". A 422 on a comment with a fix retries once without
+    the fix, anchored at the comment's own line.
+    """
+    url = f"{ctx.repo_url}/pulls/{ctx.number}/comments"
+    while True:
+        body = _github_comment_body(c, marker)
+        fix = c.get("fix")
+        payload: dict[str, Any] = {
+            "body": body,
+            "commit_id": ctx.head_sha,
+            "path": c["file"],
+            "side": "RIGHT",
+            "line": c["line"],
+        }
+        if fix and fix["start_line"] != fix["end_line"]:
+            payload["start_line"] = fix["start_line"]
+            payload["start_side"] = "RIGHT"
+            payload["line"] = fix["end_line"]
+
+        resp = session.post(url, json=payload)
+        if 200 <= resp.status_code < 300:
+            return "posted"
+        if resp.status_code == 422 and fix:
+            _warning(
+                f"GitHub rejected the suggestion on {c['file']}:{c['line']}; retrying as prose"
+            )
+            del c["fix"]
+            continue
+        if resp.status_code == 422:
+            _warning(f"Cannot anchor comment on {c['file']}:{c['line']} (HTTP 422)")
+            if verbose:
+                print(resp.text, file=sys.stderr)
+            return "unanchored"
+        _warning(
+            f"Failed to post inline comment on {c['file']}:{c['line']} (HTTP {resp.status_code})"
+        )
+        if verbose:
+            print(resp.text, file=sys.stderr)
+        return "failed"
+
+
+def _github_build_summary_body(
+    data: dict[str, Any],
+    review_marker: str,
+    run_url: str | None = None,
+    unanchored: list[dict[str, Any]] | None = None,
+    carried: int = 0,
+) -> str:
+    """Build the markdown summary body for the PR comment.
+
+    ``data["inline_comments"]`` holds the findings that were posted inline;
+    ``unanchored`` holds the ones that were not posted inline; ``carried`` is
+    the number of earlier threads still open on code that did not change.
+    """
+    parts: list[str] = ["## AI Code Review Summary\n"]
+    parts.append(_github_text(str(data.get("summary") or "No summary provided.")))
+    raw_positives = data.get("positive_aspects")
+    if isinstance(raw_positives, str):
+        raw_positives = [raw_positives]
+    elif not isinstance(raw_positives, list):
+        raw_positives = []
+    positives = [str(p) for p in raw_positives]
+    # Defuse each line after its list prefix is added, as GitHub renders it.
+    parts.extend(_github_text(line) for line in _summary_positive_lines(positives))
+    count_lines = _summary_count_lines(
+        data.get("inline_comments", []),
+        "use **Commit suggestion** on the inline comment",
+    )
+    if carried > 0:
+        carried_line = f"- Still open from earlier runs, on code that did not change: {carried}"
+        if count_lines:
+            count_lines.insert(len(count_lines) - 1, carried_line)
+        else:
+            count_lines = ["\n### Issues Found", carried_line]
+    parts.extend(count_lines)
+
+    fix_prompt = data.get("fix_prompt")
+    run = f" • Run: [{run_url}]({run_url})" if run_url else ""
+    footer = (
+        "\n\n---\n"
+        "*Generated by [Code Review](https://github.com/opendatahub-io/code-review-skills)"
+        f"{run}{_footer_facts()}*"
+    )
+    # Most severe first, so the cap leaves out the least severe findings.
+    ranked = sorted(
+        unanchored or [],
+        key=lambda c: (SEVERITY_ORDER.index(c["severity"]), c["file"], c["line"]),
+    )
+
+    def assemble(max_chars: int | None) -> str:
+        lines = list(parts)
+        if ranked:
+            lines.append("\n### Findings not posted inline")
+            lines.append(
+                "*These were not posted inline: GitHub could not anchor them to the diff, "
+                f"or the run reached its limit of {MAX_INLINE_COMMENTS} inline comments.*\n"
+            )
+            for c in ranked[:_GITHUB_LISTED_FINDINGS]:
+                path = c["file"].replace("<!--", f"<{_ZWSP}!--")
+                where = f"{_github_code_span(path)}:{c['line']}"
+                comment = c["comment"]
+                if max_chars is not None and len(comment) > max_chars:
+                    comment = comment[: max_chars - 1] + "\u2026"
+                text = _github_text(f"- {where} ({c['severity']}): {comment}")
+                lines.append(text.replace("\n", "\n  "))
+            if len(ranked) > _GITHUB_LISTED_FINDINGS:
+                lines.append(f"- ... and {len(ranked) - _GITHUB_LISTED_FINDINGS} more not listed")
+
+        if isinstance(fix_prompt, str) and fix_prompt:
+            fence = "`" * max(4, _longest_backtick_run(fix_prompt) + 1)
+            lines.append("\n### \U0001f916 Fix all issues with AI agents")
+            lines.append(
+                "\n**Copy-paste this into a prompt to automatically fix the issues found:**"
+            )
+            lines.append(f"\n{fence}\n{_github_text(fix_prompt, mentions=False)}\n{fence}")
+        return "\n".join(lines) + footer
+
+    text = assemble(None)
+    if len(f"{text}\n\n{review_marker}") > _GITHUB_BODY_LIMIT:
+        text = assemble(_GITHUB_LISTED_FINDING_CHARS)
+    if len(f"{text}\n\n{review_marker}") > _GITHUB_BODY_LIMIT:
+        _github_annotation(
+            "warning", "The summary comment is over GitHub's size limit, so its end was cut"
+        )
+    return _github_cap(text, review_marker)
+
+
+def _github_upsert_summary(
+    session: requests.Session,
+    ctx: _GitHubContext,
+    body: str,
+    existing_id: int | None,
+    *,
+    verbose: bool = False,
+) -> bool:
+    """Update our newest summary comment in place, or post the first one."""
+    if existing_id is not None:
+        _step(f"Updating summary comment (id: {existing_id})...")
+        resp = session.patch(f"{ctx.repo_url}/issues/comments/{existing_id}", json={"body": body})
+    else:
+        _step(f"Posting summary comment to PR #{ctx.number}...")
+        resp = session.post(f"{ctx.repo_url}/issues/{ctx.number}/comments", json={"body": body})
+    if 200 <= resp.status_code < 300:
+        return True
+
+    _error(f"Failed to post summary comment (HTTP {resp.status_code})")
+    if verbose:
+        print(resp.text, file=sys.stderr)
+    return False
+
+
+def _github_post(args: argparse.Namespace) -> None:
+    """Post review results to the GitHub pull request named by the Actions event."""
+    ctx = _github_load_context()
+    verbose = _resolve_verbose(args)
+    chill = _resolve_chill(args)
+    inline_fixes = _resolve_inline_fixes(args)
+
+    try:
+        data = parse_review_json(args.review_file, chill_mode=chill, inline_fixes=inline_fixes)
+    except (json.JSONDecodeError, ValueError) as e:
+        _error(f"Failed to parse review JSON: {e}")
+        sys.exit(1)
+
+    # A path with a control character is never in a diff, and printing it
+    # would let the model start a workflow command in the log.
+    clean = [c for c in data["inline_comments"] if not _CONTROL_CHARS_RE.search(c["file"])]
+    if len(clean) != len(data["inline_comments"]):
+        _warning(f"Dropped {len(data['inline_comments']) - len(clean)} comment(s): bad file path")
+        data["inline_comments"] = clean
+
+    session = _SafeSession()
+    session.headers.update(
+        {
+            "Authorization": f"Bearer {ctx.token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+    )
+    head_sha = ctx.head_sha
+    review_marker = _make_review_marker(head_sha)
+
+    try:
+        pr_resp = session.get(f"{ctx.repo_url}/pulls/{ctx.number}")
+        pr_resp.raise_for_status()
+        current_head = (pr_resp.json().get("head") or {}).get("sha")
+        if not current_head:
+            _error("GitHub returned no head SHA for the pull request")
+            sys.exit(1)
+        if current_head != head_sha:
+            _github_annotation(
+                "notice",
+                f"PR #{ctx.number} moved to {current_head[:8]} since this run started "
+                f"({head_sha[:8]}); a newer run owns the review, so nothing was posted.",
+            )
+            return
+
+        summary_id, prev_sha = _github_find_summary(session, ctx)
+        original = list(data["inline_comments"])
+        if prev_sha and prev_sha != head_sha:
+            _step(f"Found previous review (sha: {prev_sha[:8]}...), filtering unchanged code...")
+            data = filter_already_reviewed(data, prev_sha, head_sha)
+
+        # Findings dedup dropped are still valid on unchanged code. Their old
+        # threads must survive cleanup, or they would vanish from the PR. A
+        # multi-line suggestion anchors at its end line, so match that too.
+        kept_ids = {id(c) for c in data["inline_comments"]}
+        dropped: set[tuple[str, int]] = set()
+        for c in original:
+            if id(c) not in kept_ids:
+                dropped.add((c["file"], c["line"]))
+                if c.get("fix"):
+                    dropped.add((c["file"], c["fix"]["end_line"]))
+
+        carried = _github_delete_previous_threads(session, ctx, dropped, verbose=verbose)
+
+        inline = data.get("inline_comments", [])
+        posted_comments: list[dict[str, Any]] = []
+        unanchored: list[dict[str, Any]] = []
+        failed = 0
+
+        if len(inline) > MAX_INLINE_COMMENTS:
+            ranked = sorted(inline, key=lambda c: SEVERITY_ORDER.index(c["severity"]))
+            _warning(
+                f"{len(inline)} findings; posting {MAX_INLINE_COMMENTS} inline, "
+                "listing the rest in the summary"
+            )
+            inline = ranked[:MAX_INLINE_COMMENTS]
+            unanchored.extend(ranked[MAX_INLINE_COMMENTS:])
+
+        if inline:
+            _step(f"Posting {len(inline)} inline comment(s) to PR #{ctx.number}...")
+            for c in inline:
+                _verify_fix_against_head(c, head_sha, verbose=verbose)
+                outcome = _github_post_inline_comment(
+                    session, ctx, c, review_marker, verbose=verbose
+                )
+                if outcome == "posted":
+                    posted_comments.append(c)
+                elif outcome == "unanchored":
+                    unanchored.append(c)
+                else:
+                    failed += 1
+
+            _success(
+                f"Posted {len(posted_comments)}/{len(inline)} inline comments "
+                f"({len(unanchored)} not posted inline, {failed} failed)"
+            )
+        else:
+            _step("No inline comments to post")
+
+        # Count only what is visible on the PR; unanchored findings get their own list.
+        data["inline_comments"] = posted_comments
+        if not _keep_fix_prompt(failed, unanchored):
+            data.pop("fix_prompt", None)
+        # Without the SHA the next run skips dedup, so findings missing from the diff
+        # come back instead of staying dropped as "unchanged code".
+        summary_marker = review_marker if not (unanchored or failed) else _make_review_marker()
+        summary_body = _github_build_summary_body(
+            data, summary_marker, ctx.run_url, unanchored, carried
+        )
+        if _github_upsert_summary(session, ctx, summary_body, summary_id, verbose=verbose):
+            _success(f"Summary posted to pull request #{ctx.number}")
+        else:
+            _error("Failed to post summary comment")
+            sys.exit(1)
+
+        if failed > 0:
+            _error(f"{failed}/{len(inline)} inline comments failed to post")
+            sys.exit(1)
+    except (requests.exceptions.RequestException, ValueError) as e:
+        _error(f"GitHub API error ({type(e).__name__}): {e}")
+        sys.exit(1)
+
+
+# ===========================================================================
 # Suggest reviewers
 # ===========================================================================
 
@@ -1150,8 +2019,13 @@ def _resolve_verbose(args: argparse.Namespace) -> bool:
 def cmd_post(args: argparse.Namespace) -> None:
     """Post review results to the detected platform.
 
-    Falls back to terminal display when no CI platform is detected.
+    Falls back to terminal display when no CI platform is detected. GitHub is
+    never detected: it needs ``--platform github``.
     """
+    if getattr(args, "platform", "auto") == "github":
+        _github_post(args)
+        return
+
     platform = _detect_platform()
 
     if platform == "gitlab":
@@ -1202,7 +2076,7 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         default=None,
         dest="inline_fixes",
-        help="Post applicable GitLab suggestions from inline_comments[].fix (default)",
+        help="Post applicable suggestions from inline_comments[].fix (default)",
     )
     fix_group.add_argument(
         "--no-inline-fixes",
@@ -1218,8 +2092,17 @@ def main() -> None:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    post_parser = subparsers.add_parser("post", help="Post review to GitLab MR")
+    post_parser = subparsers.add_parser("post", help="Post review to a GitLab MR or GitHub PR")
     _add_common_args(post_parser)
+    post_parser.add_argument(
+        "--platform",
+        choices=["auto", "github"],
+        default="auto",
+        help=(
+            "auto detects GitLab CI and otherwise displays the review; "
+            "github posts to the pull request named by the Actions event (never auto-detected)"
+        ),
+    )
     post_parser.add_argument("--verbose", action="store_true", help="Verbose output")
     post_parser.set_defaults(func=cmd_post)
 
