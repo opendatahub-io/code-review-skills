@@ -1,5 +1,6 @@
 #!/usr/bin/env -S uv run --script
 # /// script
+# requires-python = ">=3.10"
 # dependencies = [
 #     "requests>=2.28.0",
 # ]
@@ -13,6 +14,7 @@ Subcommands:
   post               Post review as inline comments + summary to a GitLab MR or GitHub PR
   display            Display review results in the terminal
   suggest-reviewers  Suggest reviewers based on git history of modified files
+  stand-down         Exit 10 when another review should win over this one (GitHub only)
 
 Environment variables (for 'post' with GitLab):
   GITLAB_API_TOKEN              GitLab Personal Access Token (required)
@@ -38,24 +40,45 @@ Environment variables (for 'post --platform github', which is never auto-detecte
   GITHUB_EVENT_PATH             Path to the pull_request event payload (required)
   GITHUB_SERVER_URL             Server URL, for the run link in the footer (optional)
   GITHUB_RUN_ID                 Run ID, for the run link in the footer (optional)
+  RUNNER_NAME                   Runner of this job; with GITHUB_RUN_ID, keeps the
+                                stand-down check from matching its own running job
+                                (optional)
+  AI_REVIEW_BOT_LOGIN           Account GITHUB_TOKEN posts as, when it is not
+                                github-actions[bot]: a GitHub App's <slug>[bot], or
+                                the user login behind a personal access token
+                                (optional). Comments of github-actions[bot] still
+                                count as ours, but only the account's own summary
+                                is updated in place.
   CHILL_MODE, INLINE_FIXES, VERBOSE, AGENT_MODEL, AGENT_REASONING_EFFORT apply as above
 
 Usage:
   review.py post review.json [--chill|--no-chill] [--inline-fixes|--no-inline-fixes] [--verbose]
-  review.py post review.json --platform github
+  review.py post review.json --platform github [--deep-recommendation-plan PATH]
+                               [--mode standard|deep] [--deep-job NAME]
+                               [--deep-label=LABEL] [--posted-flag PATH]
+  review.py stand-down --platform github --mode standard|deep [--deep-job NAME]
   review.py display review.json [--chill|--no-chill] [--inline-fixes|--no-inline-fixes]
   review.py suggest-reviewers [--verbose]
+  review.py suggest-reviewers --platform github [--verbose]
+
+'suggest-reviewers --platform github' runs in a checkout holding the pull
+request's base and head commits, and reads the same environment as 'post
+--platform github'. GITHUB_TOKEN also needs contents: read for the history query.
 """
 
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
+import unicodedata
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, NamedTuple
 from urllib.parse import urlparse
@@ -884,15 +907,22 @@ def _summary_positive_lines(positives: list[str]) -> list[str]:
     return ["\n### Positive Aspects", *(f"- {p}" for p in positives)]
 
 
-def _summary_count_lines(inline: list[dict[str, Any]], apply_hint: str) -> list[str]:
-    """Markdown lines with severity counts and the applicable-suggestion count."""
+def _summary_count_lines(
+    inline: list[dict[str, Any]], apply_hint: str, heading: str | None = None
+) -> list[str]:
+    """Markdown lines with severity counts and the applicable-suggestion count.
+
+    ``heading`` replaces the default "Issues Found (N total)" heading text.
+    """
     if not inline:
         return []
     severity_counts: dict[str, int] = {}
     for c in inline:
         severity_counts[c["severity"]] = severity_counts.get(c["severity"], 0) + 1
 
-    lines = [f"\n### Issues Found ({len(inline)} total)"]
+    if heading is None:
+        heading = f"Issues Found ({len(inline)} total)"
+    lines = [f"\n### {heading}"]
     for sev in SEVERITY_ORDER:
         if sev in severity_counts:
             icon = SEVERITY_ICONS.get(sev, "")
@@ -941,9 +971,15 @@ MAX_INLINE_COMMENTS = 50
 _GITHUB_LISTED_FINDING_CHARS = 500
 _GITHUB_LISTED_FINDINGS = 100
 
-# Only the workflow token is supported, so our comments come from this bot.
+# The workflow token posts as this bot. AI_REVIEW_BOT_LOGIN names another posting account
+# (a GitHub App or a token owner); comments of this bot still count as ours after a switch.
 _GITHUB_BOT_REST_LOGIN = "github-actions[bot]"
 _GITHUB_BOT_GRAPHQL_LOGIN = "github-actions"
+_GITHUB_BOT_LOGIN_ENV = "AI_REVIEW_BOT_LOGIN"
+# The App slug charset is not documented; every observed slug is lowercase alphanumerics and
+# hyphens. Logins are compared for equality, so a permissive pattern cannot cause a false match.
+_GITHUB_APP_LOGIN_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,62}\[bot\]")
+_GITHUB_USER_LOGIN_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}")
 
 # Our comments end with the marker; one earlier in the body (a fence, a path)
 # never counts.
@@ -955,11 +991,40 @@ _GITHUB_SHA_RE = re.compile(r"^[0-9a-f]{40,64}$")
 _GITHUB_NEXT_LINK_RE = re.compile(r'<([^>]+)>\s*;\s*rel="next"')
 
 # A backtick fence's info string may not contain a backtick.
-_FENCE_OPEN_RE = re.compile(r"^ {0,3}(`{3,}(?=[^`]*$)|~{3,})")
+_FENCE_OPEN_RE = re.compile(r"^( {0,3})(`{3,}(?=[^`]*$)|~{3,})")
 _FENCE_CLOSE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})[ \t]*$")
-# A backslash pair is consumed first, so an escaped backtick opens no span.
-_CODE_SPAN_RE = re.compile(r"\\.|(?<!`)(`+)(?!`)(.+?)(?<!`)\1(?!`)")
 _MENTION_RE = re.compile(r"(?<![A-Za-z0-9])(@|&#0*64;|&#[xX]0*40;|&commat;)(?=[A-Za-z0-9])")
+
+# The deep-review recommendation reads panel.py triage output. Paths come from the
+# pull request, so each is bounded and the number of categories shown is capped.
+_PLAN_MAX_BYTES = 1024 * 1024
+# DOTALL: a path may hold a newline, and its category still comes last.
+_EVIDENCE_RE = re.compile(r"^(.*?) \(([^()]*)\)$", re.DOTALL)
+_EVIDENCE_MORE_RE = re.compile(r"^and (\d{1,9}) more$")
+_REASON_PATH_CHARS = 160
+_REASON_CATEGORY_CHARS = 60
+_REASON_CATEGORIES = 10
+
+# Stand-down: a standard review gives way to a deep review of the same head, and a deep
+# review gives way to a newer head. Each check makes at most _STANDDOWN_MAX_CALLS GETs,
+# every page included: one page of runs (the newest 100 for the head) and at most two
+# pages of jobs per run. Every lookup failure lets the review go ahead.
+_STANDDOWN_EXIT = 10
+_STANDDOWN_MAX_CALLS = 20
+_STANDDOWN_RUN_PAGES = 1
+_STANDDOWN_JOB_PAGES = 2
+_STANDDOWN_PER_PAGE = 100
+_GITHUB_DEEP_JOB_DEFAULT = "deep-review"
+_GITHUB_DEEP_JOB_CHARS = 200
+# The label the recommendation line tells reviewers to add. GitHub caps label names at 50.
+_GITHUB_DEEP_LABEL_DEFAULT = "deep-review"
+_GITHUB_DEEP_LABEL_CHARS = 50
+# Control, format (bidi overrides, zero-width marks), surrogate and line or paragraph
+# separator characters: each can hide or reorder text, or break the line.
+_LABEL_BAD_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Zl", "Zp"})
+# A deep review job in one of these states has started or is about to. A completed one
+# counts only when it succeeded: one that failed, was cancelled or skipped posted nothing.
+_GITHUB_JOB_STARTED = frozenset({"queued", "in_progress", "waiting", "requested", "pending"})
 
 _GITHUB_THREADS_QUERY = """
 query($owner: String!, $name: String!, $number: Int!, $after: String) {
@@ -994,10 +1059,83 @@ class _GitHubContext(NamedTuple):
     number: int
     head_sha: str
     run_url: str | None
+    # From the event payload, None when absent or malformed; nothing posts with them.
+    base_sha: str | None = None
+    author_login: str | None = None
 
     @property
     def repo_url(self) -> str:
         return f"{self.api_url}/repos/{self.owner}/{self.repo}"
+
+
+class _GitHubIdentity(NamedTuple):
+    """How one posting account appears as a REST ``user`` and as a GraphQL ``author``."""
+
+    rest_login: str
+    graphql_login: str
+    kind: str  # REST ``type`` and GraphQL ``__typename``: "Bot" or "User"
+
+    def _is_login(self, login: Any, expected: str) -> bool:
+        if not isinstance(login, str):
+            return False
+        # GitHub user logins are case-insensitive and ASCII; bot logins are compared exactly.
+        if self.kind == "User":
+            return login.isascii() and login.lower() == expected.lower()
+        return login == expected
+
+    def wrote_rest(self, user: Any) -> bool:
+        return (
+            isinstance(user, dict)
+            and user.get("type") == self.kind
+            and self._is_login(user.get("login"), self.rest_login)
+        )
+
+    def wrote_graphql(self, author: Any) -> bool:
+        # A deleted account comes back as a null author, which counts as human.
+        return (
+            isinstance(author, dict)
+            and author.get("__typename") == self.kind
+            and self._is_login(author.get("login"), self.graphql_login)
+        )
+
+
+_GITHUB_ACTIONS_IDENTITY = _GitHubIdentity(_GITHUB_BOT_REST_LOGIN, _GITHUB_BOT_GRAPHQL_LOGIN, "Bot")
+
+
+def _github_configured_identity() -> _GitHubIdentity | None:
+    """Return the account named by AI_REVIEW_BOT_LOGIN, or None for the workflow bot.
+
+    ``<slug>[bot]`` is a GitHub App, which GraphQL names without the suffix. A
+    plain login is the user behind a personal access token. Raises ValueError
+    on anything else.
+    """
+    login = os.environ.get(_GITHUB_BOT_LOGIN_ENV, "")
+    if not login or login == _GITHUB_BOT_REST_LOGIN:
+        return None
+    if _GITHUB_APP_LOGIN_RE.fullmatch(login):
+        return _GitHubIdentity(login, login[: -len("[bot]")], "Bot")
+    if _GITHUB_USER_LOGIN_RE.fullmatch(login):
+        return _GitHubIdentity(login, login, "User")
+    raise ValueError(
+        f"{_GITHUB_BOT_LOGIN_ENV} must be a GitHub App bot login like my-app[bot] "
+        f"or a GitHub user login, got: {login[:80]!r}"
+    )
+
+
+def _github_identities() -> tuple[_GitHubIdentity, tuple[_GitHubIdentity, ...]]:
+    """Return the account that posts now, and every account whose comments are ours.
+
+    Comments of the workflow bot stay ours after a switch to another account,
+    so its summaries and threads from earlier runs are still recognized.
+    """
+    try:
+        current = _github_configured_identity() or _GITHUB_ACTIONS_IDENTITY
+    except ValueError:
+        # _github_load_context exits on a bad value before any request; never widen on one.
+        current = _GITHUB_ACTIONS_IDENTITY
+    if current == _GITHUB_ACTIONS_IDENTITY:
+        return current, (current,)
+    return current, (current, _GITHUB_ACTIONS_IDENTITY)
 
 
 def _github_annotation(level: str, msg: str) -> None:
@@ -1014,6 +1152,11 @@ def _github_load_context() -> _GitHubContext:
     token = os.environ.get("GITHUB_TOKEN")
     if not token:
         _error("GITHUB_TOKEN environment variable is required")
+        sys.exit(1)
+    try:
+        _github_configured_identity()
+    except ValueError as e:
+        _error(str(e))
         sys.exit(1)
 
     api_url = (os.environ.get("GITHUB_API_URL") or "https://api.github.com").rstrip("/")
@@ -1056,6 +1199,17 @@ def _github_load_context() -> _GitHubContext:
     if not isinstance(head_sha, str) or not _GITHUB_SHA_RE.match(head_sha):
         _error(f"pull_request.head.sha: expected a hex commit SHA, got {head_sha!r}")
         sys.exit(1)
+    base = pull_request.get("base")
+    base_sha = base.get("sha") if isinstance(base, dict) else None
+    if not isinstance(base_sha, str) or not _GITHUB_SHA_RE.match(base_sha):
+        base_sha = None
+    # A pull request is opened by a user or by a GitHub App (<slug>[bot]).
+    author = pull_request.get("user")
+    author_login = author.get("login") if isinstance(author, dict) else None
+    if not isinstance(author_login, str) or not any(
+        pattern.fullmatch(author_login) for pattern in (_GITHUB_USER_LOGIN_RE, _GITHUB_APP_LOGIN_RE)
+    ):
+        author_login = None
 
     server_url = os.environ.get("GITHUB_SERVER_URL", "").rstrip("/")
     run_id = os.environ.get("GITHUB_RUN_ID", "")
@@ -1072,6 +1226,8 @@ def _github_load_context() -> _GitHubContext:
         number=number,
         head_sha=head_sha,
         run_url=run_url,
+        base_sha=base_sha,
+        author_login=author_login,
     )
 
 
@@ -1082,8 +1238,9 @@ def _github_paginated_get(
 
     Follows ``Link: rel="next"`` only when it stays on the API host over
     https, so the token never goes anywhere else. Raises requests.HTTPError
-    when the first page fails, or any page when ``strict`` is set: a caller
-    that looks for the newest item cannot work from a truncated list.
+    when the first page fails or is not a JSON list, or any page when
+    ``strict`` is set: a caller that looks for the newest item cannot work
+    from a truncated list.
     """
     api_netloc = urlparse(ctx.api_url).netloc
     results: list[Any] = []
@@ -1098,7 +1255,14 @@ def _github_paginated_get(
                 raise requests.exceptions.HTTPError(f"GitHub API returned HTTP {resp.status_code}")
             _warning(f"GitHub API returned HTTP {resp.status_code} during pagination")
             break
-        results.extend(resp.json())
+        page = resp.json()
+        if not isinstance(page, list):
+            # extend() would raise on null or a number, and walk the keys of an object.
+            if first_page or strict:
+                raise requests.exceptions.HTTPError("GitHub API returned a page that is not a list")
+            _warning("GitHub API returned a page that is not a list during pagination")
+            break
+        results.extend(page)
         first_page = False
         m = _GITHUB_NEXT_LINK_RE.search(resp.headers.get("Link", ""))
         if not m:
@@ -1112,20 +1276,19 @@ def _github_paginated_get(
 
 
 def _github_rest_is_ours(user: Any) -> bool:
-    return (
-        isinstance(user, dict)
-        and user.get("login") == _GITHUB_BOT_REST_LOGIN
-        and user.get("type") == "Bot"
-    )
+    return any(identity.wrote_rest(user) for identity in _github_identities()[1])
 
 
 def _github_graphql_is_ours(author: Any) -> bool:
-    # A deleted account comes back as a null author, which counts as human.
-    return (
-        isinstance(author, dict)
-        and author.get("login") == _GITHUB_BOT_GRAPHQL_LOGIN
-        and author.get("__typename") == "Bot"
-    )
+    return any(identity.wrote_graphql(author) for identity in _github_identities()[1])
+
+
+def _github_comment_is_ours(user: Any) -> bool:
+    """Whether a REST issue or review comment author is one of our posting accounts.
+
+    Callers still check that the body ends with their own marker.
+    """
+    return _github_rest_is_ours(user)
 
 
 def _github_trailing_marker(body: Any) -> re.Match[str] | None:
@@ -1135,20 +1298,33 @@ def _github_trailing_marker(body: Any) -> re.Match[str] | None:
 def _github_find_summary(
     session: requests.Session, ctx: _GitHubContext
 ) -> tuple[int | None, str | None]:
-    """Return the id and review SHA of our newest summary comment on the PR.
+    """Return the id of the summary to update and the review SHA to dedup against.
 
     Lists sort ascending, so the last match is the newest. A comment is ours
-    only when the workflow bot wrote it and its body ends with the marker.
+    only when one of our accounts wrote it and its body ends with the marker.
+    The id is that of the newest summary the current account wrote: editing
+    one of another account would keep that account as its author. The SHA
+    comes from that same summary, since every later run updates it, else from
+    our newest summary of either account. Taking it from a newer summary of
+    the other account would pin dedup to that summary's SHA for good.
     """
+    current, known = _github_identities()
     comment_id: int | None = None
-    sha: str | None = None
+    current_sha: str | None = None
+    newest_sha: str | None = None
     url = f"{ctx.repo_url}/issues/{ctx.number}/comments"
     for comment in _github_paginated_get(session, ctx, url, strict=True):
+        if not isinstance(comment, dict):
+            continue
         marker = _github_trailing_marker(comment.get("body"))
-        if marker and _github_rest_is_ours(comment.get("user")):
+        user = comment.get("user")
+        if not marker or not any(identity.wrote_rest(user) for identity in known):
+            continue
+        newest_sha = marker.group(1)
+        if current.wrote_rest(user):
             comment_id = comment["id"]
-            sha = marker.group(1)
-    return comment_id, sha
+            current_sha = marker.group(1)
+    return comment_id, current_sha or newest_sha
 
 
 def _github_thread_covers_dropped(thread: dict[str, Any], dropped: set[tuple[str, int]]) -> bool:
@@ -1315,61 +1491,383 @@ def _github_delete_previous_threads(
     return protected
 
 
+# ---------------------------------------------------------------------------
+# Stand-down
+# ---------------------------------------------------------------------------
+
+
+class _GitHubLookupError(Exception):
+    """A stand-down lookup that did not answer cleanly. The message names the cause only."""
+
+
+class _GitHubBudgetError(Exception):
+    """A stand-down check used up its calls before it found an answer."""
+
+
+class _GitHubBudget:
+    def __init__(self, calls: int) -> None:
+        self.remaining = calls
+
+    def spend(self) -> None:
+        if self.remaining <= 0:
+            raise _GitHubBudgetError
+        self.remaining -= 1
+
+
+def _github_wrapped_pages(
+    session: requests.Session,
+    ctx: _GitHubContext,
+    url: str,
+    key: str,
+    params: dict[str, Any],
+    *,
+    max_pages: int,
+    budget: _GitHubBudget,
+) -> Iterator[tuple[list[Any], bool]]:
+    """Yield the list under ``key`` from each page of a wrapped list such as workflow runs.
+
+    Follows ``Link: rel="next"`` only over https on the API host, as
+    _github_paginated_get does. The path is not pinned: these next links use
+    ``/repositories/{id}/...``. The flag is True when the page cap left a next
+    page unread. Raises _GitHubLookupError on any failure, after yielding the
+    pages read so far, and _GitHubBudgetError before a GET the budget cannot pay.
+    """
+    api_netloc = urlparse(ctx.api_url).netloc
+    request_params: dict[str, Any] | None = params
+    for page in range(1, max_pages + 1):
+        budget.spend()
+        try:
+            resp = session.get(url, params=request_params)
+        except requests.exceptions.RequestException as e:
+            raise _GitHubLookupError(type(e).__name__) from None
+        request_params = None
+        if resp.status_code != 200:
+            raise _GitHubLookupError(f"HTTP {resp.status_code}")
+        try:
+            payload = resp.json()
+        except ValueError:
+            raise _GitHubLookupError("invalid JSON") from None
+        items = payload.get(key) if isinstance(payload, dict) else None
+        if not isinstance(items, list):
+            raise _GitHubLookupError(f"no {key} list")
+        m = _GITHUB_NEXT_LINK_RE.search(resp.headers.get("Link", ""))
+        if not m or page == max_pages:
+            yield items, bool(m)
+            return
+        yield items, False
+        next_url = urlparse(m.group(1))
+        if next_url.scheme != "https" or next_url.netloc != api_netloc:
+            raise _GitHubLookupError("pagination link off the API host")
+        url = m.group(1)
+
+
+def _github_deep_job_matches(name: Any, deep_job: str) -> bool:
+    """Whether a job name from the jobs API is the deep review job ``deep_job``.
+
+    ``deep_job`` is the job's display name: its ``name:``, else its key. A
+    matrix job shows as ``J (value)``, and a job of a called reusable workflow
+    as ``J / callee``. The comparison is exact: a suffix rule would let
+    ``review`` match the standard job ``review / review``.
+    """
+    if not isinstance(name, str) or not deep_job:
+        return False
+    if name == deep_job or name.startswith(deep_job + " / "):
+        return True
+    first = name.split(" / ", 1)[0]
+    return first.startswith(deep_job + " (") and first.endswith(")")
+
+
+def _github_runs_to_check(runs: list[Any], ctx: _GitHubContext) -> list[dict[str, Any]]:
+    """Return the runs of this PR head that may hold a deep review job, unfinished first."""
+    candidates = []
+    for run in runs:
+        if not isinstance(run, dict):
+            continue
+        run_id = run.get("id")
+        if not isinstance(run_id, int) or isinstance(run_id, bool) or run_id <= 0:
+            continue
+        if run.get("head_sha") != ctx.head_sha or run.get("event") != "pull_request":
+            continue
+        # Every job of such a run was skipped, so it has no deep review to find.
+        if run.get("status") == "completed" and run.get("conclusion") == "skipped":
+            continue
+        # The list is empty for forks and closed PRs, so it can only rule a run out:
+        # another open PR from a branch with the same head.
+        prs = run.get("pull_requests")
+        if (
+            isinstance(prs, list)
+            and prs
+            and not any(isinstance(p, dict) and p.get("number") == ctx.number for p in prs)
+        ):
+            continue
+        candidates.append(run)
+    # sorted() is stable, so each group keeps the API's newest-first order.
+    return sorted(candidates, key=lambda r: r.get("status") == "completed")
+
+
+def _github_find_deep_review(
+    session: requests.Session, ctx: _GitHubContext, deep_job: str
+) -> dict[str, Any] | None:
+    """Return a deep review job for this head that started or succeeded, else None.
+
+    The current run counts, since a push can start both reviews in one run.
+    Only the job running this check is skipped: same run, same runner and still
+    in progress, so a deep job name that also matches the standard job cannot
+    block it forever. A self-hosted runner keeps its name from job to job, so a
+    deep job that already finished on it in this run still counts.
+    """
+    budget = _GitHubBudget(_STANDDOWN_MAX_CALLS)
+    own_run = os.environ.get("GITHUB_RUN_ID", "")
+    own_runner = os.environ.get("RUNNER_NAME", "")
+    runs: list[Any] = []
+    params = {"head_sha": ctx.head_sha, "event": "pull_request", "per_page": _STANDDOWN_PER_PAGE}
+    for items, more in _github_wrapped_pages(
+        session,
+        ctx,
+        f"{ctx.repo_url}/actions/runs",
+        "workflow_runs",
+        params,
+        max_pages=_STANDDOWN_RUN_PAGES,
+        budget=budget,
+    ):
+        runs.extend(items)
+        if more:
+            _github_annotation(
+                "warning",
+                f"More than {len(runs)} workflow runs for {ctx.head_sha[:8]}; "
+                f"checked the newest {len(runs)} for a deep review.",
+            )
+
+    for run in _github_runs_to_check(runs, ctx):
+        own = bool(own_runner) and own_run.isdigit() and int(own_run) == run["id"]
+        for items, more in _github_wrapped_pages(
+            session,
+            ctx,
+            f"{ctx.repo_url}/actions/runs/{run['id']}/jobs",
+            "jobs",
+            {"filter": "latest", "per_page": _STANDDOWN_PER_PAGE},
+            max_pages=_STANDDOWN_JOB_PAGES,
+            budget=budget,
+        ):
+            for job in items:
+                if not isinstance(job, dict):
+                    continue
+                if (
+                    own
+                    and job.get("runner_name") == own_runner
+                    and job.get("status") == "in_progress"
+                ):
+                    continue
+                if not _github_deep_job_matches(job.get("name"), deep_job):
+                    continue
+                if job.get("head_sha") and job.get("head_sha") != ctx.head_sha:
+                    continue
+                status = job.get("status")
+                if status is not None and not isinstance(status, str):
+                    # A list or object is not hashable, so the set lookup would raise.
+                    raise _GitHubLookupError("unexpected job status")
+                if status in _GITHUB_JOB_STARTED or (
+                    status == "completed" and job.get("conclusion") == "success"
+                ):
+                    return job
+            if more:
+                _github_annotation(
+                    "warning",
+                    f"Run {run['id']} has more jobs than the stand-down check reads; "
+                    "checked the first pages only.",
+                )
+    return None
+
+
+def _github_head_moved(session: requests.Session, ctx: _GitHubContext) -> bool:
+    """Deep mode: whether the PR has a newer head than the one this run reviewed."""
+    reason = None
+    current = None
+    try:
+        resp = session.get(f"{ctx.repo_url}/pulls/{ctx.number}")
+        if resp.status_code != 200:
+            reason = f"HTTP {resp.status_code}"
+        else:
+            payload = resp.json()
+            head = payload.get("head") if isinstance(payload, dict) else None
+            current = head.get("sha") if isinstance(head, dict) else None
+            if not isinstance(current, str) or not _GITHUB_SHA_RE.match(current):
+                reason = "no head SHA"
+    except requests.exceptions.RequestException as e:
+        reason = type(e).__name__
+    except ValueError:
+        reason = "invalid JSON"
+    if reason is not None or current is None:
+        _github_annotation(
+            "warning",
+            f"Could not check whether PR #{ctx.number} has a newer head ({reason}); "
+            "continuing without the check.",
+        )
+        return False
+    if current == ctx.head_sha:
+        return False
+    _github_annotation(
+        "notice",
+        f"PR #{ctx.number} moved to {current[:8]} since this run started "
+        f"({ctx.head_sha[:8]}); the deep review stands down.",
+    )
+    return True
+
+
+def _github_stands_down(
+    session: requests.Session, ctx: _GitHubContext, mode: str, deep_job: str
+) -> bool:
+    """Whether a review that should win makes this one redundant. Never writes.
+
+    Standard mode gives way to a deep review job of the same head that started
+    or succeeded. Deep mode gives way to a newer head. A lookup that fails
+    warns once and lets the review go ahead.
+    """
+    if mode == "deep":
+        return _github_head_moved(session, ctx)
+    try:
+        job = _github_find_deep_review(session, ctx, deep_job)
+    except _GitHubLookupError as e:
+        # Only a refused lookup points at the permission.
+        hint = (
+            "grant the job 'actions: read' so the standard review can stand down for one"
+            if str(e) in ("HTTP 403", "HTTP 404")
+            else "the lookup failed"
+        )
+        _github_annotation(
+            "warning",
+            f"Could not check for a deep review ({e}); {hint}. Continuing without the check.",
+        )
+        return False
+    except _GitHubBudgetError:
+        _github_annotation(
+            "warning",
+            f"The check for a deep review stopped after {_STANDDOWN_MAX_CALLS} API calls; "
+            "continuing without it.",
+        )
+        return False
+    if job is None:
+        return False
+    name = _CONTROL_CHARS_RE.sub("", job["name"])[:_GITHUB_DEEP_JOB_CHARS]
+    _github_annotation(
+        "notice",
+        f"{name} ({job.get('status')}) is running or has posted for {ctx.head_sha[:8]}; "
+        "the standard review stands down.",
+    )
+    return True
+
+
+def _github_deep_job(value: str | None) -> str:
+    """Return the deep review job name to match, exiting 1 on an unusable one."""
+    if value is None:
+        return _GITHUB_DEEP_JOB_DEFAULT
+    if not value or len(value) > _GITHUB_DEEP_JOB_CHARS or _CONTROL_CHARS_RE.search(value):
+        _error(
+            f"--deep-job must be a job name of 1 to {_GITHUB_DEEP_JOB_CHARS} characters "
+            "without control characters"
+        )
+        sys.exit(1)
+    return value
+
+
+def _github_deep_label(value: str | None) -> str:
+    """Return the label the deep review recommendation names, exiting 1 on an unusable one."""
+    if value is None:
+        return _GITHUB_DEEP_LABEL_DEFAULT
+    if (
+        not value.strip()
+        or len(value) > _GITHUB_DEEP_LABEL_CHARS
+        or any(unicodedata.category(ch) in _LABEL_BAD_CATEGORIES for ch in value)
+    ):
+        _error(
+            f"--deep-label must be a label name of 1 to {_GITHUB_DEEP_LABEL_CHARS} characters, "
+            "not blank, without control or invisible format characters"
+        )
+        sys.exit(1)
+    return value
+
+
+def _github_label_span(label: str) -> str:
+    """Render a label name as an inline code span, keeping a plain name as `name`.
+
+    The delimiter outlasts any backtick run in the name; the padding keeps a backtick
+    at either end from joining the delimiter, and GitHub strips it again.
+    """
+    delimiter = "`" * (_longest_backtick_run(label) + 1)
+    pad = " " if "`" in label else ""
+    return f"{delimiter}{pad}{label}{pad}{delimiter}"
+
+
+def _github_session(ctx: _GitHubContext) -> requests.Session:
+    session = _SafeSession()
+    session.headers.update(
+        {
+            "Authorization": f"Bearer {ctx.token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+    )
+    return session
+
+
+def cmd_stand_down(args: argparse.Namespace) -> None:
+    """Exit 10 when the review should stand down, 0 when it should go ahead."""
+    ctx = _github_load_context()
+    deep_job = _github_deep_job(args.deep_job)
+    if _github_stands_down(_github_session(ctx), ctx, args.mode, deep_job):
+        sys.exit(_STANDDOWN_EXIT)
+
+
 def _scan_fences(text: str) -> tuple[list[tuple[str, bool]], str | None]:
     """Split ``text`` into lines flagged as inside a fenced block (fences included).
 
-    Also returns the opening fence still unclosed at the end, if any.
+    Also returns a closer for the fence still open at the end, if any. The
+    closer keeps the opener's indentation, so a fence opened inside a list
+    item closes there instead of opening a new top-level fence.
     """
     lines: list[tuple[str, bool]] = []
     fence: str | None = None
+    indent = ""
     for line in text.split("\n"):
         if fence is None:
             opened = _FENCE_OPEN_RE.match(line)
             if opened:
-                fence = opened.group(1)
+                indent, fence = opened.group(1), opened.group(2)
             lines.append((line, bool(opened)))
             continue
         lines.append((line, True))
         closed = _FENCE_CLOSE_RE.match(line)
         if closed and closed.group(1)[0] == fence[0] and len(closed.group(1)) >= len(fence):
             fence = None
-    return lines, fence
+    return lines, (f"{indent}{fence}" if fence else None)
 
 
-def _neutralize_mentions(line: str) -> str:
-    """Put a zero-width space after each @ (or its HTML entity) outside inline code spans."""
+def _github_defuse(text: str) -> str:
+    """Put a zero-width space after each ``<!--`` and each @ (or its HTML entity).
 
-    def defuse(chunk: str) -> str:
-        return _MENTION_RE.sub(lambda m: m.group(1) + _ZWSP, chunk)
-
-    parts: list[str] = []
-    pos = 0
-    for span in _CODE_SPAN_RE.finditer(line):
-        if span.group(1) is None:
-            continue
-        parts.append(defuse(line[pos : span.start()]))
-        parts.append(span.group(0))
-        pos = span.end()
-    parts.append(defuse(line[pos:]))
-    return "".join(parts)
-
-
-def _github_text(text: str, *, mentions: bool = True) -> str:
-    """Make model-written text safe to post as a GitHub comment.
-
-    ``<!--`` gets a zero-width space everywhere, fences and code spans
-    included, because the ownership marker is matched on the raw text.
-    Mentions (``@user``, ``@org/team``) are defused outside code spans and
-    fenced blocks, so code such as ``@property`` stays copy-pasteable. Pass
-    ``mentions=False`` for text that goes inside a fenced block anyway.
+    Applies everywhere in model text, code spans and fences included. Finding
+    code by regex is not reliable (HTML blocks, spans across lines, list
+    indentation), and a missed span leaves a live mention. A zero-width space
+    in a code sample costs only copy-paste fidelity.
     """
     text = text.replace("<!--", f"<{_ZWSP}!--")
-    if not mentions:
-        return text
-    lines, open_fence = _scan_fences(text)
-    safe = "\n".join(line if in_code else _neutralize_mentions(line) for line, in_code in lines)
-    # A fence left open would swallow the next fragment of the body and hide its mentions.
-    return f"{safe}\n{open_fence}" if open_fence else safe
+    return _MENTION_RE.sub(lambda m: m.group(1) + _ZWSP, text)
+
+
+def _github_text(text: str) -> str:
+    """Make model-written text safe to post as one fragment of a GitHub comment.
+
+    ``<!--`` is defused because the ownership marker is matched on the raw
+    text, and mentions (``@user``, ``@org/team``) so model text cannot ping
+    anyone. A fence left open is closed, so it cannot swallow the next fragment.
+    """
+    return _github_close_fence(_github_defuse(text))
+
+
+def _github_close_fence(text: str) -> str:
+    """Close a fence left open at the end of ``text``."""
+    _, open_fence = _scan_fences(text)
+    return f"{text}\n{open_fence}" if open_fence else text
 
 
 def _longest_backtick_run(text: str) -> int:
@@ -1381,6 +1879,127 @@ def _github_code_span(text: str) -> str:
     text = " ".join(text.split())
     delimiter = "`" * (_longest_backtick_run(text) + 1)
     return f"{delimiter} {text} {delimiter}"
+
+
+def _github_reason_text(value: str) -> str:
+    """Flatten ``value`` to one line without backticks, control or format characters.
+
+    Format characters (category Cf, such as bidi overrides and zero-width
+    marks) are invisible, so they could make a path read differently than it is.
+    """
+    value = "".join(ch for ch in value if unicodedata.category(ch) != "Cf")
+    return " ".join(_CONTROL_CHARS_RE.sub(" ", value.replace("`", "")).split())
+
+
+def _github_reason_path(value: str) -> str:
+    """Render a path from the pull request as an inert, bounded code span."""
+    cleaned = _github_reason_text(value)
+    cleaned = cleaned[:_REASON_PATH_CHARS]
+    return f"`{cleaned}`" if cleaned else "(unnamed path)"
+
+
+def _github_reason_summary(evidence: list[str]) -> str:
+    """Show one path per evidence category and count the remaining paths.
+
+    Evidence entries look like ``path (category)`` or ``and N more (category)``,
+    as panel.py triage writes them.
+    """
+    grouped: dict[str, tuple[str | None, int]] = {}
+    for reason in evidence:
+        match = _EVIDENCE_RE.fullmatch(reason)
+        label, category = match.groups() if match else (reason, "changes")
+        example, count = grouped.get(category, (None, 0))
+        more = _EVIDENCE_MORE_RE.fullmatch(label)
+        if more:
+            count += int(more.group(1))
+        else:
+            example = example or label
+            count += 1
+        grouped[category] = (example, count)
+    parts = []
+    for category, (example, count) in list(grouped.items())[:_REASON_CATEGORIES]:
+        name = _github_reason_text(category)
+        name = html.escape(name[:_REASON_CATEGORY_CHARS], quote=False) or "changes"
+        path = f": {_github_reason_path(example)}" if example is not None else ""
+        extra = f" and {count - 1} more" if example is not None and count > 1 else ""
+        parts.append(f"{name}{path}{extra}")
+    if len(grouped) > _REASON_CATEGORIES:
+        parts.append(f"and {len(grouped) - _REASON_CATEGORIES} more categories")
+    return "; ".join(parts)
+
+
+def _github_read_plan(path: str) -> dict[str, Any] | None:
+    """Read a triage plan file, or warn and return None when it is unusable."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as e:
+        reason = "does not exist" if isinstance(e, FileNotFoundError) else "is unreadable"
+        _github_annotation("warning", f"No deep-review recommendation: the triage plan {reason}")
+        return None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            reason = "is not a regular file"
+        elif info.st_size > _PLAN_MAX_BYTES:
+            reason = "is larger than 1 MiB"
+        else:
+            with os.fdopen(fd, "rb") as f:
+                fd = -1
+                raw = f.read(_PLAN_MAX_BYTES + 1)
+            if len(raw) > _PLAN_MAX_BYTES:
+                reason = "is larger than 1 MiB"
+            else:
+                try:
+                    # json.loads would also take UTF-16 and UTF-32 bytes; panel.py writes UTF-8.
+                    # utf-8-sig still accepts a UTF-8 plan that starts with a BOM.
+                    plan = json.loads(raw.decode("utf-8-sig"))
+                except (ValueError, RecursionError):
+                    reason = "is not valid JSON"
+                else:
+                    if isinstance(plan, dict):
+                        return plan
+                    reason = "is not a JSON object"
+    except OSError:
+        reason = "is unreadable"
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    _github_annotation("warning", f"No deep-review recommendation: the triage plan {reason}")
+    return None
+
+
+def _github_recommendation(path: str, label: str = _GITHUB_DEEP_LABEL_DEFAULT) -> str | None:
+    """Build the deep-review recommendation line from a triage plan, or None.
+
+    Only a plan whose tier is ``deep`` yields a line. Any other tier is silent;
+    a file that cannot be used, or has the wrong shape, gets one warning. ``label``
+    is the label that starts the deep review, checked by ``_github_deep_label``; the
+    summary defuses mentions and ``<!--`` in the whole line.
+    """
+    plan = _github_read_plan(path)
+    if plan is None:
+        return None
+    tier = plan.get("tier")
+    name = tier.get("name") if isinstance(tier, dict) else None
+    evidence = tier.get("evidence") if isinstance(tier, dict) else None
+    if isinstance(name, str) and name != "deep":
+        return None
+    if (
+        name != "deep"
+        or not isinstance(evidence, list)
+        or not all(isinstance(e, str) for e in evidence)
+    ):
+        _github_annotation(
+            "warning", "No deep-review recommendation: the triage plan has an unexpected shape"
+        )
+        return None
+    reasons = _github_reason_summary(evidence)
+    reason_text = f"{reasons}. " if reasons else ""
+    return (
+        f"**Deep review recommended:** {reason_text}"
+        f"Add the {_github_label_span(label)} label to this pull request to run it."
+    )
 
 
 def _github_cap(text: str, marker: str, limit: int = _GITHUB_BODY_LIMIT) -> str:
@@ -1494,14 +2113,21 @@ def _github_build_summary_body(
     run_url: str | None = None,
     unanchored: list[dict[str, Any]] | None = None,
     carried: int = 0,
+    recommendation: str | None = None,
+    mode: str | None = None,
 ) -> str:
     """Build the markdown summary body for the PR comment.
 
     ``data["inline_comments"]`` holds the findings that were posted inline;
     ``unanchored`` holds the ones that were not posted inline; ``carried`` is
     the number of earlier threads still open on code that did not change.
+    ``recommendation`` is a line placed directly under the heading. With ``mode``
+    ``deep`` the counts are headed as inline comments, since the panel's own summary
+    counts every finding, and the footer names the mode.
     """
     parts: list[str] = ["## AI Code Review Summary\n"]
+    if recommendation:
+        parts.append(_github_defuse(recommendation) + "\n")
     parts.append(_github_text(str(data.get("summary") or "No summary provided.")))
     raw_positives = data.get("positive_aspects")
     if isinstance(raw_positives, str):
@@ -1511,9 +2137,12 @@ def _github_build_summary_body(
     positives = [str(p) for p in raw_positives]
     # Defuse each line after its list prefix is added, as GitHub renders it.
     parts.extend(_github_text(line) for line in _summary_positive_lines(positives))
+    inline_posted = data.get("inline_comments", [])
+    deep = mode == "deep"
     count_lines = _summary_count_lines(
-        data.get("inline_comments", []),
+        inline_posted,
         "use **Commit suggestion** on the inline comment",
+        f"Inline comments ({len(inline_posted)})" if deep else None,
     )
     if carried > 0:
         carried_line = f"- Still open from earlier runs, on code that did not change: {carried}"
@@ -1528,7 +2157,7 @@ def _github_build_summary_body(
     footer = (
         "\n\n---\n"
         "*Generated by [Code Review](https://github.com/opendatahub-io/code-review-skills)"
-        f"{run}{_footer_facts()}*"
+        f"{run}{_footer_facts()}{' • Mode: deep' if deep else ''}*"
     )
     # Most severe first, so the cap leaves out the least severe findings.
     ranked = sorted(
@@ -1550,7 +2179,11 @@ def _github_build_summary_body(
                 comment = c["comment"]
                 if max_chars is not None and len(comment) > max_chars:
                     comment = comment[: max_chars - 1] + "\u2026"
-                text = _github_text(f"- {where} ({c['severity']}): {comment}")
+                # The path sits in a code span built here, so only the comment is defused.
+                # The fence check runs on the whole line: the prefix can make an opener prose.
+                text = _github_close_fence(
+                    f"- {where} ({c['severity']}): {_github_defuse(comment)}"
+                )
                 lines.append(text.replace("\n", "\n  "))
             if len(ranked) > _GITHUB_LISTED_FINDINGS:
                 lines.append(f"- ... and {len(ranked) - _GITHUB_LISTED_FINDINGS} more not listed")
@@ -1561,7 +2194,7 @@ def _github_build_summary_body(
             lines.append(
                 "\n**Copy-paste this into a prompt to automatically fix the issues found:**"
             )
-            lines.append(f"\n{fence}\n{_github_text(fix_prompt, mentions=False)}\n{fence}")
+            lines.append(f"\n{fence}\n{_github_defuse(fix_prompt)}\n{fence}")
         return "\n".join(lines) + footer
 
     text = assemble(None)
@@ -1598,9 +2231,24 @@ def _github_upsert_summary(
     return False
 
 
+def _github_mark_posted(path: str) -> None:
+    """Create the --posted-flag file. A failure only warns: the review itself is posted."""
+    try:
+        Path(path).write_text("posted\n", encoding="utf-8")
+    except OSError as e:
+        _warning(f"Could not write the posted flag ({type(e).__name__})")
+
+
 def _github_post(args: argparse.Namespace) -> None:
     """Post review results to the GitHub pull request named by the Actions event."""
     ctx = _github_load_context()
+    # Without --mode nothing checks for a review that should win, as before.
+    mode = getattr(args, "mode", None)
+    deep_job = _github_deep_job(getattr(args, "deep_job", None))
+    deep_label = _github_deep_label(getattr(args, "deep_label", None))
+    # Written only once the summary is up, so a caller can tell a review that posted from
+    # one that stood down or found the head moved, which both exit 0.
+    posted_flag = getattr(args, "posted_flag", None)
     verbose = _resolve_verbose(args)
     chill = _resolve_chill(args)
     inline_fixes = _resolve_inline_fixes(args)
@@ -1611,6 +2259,11 @@ def _github_post(args: argparse.Namespace) -> None:
         _error(f"Failed to parse review JSON: {e}")
         sys.exit(1)
 
+    plan_path = getattr(args, "deep_recommendation_plan", None)
+    recommendation = (
+        _github_recommendation(plan_path, deep_label) if plan_path is not None else None
+    )
+
     # A path with a control character is never in a diff, and printing it
     # would let the model start a workflow command in the log.
     clean = [c for c in data["inline_comments"] if not _CONTROL_CHARS_RE.search(c["file"])]
@@ -1618,14 +2271,7 @@ def _github_post(args: argparse.Namespace) -> None:
         _warning(f"Dropped {len(data['inline_comments']) - len(clean)} comment(s): bad file path")
         data["inline_comments"] = clean
 
-    session = _SafeSession()
-    session.headers.update(
-        {
-            "Authorization": f"Bearer {ctx.token}",
-            "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2022-11-28",
-        }
-    )
+    session = _github_session(ctx)
     head_sha = ctx.head_sha
     review_marker = _make_review_marker(head_sha)
 
@@ -1646,7 +2292,10 @@ def _github_post(args: argparse.Namespace) -> None:
 
         summary_id, prev_sha = _github_find_summary(session, ctx)
         original = list(data["inline_comments"])
-        if prev_sha and prev_sha != head_sha:
+        # A deep review re-reviews the whole pull request and replaces every earlier thread,
+        # so it posts all its findings. The summary SHA may come from a standard review that
+        # never saw them.
+        if prev_sha and prev_sha != head_sha and mode != "deep":
             _step(f"Found previous review (sha: {prev_sha[:8]}...), filtering unchanged code...")
             data = filter_already_reviewed(data, prev_sha, head_sha)
 
@@ -1661,6 +2310,8 @@ def _github_post(args: argparse.Namespace) -> None:
                 if c.get("fix"):
                     dropped.add((c["file"], c["fix"]["end_line"]))
 
+        if mode and _github_stands_down(session, ctx, mode, deep_job):
+            return
         carried = _github_delete_previous_threads(session, ctx, dropped, verbose=verbose)
 
         inline = data.get("inline_comments", [])
@@ -1706,10 +2357,15 @@ def _github_post(args: argparse.Namespace) -> None:
         # come back instead of staying dropped as "unchanged code".
         summary_marker = review_marker if not (unanchored or failed) else _make_review_marker()
         summary_body = _github_build_summary_body(
-            data, summary_marker, ctx.run_url, unanchored, carried
+            data, summary_marker, ctx.run_url, unanchored, carried, recommendation, mode
         )
+        # The inline comments are already up; a review that should win replaces them.
+        if mode and _github_stands_down(session, ctx, mode, deep_job):
+            return
         if _github_upsert_summary(session, ctx, summary_body, summary_id, verbose=verbose):
             _success(f"Summary posted to pull request #{ctx.number}")
+            if posted_flag is not None:
+                _github_mark_posted(posted_flag)
         else:
             _error("Failed to post summary comment")
             sys.exit(1)
@@ -1908,6 +2564,10 @@ def gitlab_has_reviewer_suggestion(session: requests.Session, api_base: str) -> 
 
 def cmd_suggest_reviewers(args: argparse.Namespace) -> None:
     """Identify and suggest reviewers for the MR based on git history."""
+    if getattr(args, "platform", "auto") == "github":
+        _github_suggest_reviewers(args)
+        return
+
     token = os.environ.get("GITLAB_API_TOKEN")
     if not token:
         _error("GITLAB_API_TOKEN environment variable is required")
@@ -1988,6 +2648,260 @@ def cmd_suggest_reviewers(args: argparse.Namespace) -> None:
         if verbose:
             print(resp.text, file=sys.stderr)
         sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# Suggest reviewers on GitHub
+# ---------------------------------------------------------------------------
+
+# History is read for at most this many changed files: 20 queries, about 20 GraphQL points.
+_GITHUB_SUGGEST_MAX_FILES = 400
+_GITHUB_HISTORY_PER_FILE = 50
+_GITHUB_IGNORE_REVS_FILE = ".git-blame-ignore-revs"
+_GITHUB_IGNORE_REV_RE = re.compile(r"[0-9a-f]{40,64}")
+
+
+class _GitHubSuggestError(Exception):
+    """A lookup or the post failed; the suggestion is skipped with a warning."""
+
+
+def _github_git(*args: str) -> bytes:
+    try:
+        return subprocess.check_output(["git", *args], stderr=subprocess.DEVNULL)
+    except (subprocess.CalledProcessError, OSError) as e:
+        raise _GitHubSuggestError(f"git {args[0]} failed") from e
+
+
+def _github_changed_files(base_sha: str, head_sha: str) -> list[str]:
+    """Files the pull request adds or modifies, diffed from the merge base to the head.
+
+    -z keeps paths unquoted; a path that is not UTF-8 cannot be looked up and is skipped.
+    """
+    merge_base = _github_git("merge-base", base_sha, head_sha).decode("ascii", "replace").strip()
+    if not _GITHUB_SHA_RE.match(merge_base):
+        raise _GitHubSuggestError("git merge-base found no common commit")
+    out = _github_git(
+        "diff", "--name-only", "--diff-filter=d", "--no-ext-diff", "-z", merge_base, head_sha
+    )
+    files = []
+    for raw in out.split(b"\0"):
+        try:
+            path = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+        if path:
+            files.append(path)
+    return files
+
+
+def _github_ignored_revs(head_sha: str) -> set[str]:
+    """Commits listed in .git-blame-ignore-revs at the head; none when the file is absent."""
+    try:
+        out = subprocess.check_output(
+            ["git", "show", "--no-textconv", f"{head_sha}:{_GITHUB_IGNORE_REVS_FILE}"],
+            stderr=subprocess.DEVNULL,
+        )
+    except (subprocess.CalledProcessError, OSError):
+        return set()
+    revs = set()
+    for line in out.decode("utf-8", "replace").splitlines():
+        rev = line.split("#", 1)[0].strip().lower()
+        if _GITHUB_IGNORE_REV_RE.fullmatch(rev):
+            revs.add(rev)
+    return revs
+
+
+def _github_history_query(count: int) -> str:
+    """History of ``count`` paths at one commit. Paths are variables, never query text."""
+    decls = "".join(f", $p{i}: String!" for i in range(count))
+    fields = "\n".join(
+        f"        f{i}: history(first: {_GITHUB_HISTORY_PER_FILE}, path: $p{i}) "
+        "{ nodes { oid author { user { __typename login } } } }"
+        for i in range(count)
+    )
+    return (
+        "query($owner: String!, $name: String!, $oid: GitObjectID!" + decls + ") {\n"
+        "  repository(owner: $owner, name: $name) {\n"
+        "    object(oid: $oid) {\n"
+        "      ... on Commit {\n" + fields + "\n      }\n    }\n  }\n}"
+    )
+
+
+def _github_history_login(node: Any, ignored: set[str], pr_author: str) -> str | None:
+    """The login to credit for one history commit, or None when it does not count."""
+    if not isinstance(node, dict):
+        return None
+    oid = node.get("oid")
+    if isinstance(oid, str) and oid.lower() in ignored:
+        return None
+    author = node.get("author")
+    user = author.get("user") if isinstance(author, dict) else None
+    # A commit email linked to no account gives a null user.
+    if not isinstance(user, dict) or user.get("__typename") != "User":
+        return None
+    login = user.get("login")
+    # The login goes into a live @mention, so it must be a plain GitHub user login.
+    if (
+        not isinstance(login, str)
+        or login.endswith("[bot]")
+        or not _GITHUB_USER_LOGIN_RE.fullmatch(login)
+    ):
+        return None
+    if login.lower() == pr_author.lower():
+        return None
+    return login
+
+
+def _github_history_authors(
+    session: requests.Session,
+    ctx: _GitHubContext,
+    oid: str,
+    files: list[str],
+    ignored: set[str],
+    pr_author: str,
+) -> list[tuple[str, int]]:
+    """Commit counts per login over the files' history at ``oid``, highest first."""
+    counts: dict[str, int] = {}
+    logins: dict[str, str] = {}
+    for start in range(0, len(files), _FILES_PER_GRAPHQL_BATCH):
+        batch = files[start : start + _FILES_PER_GRAPHQL_BATCH]
+        variables: dict[str, Any] = {"owner": ctx.owner, "name": ctx.repo, "oid": oid}
+        variables.update((f"p{i}", path) for i, path in enumerate(batch))
+        resp = session.post(
+            ctx.graphql_url,
+            json={"query": _github_history_query(len(batch)), "variables": variables},
+        )
+        if resp.status_code != 200:
+            raise _GitHubSuggestError(f"the history query failed (HTTP {resp.status_code})")
+        payload = resp.json()
+        if not isinstance(payload, dict) or payload.get("errors"):
+            raise _GitHubSuggestError("the history query returned errors")
+        data = payload.get("data")
+        repository = data.get("repository") if isinstance(data, dict) else None
+        commit = repository.get("object") if isinstance(repository, dict) else None
+        if not isinstance(commit, dict):
+            raise _GitHubSuggestError(f"the history query found no commit {oid[:8]}")
+        for i in range(len(batch)):
+            connection = commit.get(f"f{i}")
+            nodes = connection.get("nodes") if isinstance(connection, dict) else None
+            for node in nodes if isinstance(nodes, list) else []:
+                login = _github_history_login(node, ignored, pr_author)
+                if login is None:
+                    continue
+                # Logins are case-insensitive; credit one account once.
+                key = login.lower()
+                logins.setdefault(key, login)
+                counts[key] = counts.get(key, 0) + 1
+    ranked = sorted(counts, key=lambda key: (-counts[key], key))
+    return [(logins[key], counts[key]) for key in ranked]
+
+
+def _github_reviewer_comment(reviewers: list[tuple[str, int]]) -> str:
+    """The suggestion comment; logins passed the user login check, so each @ is a mention."""
+    lines = [
+        "## Suggested Reviewers",
+        "",
+        "The following users have recently contributed to the files modified in this "
+        "pull request and may be well-suited to review these changes:",
+        "",
+        "| Reviewer | Commits on modified files |",
+        "|----------|--------------------------|",
+    ]
+    lines.extend(f"| @{login} | {count} |" for login, count in reviewers)
+    mentions = " ".join(f"@{login}" for login, _ in reviewers)
+    lines.extend(
+        [
+            "",
+            f"{mentions}, please consider reviewing this pull request.",
+            "",
+            SUGGESTED_REVIEWERS_MARKER,
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _github_has_reviewer_suggestion(session: requests.Session, ctx: _GitHubContext) -> bool:
+    """Whether one of our accounts already posted a comment ending with the marker.
+
+    Reads every page: a partial list could miss the comment and post a second one.
+    """
+    url = f"{ctx.repo_url}/issues/{ctx.number}/comments"
+    for comment in _github_paginated_get(session, ctx, url, strict=True):
+        if not isinstance(comment, dict):
+            continue
+        body = comment.get("body")
+        if (
+            isinstance(body, str)
+            and body.strip().endswith(SUGGESTED_REVIEWERS_MARKER)
+            and _github_comment_is_ours(comment.get("user"))
+        ):
+            return True
+    return False
+
+
+def _github_post_reviewer_suggestion(
+    session: requests.Session, ctx: _GitHubContext, base_sha: str, pr_author: str
+) -> None:
+    if _github_has_reviewer_suggestion(session, ctx):
+        _success("Reviewers already suggested, skipping")
+        return
+
+    _step("Getting modified files...")
+    files = _github_changed_files(base_sha, ctx.head_sha)
+    if not files:
+        _step("No modified files found, skipping reviewer suggestion")
+        return
+    if len(files) > _GITHUB_SUGGEST_MAX_FILES:
+        _step(
+            f"Found {len(files)} modified files; reading the history of the first "
+            f"{_GITHUB_SUGGEST_MAX_FILES}"
+        )
+        files = files[:_GITHUB_SUGGEST_MAX_FILES]
+    else:
+        _step(f"Found {len(files)} modified file(s)")
+
+    ignored = _github_ignored_revs(ctx.head_sha)
+    if ignored:
+        _step(f"Ignoring {len(ignored)} commit(s) listed in {_GITHUB_IGNORE_REVS_FILE}")
+
+    # History at the base, as GitLab reads the default branch: the pull request's own
+    # commits do not count.
+    _step("Querying git history for file authors...")
+    reviewers = _github_history_authors(session, ctx, base_sha, files, ignored, pr_author)
+    reviewers = reviewers[:_MAX_SUGGESTED_REVIEWERS]
+    if not reviewers:
+        _step("No suitable reviewers found, skipping reviewer suggestion")
+        return
+
+    _step(f"Suggesting {len(reviewers)} reviewer(s): {', '.join(r for r, _ in reviewers)}")
+    resp = session.post(
+        f"{ctx.repo_url}/issues/{ctx.number}/comments",
+        json={"body": _github_reviewer_comment(reviewers)},
+    )
+    if not 200 <= resp.status_code < 300:
+        raise _GitHubSuggestError(f"posting the comment failed (HTTP {resp.status_code})")
+    _success(f"Reviewer suggestion posted to pull request #{ctx.number}")
+
+
+def _github_suggest_reviewers(args: argparse.Namespace) -> None:
+    """Suggest reviewers on the pull request from the history of the files it changes.
+
+    Exits 1 only on an unusable environment. Every other failure warns and exits 0:
+    a missing suggestion must never fail the review.
+    """
+    ctx = _github_load_context()
+    if ctx.base_sha is None or ctx.author_login is None:
+        _error("The pull_request event payload needs base.sha and user.login")
+        sys.exit(1)
+    session = _github_session(ctx)
+    try:
+        _github_post_reviewer_suggestion(session, ctx, ctx.base_sha, ctx.author_login)
+    except _GitHubSuggestError as e:
+        _github_annotation("warning", f"Reviewer suggestion skipped: {e}")
+    except (requests.exceptions.RequestException, ValueError) as e:
+        _github_annotation(
+            "warning", f"Reviewer suggestion skipped: GitHub API error ({type(e).__name__}): {e}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -2103,6 +3017,47 @@ def main() -> None:
             "github posts to the pull request named by the Actions event (never auto-detected)"
         ),
     )
+    post_parser.add_argument(
+        "--deep-recommendation-plan",
+        metavar="PATH",
+        help=(
+            "panel.py triage output; when its tier is deep, the summary recommends "
+            "a deep review (needs --platform github)"
+        ),
+    )
+    post_parser.add_argument(
+        "--mode",
+        choices=["standard", "deep"],
+        help=(
+            "check for a review that should win before deleting old threads and before "
+            "the summary, as stand-down does (needs --platform github)"
+        ),
+    )
+    post_parser.add_argument(
+        "--deep-job",
+        metavar="NAME",
+        help=(
+            f"display name of the deep review job (default: {_GITHUB_DEEP_JOB_DEFAULT}; "
+            "needs --platform github)"
+        ),
+    )
+    post_parser.add_argument(
+        "--deep-label",
+        metavar="LABEL",
+        help=(
+            "label the deep-review recommendation tells reviewers to add "
+            f"(default: {_GITHUB_DEEP_LABEL_DEFAULT}; at most {_GITHUB_DEEP_LABEL_CHARS} "
+            "characters; pass it as --deep-label=LABEL; needs --platform github)"
+        ),
+    )
+    post_parser.add_argument(
+        "--posted-flag",
+        metavar="PATH",
+        help=(
+            "create this file once the summary is posted, and not when the review stands "
+            "down or the head moved (needs --platform github)"
+        ),
+    )
     post_parser.add_argument("--verbose", action="store_true", help="Verbose output")
     post_parser.set_defaults(func=cmd_post)
 
@@ -2113,10 +3068,45 @@ def main() -> None:
     suggest_parser = subparsers.add_parser(
         "suggest-reviewers", help="Suggest reviewers based on git history"
     )
+    suggest_parser.add_argument(
+        "--platform",
+        choices=["auto", "github"],
+        default="auto",
+        help=(
+            "auto suggests on the GitLab merge request; github comments on the pull request "
+            "named by the Actions event (never auto-detected)"
+        ),
+    )
     suggest_parser.add_argument("--verbose", action="store_true", help="Verbose output")
     suggest_parser.set_defaults(func=cmd_suggest_reviewers)
 
+    standdown_parser = subparsers.add_parser(
+        "stand-down",
+        help=(
+            "Exit 10 when a review that should win makes this one redundant, 0 otherwise: "
+            "a deep review job of the same head for standard, a newer head for deep"
+        ),
+    )
+    standdown_parser.add_argument("--platform", choices=["github"], required=True)
+    standdown_parser.add_argument("--mode", choices=["standard", "deep"], required=True)
+    standdown_parser.add_argument(
+        "--deep-job",
+        metavar="NAME",
+        help=f"display name of the deep review job (default: {_GITHUB_DEEP_JOB_DEFAULT})",
+    )
+    standdown_parser.set_defaults(func=cmd_stand_down)
+
     args = parser.parse_args()
+    if args.command == "post" and args.platform != "github":
+        for flag, value in (
+            ("--deep-recommendation-plan", args.deep_recommendation_plan),
+            ("--mode", args.mode),
+            ("--deep-job", args.deep_job),
+            ("--deep-label", args.deep_label),
+            ("--posted-flag", args.posted_flag),
+        ):
+            if value is not None:
+                post_parser.error(f"{flag} needs --platform github")
     args.func(args)
 
 

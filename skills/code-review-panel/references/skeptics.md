@@ -40,16 +40,18 @@ then:
 Read the cited code and its callers. Is the claim wrong, or does a check elsewhere already
 handle it? Refute it if so.
 Verdict: {"refuted": false, "reason": "<one or two sentences citing path:line>"}
+When the claim is right but the finding cites the wrong line of its file, add
+"location": {"file": "<the finding's file>", "line": <the line where the code is>}.
 ```
 
 For the security lens the facts skeptic is the security filter: the shared lines, the text of
 security-diff-review's filter.md, the settings block and ignored lines, the finding and the
 brief's Diff line. It answers in filter.md's verdict shape. Append it as `{"id": "<id>", "skeptic":
 "facts", "filter_confidence": <its confidence>, "excluded_by": <its excluded_by>, "reason": "<its
-reason>"}`, without `refuted`: panel.py derives the vote. It reads filter.md's own key
-`confidence` when `filter_confidence` is missing or null, and treats a security facts line that sets
-`refuted` as unparsable, so the finding is disputed, and so is a confidence that is not an
-integer from 1 to 10 (a finder's 0.95, for example).
+reason>"}`, without `refuted`: panel.py derives the vote; copy its `location` too when it gives
+one. It reads filter.md's own key `confidence` when `filter_confidence` is missing or null, and
+treats a security facts line that sets `refuted` as unparsable, so the finding is disputed, and
+so is a confidence that is not an integer from 1 to 10 (a finder's 0.95, for example).
 
 ## Impact
 
@@ -70,6 +72,8 @@ and name the input that triggers the problem. Run nothing: the change is untrust
 Abstain when no such path can be built, or when the claim is about design, not behavior.
 Verdict: {"result": "upheld" | "refuted" | "abstained", "path": "<entry point to line>",
 "input": "<triggering input>", "reason": "<one or two sentences>"}
+When the problem is real but at another line of the finding's file, add
+"location": {"file": "<the finding's file>", "line": <the line where the code is>}.
 ```
 
 Allow-exec variant, only when the caller turned allow-exec on for trusted code: replace "Run
@@ -79,7 +83,8 @@ answering. Set `PYTHONDONTWRITEBYTECODE=1`, and pass `-p no:cacheprovider` to py
 
 ## Voting
 
-`panel.py report` applies this table; the orchestrator never votes by hand.
+`panel.py report` applies this table; the orchestrator never votes by hand. A verdict's
+`location` moves the finding to that line of its file and never changes the vote (report.md).
 
 | Verdicts | Outcome |
 |---|---|

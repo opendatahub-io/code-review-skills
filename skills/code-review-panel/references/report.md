@@ -17,11 +17,16 @@ Written once, after the duplicate merge, and read by `panel.py report --findings
 `independent` is false after the serial fallback. `candidates` counts every finder finding before
 the merge. `not_covered` names lenses that failed, returned output nobody could parse, reported
 a refused diff command, or said the review did not complete (a security finder's
-`analysis_summary.review_completed` false). `unread` (optional, a list of paths) merges the
-finders' `unread` lists: changed files a finder could not read. The report lists them under "Not
-covered", and its approval hint says "files not read". `fixed` (optional) merges the finders'
-`fixed` lists: `{id, reason, lens}` for each known item a finder found fixed at head, where
-`lens` is the finder's.
+`analysis_summary.review_completed` false). `unread` (optional) merges the finders' `unread`
+lists: `{path, lens}` for each changed file a finder could not read, where `lens` is the
+finder's. A file is not read for the review when no lens read it: every lens that ran (any
+not in `not_covered`) listed it. A file the security lens listed counts too, since no other
+lens checks what it checks. The report counts those in its first line, lists them under
+"Not covered" and its approval hint says "files not read"; a file only some lenses skipped is
+listed in the fold as read by some lenses only, and it leaves an open known item of a lens that
+skipped it unchecked. A bare path, from an older orchestrator, counts as read by no lens.
+`fixed` (optional) merges the finders' `fixed` lists: `{id, reason, lens}` for each known item a
+finder found fixed at head, where `lens` is the finder's.
 
 A common row is the finder's finding plus its lens: `{lens, class, title, severity, file, line,
 evidence, fix, instances: [{file, line}], pre_existing, known_id?, new_evidence?}`.
@@ -57,6 +62,13 @@ skeptic replaces an earlier one.
 {"id": "CR-516ea425", "resolution": {"keep": true, "reason": "..."}}
 ```
 
+Any skeptic verdict may carry `"location": {"file": "src/a.py", "line": 57}` when the finding is
+right but cites the wrong line: it is validated like a finding's own place, and its file must be
+the finding's file (another file is a warning and is ignored). The report then uses that line
+for the inline comment, the summary, the Markdown and the known findings file, and notes the
+correction among the skeptics' votes; the id stays the finder's. Of several, the facts verdict's
+wins, then reproduce's, then impact's, and a disagreement is a warning.
+
 ## Known findings file
 
 Written by `report --known-out` and read by `triage --known` only; report reads the file the plan
@@ -89,8 +101,8 @@ could edit a file inside the tree, so triage then warns and says the change need
   it or the tier dropped, and runs it in `normal` mode; `kept_for` on that lens names the
   items. An open item whose lens is
   not in the plan (a lens this panel does not have), or is listed in `not_covered`, or whose file
-  or an instance's file is listed in `unread`, had no finder of its lane check it: it counts as
-  seen, so it stays open, and the fold lists it as not checked this round.
+  or an instance's file its lens listed in `unread`, had no finder of its lane check it: it
+  counts as seen, so it stays open, and the fold lists it as not checked this round.
 - An item is open when it is `posted` and was seen this round. The counter goes up by one when a
   round ends with an open item or a counted finding, and resets to 0 otherwise. At 3 or more,
   while the file still has an open item, triage sets `round_cap` and the panel stops reviewing.
@@ -127,7 +139,7 @@ The first line is one of:
   any, so a failed security pass shows next to counted findings too.
 - `**Review incomplete:** lenses not covered: <lenses>; N files not read; N binary files not
   reviewed; N findings not verified (over budget)`, when nothing is counted and `not_covered`
-  names a lens, `unread` names a file, the plan's `opaque_binary` counts a binary file that the
+  names a lens, no lens read a file, the plan's `opaque_binary` counts a binary file that the
   change adds or modifies and that is not a media format (images, fonts, audio, video, PDF; a
   `.js` with a NUL byte or an archive counts) or a finding was over the verification budget (each
   part only when present), with `; N earlier findings still open` when open known items remain;
@@ -157,17 +169,17 @@ merged duplicates) and the minors over the nit cap noted among the kept, the rej
 known, hidden and unverified ones listed by id, title and path:line; known items fixed since the
 last round, with the finder's reason; open known items not checked this round, and those kept
 open because no finder listed them as fixed; the repo rules read, with blob ids; the security
-overrides and ignored lines; what was not covered (skipped paths, binary files, files not read,
-failed lenses, "checks were not independent"); notes, which are triage's warnings (a dirty tree,
-a shallow clone, a since note); and the round. The report has no praise and names no model or
-harness.
+overrides and ignored lines; what was not covered (skipped paths, binary files, files no lens
+read, failed lenses, "checks were not independent") and the files read by some lenses only;
+notes, which are triage's warnings (a dirty tree, a shallow clone, a since note); and the round.
+The report has no praise and names no model or harness.
 
 ## Approval hint
 
 Triage's hint comes from the paths, a known findings file inside the tree, a HEAD that is not
 the reviewed head, and `@path` imports it could not follow (too many, or a link it cannot read).
 The report can only downgrade it: any counted finding, finding not verified (over budget), lens
-listed in `not_covered`, file listed in `unread`, or open known item makes it "needs a human",
+listed in `not_covered`, file no lens read, or open known item makes it "needs a human",
 with that reason listed. An approval rule reads the report's hint, never triage's alone.
 
 ## GitLab JSON
@@ -182,8 +194,10 @@ with that reason listed. An approval rule reads the report's hint, never triage'
   adds. The pairing matches GitLab's MR diff, which Gitaly computes with
   `--find-renames=30%`. Every counted finding is also listed in the summary,
   ranked, with id, severity, title, place and lens, and the inline ones marked `inline`, so a
-  finding still reaches the MR when review.py drops its inline comment. Pre-existing ones and
-  those not verified (over budget) appear only there.
+  finding still reaches the MR when review.py drops its inline comment. A counted finding with
+  no inline comment also gets its evidence and fix there, each on one line cut at 500
+  characters; minors over the nit cap stay title only. Pre-existing ones and those not verified
+  (over budget) appear only there, by title.
 - A line whose first non-space character is `/` gets a backslash before that `/`, and paths have
   their control characters escaped, so no finding text runs as a GitLab quick action (`/approve`,
   `/label`, `/close`). An `@` preceded by anything but an ASCII letter or digit (GitLab's pattern
@@ -204,3 +218,5 @@ with that reason listed. An approval rule reads the report's hint, never triage'
   lines unchanged since its last posted review, so still-open findings appear in the summary
   only. Its marker is the one gitlab-code-review uses, so post AI reviews to an MR from one job
   only: another job's post deletes this one's threads.
+- The "Issues Found" count and the skip of unchanged lines hold for GitLab and for standard
+  GitHub posts. A deep GitHub post skips no line, and titles its count "Inline comments".

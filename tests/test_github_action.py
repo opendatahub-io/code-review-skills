@@ -9,11 +9,15 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
+import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from tests.helpers import (
+    HAVE_UV,
     REPO_ROOT,
     PanelTestCase,
     commit,
@@ -23,6 +27,7 @@ from tests.helpers import (
     run,
     write,
 )
+from tests.test_github_review import review
 
 ACTION_YML = REPO_ROOT / "action.yml"
 SCRIPT = REPO_ROOT / "action/review-pr.sh"
@@ -94,9 +99,26 @@ def skill_frontmatter_value(key: str) -> str:
 
 
 def script_constant(name: str) -> str:
-    m = re.search(rf"(?m)^{name}=(\S+)$", SCRIPT.read_text(encoding="utf-8"))
+    """A review-pr.sh constant as written: a double-quoted value keeps its quotes."""
+    m = re.search(rf'(?m)^{name}=("[^"]*"|\S+)$', SCRIPT.read_text(encoding="utf-8"))
     assert m, f"constant {name} not found in review-pr.sh"
     return m.group(1)
+
+
+def run_script_function(name: str, *args: str) -> subprocess.CompletedProcess:
+    """Run one function of review-pr.sh with the script's constants, but not its main."""
+    constants = "\n".join(
+        line
+        for line in SCRIPT.read_text(encoding="utf-8").splitlines()
+        if re.match(r"^[A-Z_]+=", line)
+    )
+    source = "\n".join([constants, script_function("error"), script_function(name)])
+    return subprocess.run(
+        ["bash", "-c", f'{source}\n{name} "$@"', "bash", *args],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
 
 
 def without_comments(text: str) -> str:
@@ -108,6 +130,66 @@ def input_default(name: str) -> str:
     m = re.search(rf"(?ms)^  {name}:\n.*?^    default:\s*'([^']*)'", text)
     assert m, f"no default for input {name}"
     return m.group(1)
+
+
+def step_names() -> list[str]:
+    return [re.search(r"(?m)^name:\s*(.+)$", block).group(1).strip() for block in action_steps()]
+
+
+def step_env_value(step: str, var: str) -> str:
+    """The value of one env: entry of a step, as written in action.yml."""
+    m = re.search(rf"(?m)^\s*{var}:\s*(.+?)\s*$", find_step(step))
+    assert m, f"no {var} in step {step!r}"
+    return m.group(1)
+
+
+def with_block(block: str) -> str:
+    """The lines under a step's with: key."""
+    lines = block.splitlines()
+    for i, line in enumerate(lines):
+        m = re.match(r"^(\s*)with:\s*$", line)
+        if not m:
+            continue
+        indent = len(m.group(1))
+        body = []
+        for follow in lines[i + 1 :]:
+            if follow.strip() and len(follow) - len(follow.lstrip()) <= indent:
+                break
+            body.append(follow)
+        return "\n".join(body)
+    raise AssertionError(f"no with: in {block!r}")
+
+
+def evaluate_expression(
+    expression: str,
+    inputs: dict[str, str],
+    app_token: dict[str, str],
+    github_token: str = "ghs_workflow",
+) -> str:
+    """Evaluate one ${{ }} expression of action.yml the way the runner does.
+
+    Covers only what the post step's env uses: inputs, the app-token step's outputs,
+    github.token, string literals, == and !=, && and || (which return an operand, like
+    Python's and and or) and format(). An unset input or output is the empty string.
+    """
+    m = re.fullmatch(r"\$\{\{ (.+) \}\}", expression)
+    assert m, f"not a single expression: {expression!r}"
+    source = re.sub(
+        r"steps\.app-token\.outputs\.([a-z-]+)", lambda o: f"app_token({o.group(1)!r})", m.group(1)
+    )
+    source = re.sub(r"inputs\.([a-z_]+)", lambda i: f"inputs({i.group(1)!r})", source)
+    source = source.replace("github.token", "workflow_token")
+    source = source.replace("&&", " and ").replace("||", " or ")
+    assert "." not in re.sub(r"'[^']*'", "", source), f"unsupported expression: {expression!r}"
+    namespace = {
+        "__builtins__": {},
+        "inputs": lambda name: inputs.get(name, ""),
+        "app_token": lambda name: app_token.get(name, ""),
+        "workflow_token": github_token,
+        "format": lambda template, *args: template.format(*args),
+    }
+    # The source is action.yml's own text, limited to the forms above.
+    return eval(source, namespace)
 
 
 class ActionStaticTests(PanelTestCase):
@@ -155,10 +237,220 @@ class ActionStaticTests(PanelTestCase):
             self.assertRegex(block, rf"""(?m)^\s*{var}:\s*(''|"")\s*$""")
         self.assertNotIn("github.token", block)
 
-    def test_only_the_post_step_holds_the_write_token(self):
+    def test_only_the_standdown_and_post_steps_hold_the_token(self):
+        holders = [
+            re.search(r"(?m)^name:\s*(.+)$", block).group(1).strip()
+            for block in action_steps()
+            if "github.token" in block
+        ]
+        self.assertEqual(holders, ["Check for a review that should win", "Post the review"])
+        self.assertIn('review-pr.sh" standdown', run_text(find_step(holders[0])))
+        self.assertIn('review-pr.sh" post', run_text(find_step(holders[1])))
+        # The standdown step only reads, so it keeps the workflow token even with an App.
+        self.assertEqual(
+            step_env_value("Check for a review that should win", "GITHUB_TOKEN"),
+            "${{ github.token }}",
+        )
+
+    def test_the_post_token_is_the_callers_then_the_apps_then_the_workflows(self):
+        self.assertEqual(
+            step_env_value("Post the review", "GITHUB_TOKEN"),
+            "${{ inputs.github_token || steps.app-token.outputs.token || github.token }}",
+        )
+
+    def test_the_bot_login_derives_from_the_app_slug_or_the_bot_login_input(self):
+        self.assertEqual(
+            step_env_value("Post the review", "AI_REVIEW_BOT_LOGIN"),
+            "${{ inputs.github_token != '' && inputs.bot_login || inputs.github_token == '' && "
+            "steps.app-token.outputs.app-slug && "
+            "format('{0}[bot]', steps.app-token.outputs.app-slug) || '' }}",
+        )
+
+    def test_the_post_identity_for_each_token_source(self):
+        # Past the skip and stand-down gates, the mint runs when this part of its if: holds.
+        mint_if = re.search(
+            r"(?m)^\s*if: steps\.check\.outputs\.skip != 'true' && "
+            r"steps\.standdown\.outputs\.stand_down != 'true' && (.+?)\s*$",
+            find_step("Mint the posting token"),
+        ).group(1)
+        mint = f"${{{{ {mint_if} }}}}"
+        token = step_env_value("Post the review", "GITHUB_TOKEN")
+        login = step_env_value("Post the review", "AI_REVIEW_BOT_LOGIN")
+        caller_flag = step_env_value("Post the review", "AI_REVIEW_CALLER_TOKEN")
+        minted = {"token": "ghs_app", "app-slug": "my-app"}
+        caller = {"github_token": "github_pat_caller", "bot_login": "review-bot"}
+        pat_only = {"github_token": "github_pat_caller"}
+        # name, inputs, whether the mint runs, post token, bot login, caller token flag
+        cases = (
+            ("workflow token", {}, False, "ghs_workflow", "", "false"),
+            ("App", {"app_id": "123"}, True, "ghs_app", "my-app[bot]", "false"),
+            ("caller token", caller, False, "github_pat_caller", "review-bot", "true"),
+            ("caller token without a login", pat_only, False, "github_pat_caller", "", "true"),
+            (
+                "caller token and App",
+                {**caller, "app_id": "123"},
+                False,
+                "github_pat_caller",
+                "review-bot",
+                "true",
+            ),
+            (
+                "caller token without a login and App",
+                {**pat_only, "app_id": "123"},
+                False,
+                "github_pat_caller",
+                "",
+                "true",
+            ),
+            (
+                "bot_login without a caller token",
+                {"bot_login": "review-bot"},
+                False,
+                "ghs_workflow",
+                "",
+                "false",
+            ),
+            (
+                "bot_login with an App",
+                {"bot_login": "review-bot", "app_id": "123"},
+                True,
+                "ghs_app",
+                "my-app[bot]",
+                "false",
+            ),
+        )
+        for name, inputs, want_mint, want_token, want_login, want_flag in cases:
+            with self.subTest(name):
+                mints = bool(evaluate_expression(mint, inputs, {}))
+                self.assertEqual(mints, want_mint)
+                outputs = minted if mints else {}
+                self.assertEqual(evaluate_expression(token, inputs, outputs), want_token)
+                self.assertEqual(evaluate_expression(login, inputs, outputs), want_login)
+                flag = str(evaluate_expression(caller_flag, inputs, outputs)).lower()
+                self.assertEqual(flag, want_flag)
+                self.assertNotIn("github_pat", flag)
+
+    def test_the_app_token_step_is_pinned_and_runs_directly_before_post(self):
+        names = step_names()
+        mint = names.index("Mint the posting token")
+        self.assertEqual(names[mint - 1], "Review the pull request")
+        self.assertEqual(names[mint + 1], "Post the review")
+        block = find_step("Mint the posting token")
+        self.assertRegex(block, r"(?m)^\s*id:\s*app-token\s*$")
+        self.assertRegex(
+            block,
+            r"(?m)^\s*uses:\s*actions/create-github-app-token@"
+            r"f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3\.4\.0\s*$",
+        )
+        self.assertRegex(
+            block,
+            r"(?m)^\s*if: steps\.check\.outputs\.skip != 'true' && "
+            r"steps\.standdown\.outputs\.stand_down != 'true' && "
+            r"inputs\.app_id != '' && inputs\.github_token == ''\s*$",
+        )
+        # A failed mint must fail the job, not post under another identity.
+        self.assertNotIn("continue-on-error", block)
+        self.assertIsNone(run_text(block))
+
+    def test_the_minted_token_is_scoped_to_this_repository_and_minimal_permissions(self):
+        options = dict(
+            re.findall(
+                r"(?m)^\s*([a-z-]+):\s*(.+?)\s*$", with_block(find_step("Mint the posting token"))
+            )
+        )
+        self.assertEqual(
+            options,
+            {
+                "client-id": "${{ inputs.app_id }}",
+                "private-key": "${{ inputs.app_private_key }}",
+                "repositories": "${{ github.event.repository.name }}",
+                "permission-pull-requests": "write",
+                "permission-issues": "write",
+                "permission-contents": "read",
+                "permission-actions": "read",
+            },
+        )
+
+    def test_the_private_key_appears_only_in_the_mint_steps_with(self):
+        text = ACTION_YML.read_text(encoding="utf-8")
+        self.assertEqual(text.count("inputs.app_private_key"), 1)
+        mint = find_step("Mint the posting token")
+        self.assertRegex(
+            with_block(mint), r"(?m)^\s*private-key:\s*\$\{\{ inputs\.app_private_key \}\}\s*$"
+        )
+
+    def test_only_the_mint_step_reads_the_app_inputs(self):
+        for var in ("inputs.app_id", "inputs.app_private_key"):
+            readers = [
+                re.search(r"(?m)^name:\s*(.+)$", block).group(1).strip()
+                for block in action_steps()
+                if var in block
+            ]
+            with self.subTest(var):
+                self.assertEqual(readers, ["Mint the posting token"])
+
+    def test_only_the_post_step_reads_the_caller_token_and_its_login(self):
+        # The check step also reads bot_login, which is not secret, to validate it early.
+        for var, expected in (
+            ("inputs.bot_login", ["Check the event and credentials", "Post the review"]),
+            ("steps.app-token", ["Post the review"]),
+        ):
+            readers = [
+                re.search(r"(?m)^name:\s*(.+)$", block).group(1).strip()
+                for block in action_steps()
+                if var in block
+            ]
+            with self.subTest(var):
+                self.assertEqual(readers, expected)
+        post = find_step("Post the review")
+        env = post[post.index("\n      env:\n") :]
+        self.assertIn("inputs.github_token", env)
+        self.assertNotIn("inputs.github_token", post[: post.index("\n      env:\n")])
+
+    def test_the_caller_token_value_reaches_only_the_post_steps_env(self):
+        # Every mention outside the post step only compares it with '', in an if: or as a flag.
+        mentions = {}
         for block in action_steps():
-            if "github.token" in block:
-                self.assertIn('review-pr.sh" post', block)
+            name = re.search(r"(?m)^name:\s*(.+)$", block).group(1).strip()
+            for line in block.splitlines():
+                if "inputs.github_token" in line:
+                    mentions.setdefault(name, []).append(line.strip())
+        self.assertEqual(
+            sorted(mentions),
+            ["Check the event and credentials", "Mint the posting token", "Post the review"],
+        )
+        (mint_line,) = mentions["Mint the posting token"]
+        self.assertTrue(mint_line.startswith("if: "), mint_line)
+        self.assertNotRegex(mint_line, r"inputs\.github_token(?! == '')")
+        # The check step only compares it with '' to pick the bot_login to validate.
+        (check_line,) = mentions["Check the event and credentials"]
+        self.assertTrue(check_line.startswith("AI_REVIEW_BOT_LOGIN: "), check_line)
+        self.assertNotRegex(check_line, r"inputs\.github_token(?! != '')")
+        post_vars = sorted(line.split(":", 1)[0] for line in mentions["Post the review"])
+        self.assertEqual(
+            post_vars, ["AI_REVIEW_BOT_LOGIN", "AI_REVIEW_CALLER_TOKEN", "GITHUB_TOKEN"]
+        )
+        # Only GITHUB_TOKEN carries the value: the others compare it with ''.
+        for var in ("AI_REVIEW_BOT_LOGIN", "AI_REVIEW_CALLER_TOKEN"):
+            with self.subTest(var):
+                value = step_env_value("Post the review", var)
+                self.assertNotRegex(value, r"inputs\.github_token(?! [!=]= '')")
+        self.assertEqual(
+            step_env_value("Post the review", "AI_REVIEW_CALLER_TOKEN"),
+            "${{ inputs.github_token != '' }}",
+        )
+
+    def test_the_review_step_holds_no_app_input_or_token(self):
+        block = find_step("Review the pull request")
+        for needle in ("app_id", "app_private_key", "app-token", "github_token", "bot_login"):
+            with self.subTest(needle):
+                self.assertNotIn(needle, block)
+
+    def test_the_new_identity_inputs_default_to_empty(self):
+        for name in ("app_id", "app_private_key", "github_token", "bot_login"):
+            with self.subTest(name):
+                self.assertEqual(input_default(name), "")
+        self.assertEqual(input_default("suggest_reviewers"), "false")
 
     def test_post_step_pins_uv_and_the_platform(self):
         self.assertIn('review-pr.sh" post', run_text(find_step("Post the review")))
@@ -174,6 +466,62 @@ class ActionStaticTests(PanelTestCase):
             if "id: check" in block or "name: Remove the checkout" in block:
                 continue
             self.assertIn("steps.check.outputs.skip != 'true'", block)
+
+    def test_every_step_after_the_stand_down_honors_it(self):
+        gated = [
+            re.search(r"(?m)^name:\s*(.+)$", block).group(1).strip()
+            for block in action_steps()
+            if "steps.standdown.outputs.stand_down" in block
+        ]
+        self.assertEqual(
+            gated,
+            [
+                "Check out the pull request head",
+                "Prepare the diff",
+                "Review the pull request",
+                "Mint the posting token",
+                "Post the review",
+            ],
+        )
+        # The mint adds its own app_id condition, checked with its other options.
+        for step in (
+            "Check out the pull request head",
+            "Prepare the diff",
+            "Review the pull request",
+            "Post the review",
+        ):
+            with self.subTest(step):
+                self.assertRegex(
+                    find_step(step),
+                    r"(?m)^\s*if: steps\.check\.outputs\.skip != 'true' && "
+                    r"steps\.standdown\.outputs\.stand_down != 'true'\s*$",
+                )
+
+    def test_standdown_runs_right_after_the_check_and_uv_before_the_checkout(self):
+        self.assertEqual(
+            step_names()[:5],
+            [
+                "Check the event and credentials",
+                "Set up uv",
+                "Check for a review that should win",
+                "Check out the pull request head",
+                "Prepare the diff",
+            ],
+        )
+        block = find_step("Check for a review that should win")
+        self.assertRegex(block, r"(?m)^\s*id:\s*standdown\s*$")
+        # Not the checkout, which does not exist yet, nor the workspace, which can hold the
+        # PR's files.
+        self.assertRegex(block, r"(?m)^\s*working-directory:\s*\$\{\{ runner\.temp \}\}\s*$")
+
+    def test_stand_down_inputs_default_to_off_and_the_conventional_job_name(self):
+        self.assertEqual(input_default("recommend_deep_review"), "false")
+        self.assertEqual(input_default("deep_review_job"), "deep-review")
+        self.assertEqual(script_constant("DEFAULT_DEEP_JOB"), '"deep-review"')
+
+    def test_the_deep_label_defaults_to_the_conventional_label(self):
+        self.assertEqual(input_default("deep_review_label"), "deep-review")
+        self.assertEqual(script_constant("DEFAULT_DEEP_LABEL"), '"deep-review"')
 
     def test_every_input_is_documented_in_the_readme(self):
         text = ACTION_YML.read_text(encoding="utf-8")
@@ -206,16 +554,51 @@ class ActionStaticTests(PanelTestCase):
         )
         self.assertIn(f"`{VERIFIED_AGENTIC_CI_VERSION}`", row)
 
-    def test_an_empty_image_picks_the_harness_runner(self):
-        self.assertEqual(input_default("harness"), "claude-code")
-        self.assertEqual(input_default("image"), "")
+    def test_codex_is_the_default_harness(self):
+        self.assertEqual(input_default("harness"), "codex")
         script = SCRIPT.read_text(encoding="utf-8")
+        self.assertEqual(len(re.findall(r"AI_REVIEW_HARNESS:-", script)), 3)
+        self.assertEqual(len(re.findall(r"AI_REVIEW_HARNESS:-codex\}", script)), 3)
+
+    def test_the_action_description_names_no_harness_vendor(self):
+        text = ACTION_YML.read_text(encoding="utf-8")
+        description = text.split("\ndescription:", 1)[1].split("\nauthor:", 1)[0]
+        self.assertNotRegex(description, r"(?i)claude|anthropic")
+
+    def test_image_constants_name_both_families(self):
+        self.assertEqual(input_default("image"), "")
         for harness in ("claude", "codex"):
-            m = re.search(rf'(?m)^{harness.upper()}_RUNNER_IMAGE="(\S+)"$', script)
-            self.assertTrue(m, f"{harness}_RUNNER_IMAGE not found in review-pr.sh")
-            self.assertTrue(
-                m.group(1).startswith(f"quay.io/aipcc/agentic-ci/{harness}-runner:"), m.group(1)
-            )
+            for family in ("runner", "sandbox"):
+                with self.subTest(harness=harness, family=family):
+                    self.assertEqual(
+                        script_constant(f"{harness.upper()}_{family.upper()}_IMAGE"),
+                        f'"quay.io/aipcc/agentic-ci/{harness}-{family}:latest"',
+                    )
+
+    def test_default_image_picks_the_family_of_the_backend(self):
+        cases = {
+            ("codex", "podman"): "quay.io/aipcc/agentic-ci/codex-runner:latest",
+            ("claude-code", "podman"): "quay.io/aipcc/agentic-ci/claude-runner:latest",
+            ("codex", "openshell"): "quay.io/aipcc/agentic-ci/codex-sandbox:latest",
+            ("claude-code", "openshell"): "quay.io/aipcc/agentic-ci/claude-sandbox:latest",
+        }
+        for (harness, backend), image in cases.items():
+            with self.subTest(harness=harness, backend=backend):
+                proc = run_script_function("default_image", harness, backend)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual(proc.stdout, image + "\n")
+        for args in (("opencode", "podman"), ("codex", "docker"), ("", "")):
+            with self.subTest(args=args):
+                proc = run_script_function("default_image", *args)
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertEqual(proc.stdout, "")
+
+    def test_the_review_step_uses_the_family_of_its_backend(self):
+        self.assertIn('default_image "$harness" "$backend"', script_function("cmd_review"))
+
+    def test_backend_defaults_to_openshell(self):
+        self.assertEqual(input_default("backend"), "openshell")
+        self.assertIn('backend="${AI_REVIEW_BACKEND:-openshell}"', script_function("cmd_review"))
 
     def test_no_node_or_claude_invocation(self):
         action = ACTION_YML.read_text(encoding="utf-8")
@@ -230,6 +613,14 @@ class ActionStaticTests(PanelTestCase):
     def test_setup_uv_does_not_cache_the_pull_requests_tree(self):
         block = find_step("Set up uv")
         self.assertRegex(block, r"(?m)^\s*enable-cache:\s*false\s*$")
+
+    def test_setup_uv_installs_a_pinned_version(self):
+        block = find_step("Set up uv")
+        self.assertRegex(block, r'(?m)^\s*version:\s*"\d+\.\d+\.\d+"\s*$')
+
+    def test_setup_uv_reads_its_version_from_the_action_not_the_workspace(self):
+        block = find_step("Set up uv")
+        self.assertRegex(block, r"(?m)^\s*working-directory:\s*\$\{\{ github\.action_path \}\}\s*$")
 
     def test_readme_example_job_sets_a_timeout(self):
         self.assertRegex(README.read_text(encoding="utf-8"), r"(?m)^    timeout-minutes:\s*\d+\s*$")
@@ -259,8 +650,8 @@ class ActionStaticTests(PanelTestCase):
         self.assertIn(f'HEAD_DIR="${{GITHUB_WORKSPACE:-}}/{path}"', text)
         self.assertIn('AI_DIR="${GITHUB_WORKSPACE:-}/.ai-review"', text)
         cleanup = script_function("cmd_cleanup")
-        self.assertIn('"$AI_DIR" "$HEAD_DIR"', cleanup)
-        self.assertIn('rm -rf -- "$dir"', cleanup)
+        self.assertIn('rm -rf -- "$AI_DIR"', cleanup)
+        self.assertIn('rm -rf -- "$HEAD_DIR"', cleanup)
 
     def test_checkout_is_not_under_the_mounted_workdir(self):
         m = re.search(r"(?m)^\s*path:\s*(\S+)\s*$", find_step("Check out the pull request head"))
@@ -285,22 +676,24 @@ class ActionStaticTests(PanelTestCase):
         for doc in ("README.md", "AGENTS.md"):
             self.assertNotIn("checkout changed", (REPO_ROOT / doc).read_text(encoding="utf-8"))
 
-    def test_the_script_leaves_container_teardown_to_agentic_ci(self):
-        script = without_comments(SCRIPT.read_text(encoding="utf-8"))
-        self.assertNotIn("podman rm", script)
-        self.assertNotIn("CONTAINER_NAME", script)
-        self.assertNotIn("remove_container", script)
-
     def test_agent_runs_under_an_interrupting_timeout_with_a_margin(self):
-        review = script_function("cmd_review")
-        self.assertIn('timeout -s INT --kill-after=60s "${minutes}m"', review)
-        self.assertIn('--timeout "$(( (minutes + 5) * 60 ))"', review)
+        for function in ("run_podman_agent", "run_openshell_agent"):
+            with self.subTest(function):
+                self.assertIn(
+                    'timeout -s INT --kill-after=60s "${minutes}m"', script_function(function)
+                )
+        self.assertIn('--timeout "$(( (minutes + 5) * 60 ))"', script_function("cmd_review"))
 
     def test_image_is_pulled_in_its_own_bounded_step(self):
-        review = script_function("cmd_review")
-        pull = review.index('timeout 15m podman pull "$image"')
-        run_agent = review.index("timeout -s INT")
-        self.assertLess(pull, run_agent)
+        podman = script_function("run_podman_agent")
+        self.assertLess(
+            podman.index('timeout 15m podman pull "$image"'), podman.index("timeout -s INT")
+        )
+        openshell = script_function("run_openshell_agent")
+        self.assertLess(
+            openshell.index('timeout 15m docker pull --quiet "$openshell_image"'),
+            openshell.index("timeout -s INT --kill-after=60s"),
+        )
 
     def test_effort_comes_from_one_constant(self):
         script = SCRIPT.read_text(encoding="utf-8")
@@ -315,6 +708,14 @@ class ActionStaticTests(PanelTestCase):
             ("Post the review", "AGENT_MODEL", "inputs.model"),
             ("Post the review", "AI_REVIEW_HARNESS", "inputs.harness"),
             ("Check the event and credentials", "AI_REVIEW_HARNESS", "inputs.harness"),
+            ("Check the event and credentials", "AI_REVIEW_MODE", "inputs.mode"),
+            (
+                "Check the event and credentials",
+                "AI_REVIEW_DRAFT",
+                "github.event.pull_request.draft",
+            ),
+            ("Prepare the diff", "AI_REVIEW_MODE", "inputs.mode"),
+            ("Review the pull request", "AI_REVIEW_MODE", "inputs.mode"),
             ("Review the pull request", "AI_REVIEW_MODEL", "inputs.model"),
             ("Review the pull request", "AI_REVIEW_TIMEOUT_MINUTES", "inputs.timeout_minutes"),
             ("Review the pull request", "AI_REVIEW_HARNESS", "inputs.harness"),
@@ -324,7 +725,29 @@ class ActionStaticTests(PanelTestCase):
                 "inputs.agentic_ci_version",
             ),
             ("Review the pull request", "AI_REVIEW_IMAGE", "inputs.image"),
+            ("Review the pull request", "AI_REVIEW_INSTRUCTIONS", "inputs.review_instructions"),
             ("Prepare the diff", "AI_REVIEW_INSTRUCTIONS", "inputs.review_instructions"),
+            ("Review the pull request", "AI_REVIEW_BACKEND", "inputs.backend"),
+            ("Remove the checkout", "AI_REVIEW_BACKEND", "inputs.backend"),
+            ("Prepare the diff", "AI_REVIEW_RECOMMEND_DEEP", "inputs.recommend_deep_review"),
+            ("Check for a review that should win", "AI_REVIEW_MODE", "inputs.mode"),
+            ("Check for a review that should win", "AI_REVIEW_DEEP_JOB", "inputs.deep_review_job"),
+            ("Post the review", "AI_REVIEW_MODE", "inputs.mode"),
+            ("Post the review", "AI_REVIEW_DEEP_JOB", "inputs.deep_review_job"),
+            ("Post the review", "AI_REVIEW_RECOMMEND_DEEP", "inputs.recommend_deep_review"),
+            ("Post the review", "AI_REVIEW_DEEP_LABEL", "inputs.deep_review_label"),
+            (
+                "Check the event and credentials",
+                "AI_REVIEW_RECOMMEND_DEEP",
+                "inputs.recommend_deep_review",
+            ),
+            ("Check the event and credentials", "AI_REVIEW_DEEP_LABEL", "inputs.deep_review_label"),
+            ("Post the review", "AI_REVIEW_SUGGEST_REVIEWERS", "inputs.suggest_reviewers"),
+            (
+                "Remove the checkout",
+                "AI_REVIEW_AGENTIC_CI_VERSION",
+                "inputs.agentic_ci_version",
+            ),
         )
         for step, var, expr in wiring:
             with self.subTest(var=var, step=step):
@@ -333,16 +756,25 @@ class ActionStaticTests(PanelTestCase):
                 )
 
 
+# Every credential the script passes to the openshell container, and the variables its
+# application default credentials lookup reads, so a developer's own setup never leaks in.
+SCRIPT_CREDENTIAL_VARS = frozenset(
+    script_constant("CODEX_CREDENTIAL_VARS").strip('"').split()
+    + script_constant("CLAUDE_CREDENTIAL_VARS").strip('"').split()
+    + ["GOOGLE_APPLICATION_CREDENTIALS", "CLOUDSDK_CONFIG"]
+)
+
+
 def script_env(**overrides: str) -> dict[str, str]:
     """hermetic_env without anything the script reads, plus overrides."""
     env = hermetic_env()
     for key in list(env):
-        if key.startswith(
-            ("ANTHROPIC_", "CLAUDE_CODE_", "AI_REVIEW_", "AGENT_", "OPENAI_", "GCLOUD_", "GCP_")
-        ) or key in (
-            "GH_TOKEN",
-            "UV_NO_CONFIG",
-            "UV_PYTHON",
+        if (
+            key.startswith(
+                ("ANTHROPIC_", "CLAUDE_CODE_", "AI_REVIEW_", "AGENT_", "OPENAI_", "GCLOUD_", "GCP_")
+            )
+            or key in ("GH_TOKEN", "UV_NO_CONFIG", "UV_PYTHON")
+            or key in SCRIPT_CREDENTIAL_VARS
         ):
             del env[key]
     env.update(overrides)
@@ -356,8 +788,16 @@ def write_executable(path: Path, body: str) -> Path:
     return path
 
 
+def write_fake_review_py(action_path: str, body: str) -> Path:
+    """Put a stand-in review.py, with the lock the action requires next to it, in action_path."""
+    path = write_executable(Path(action_path, REVIEW_PY_REL), body)
+    path.with_name(path.name + ".lock").write_text("", encoding="utf-8")
+    return path
+
+
 # Stands in for podman, so no test touches a real container: records each call.
 FAKE_PODMAN = """
+import json
 import os
 import sys
 
@@ -365,7 +805,72 @@ with open(os.environ["FAKE_PODMAN_LOG"], "a", encoding="utf-8") as f:
     f.write(" ".join(sys.argv[1:]) + "\\n")
 with open(os.environ["FAKE_PODMAN_LOG"] + ".tmpdir", "a", encoding="utf-8") as f:
     f.write(os.environ.get("TMPDIR", "") + "\\n")
+# FAKE_PODMAN_CONTAINERS maps container IDs to their mount sources, for ps and inspect.
+containers = json.loads(os.environ.get("FAKE_PODMAN_CONTAINERS", "{}"))
+if sys.argv[1:2] == ["ps"]:
+    print("\\n".join(containers))
+elif sys.argv[1:2] == ["inspect"]:
+    print("\\n".join(containers.get(sys.argv[-1], [])))
+elif sys.argv[1:3] == ["rm", "-f"]:
+    sys.exit(int(os.environ.get("FAKE_PODMAN_RM_STATUS", "0")))
 sys.exit(int(os.environ.get("FAKE_PODMAN_STATUS", "0")))
+"""
+
+
+# Stands in for docker, so no test touches a real container: appends each call's argv and
+# environment to FAKE_DOCKER_LOG as one JSON line.
+# FAKE_DOCKER_CONTAINERS and FAKE_DOCKER_VOLUMES map names to their ai-review.workdir label, for
+# `ps` and `volume ls` with a label filter. A `run` of agentic-ci writes the review output when
+# FAKE_WRITE is 1, and a `run` of chown makes the workdir removable again. `info` exits
+# FAKE_DOCKER_INFO_STATUS, as when the daemon cannot be reached.
+FAKE_DOCKER = """
+import json
+import os
+import sys
+
+args = sys.argv[1:]
+log = os.environ.get("FAKE_DOCKER_LOG")
+if log:
+    with open(log, "a", encoding="utf-8") as f:
+        f.write(json.dumps({"argv": args, "env": dict(os.environ)}) + "\\n")
+
+
+def status(name):
+    sys.exit(int(os.environ.get(name, "0")))
+
+
+def labelled(var):
+    items = json.loads(os.environ.get(var, "{}"))
+    wanted = args[args.index("--filter") + 1]
+    print("\\n".join(k for k, v in items.items() if wanted == f"label=ai-review.workdir={v}"))
+
+
+if args[:1] == ["info"]:
+    status("FAKE_DOCKER_INFO_STATUS")
+elif args[:1] == ["ps"]:
+    labelled("FAKE_DOCKER_CONTAINERS")
+elif args[:2] == ["volume", "ls"]:
+    labelled("FAKE_DOCKER_VOLUMES")
+elif args[:2] == ["volume", "rm"] or args[:1] == ["rm"]:
+    status("FAKE_DOCKER_RM_STATUS")
+elif args[:2] == ["image", "inspect"]:
+    sys.exit(0 if os.environ.get("FAKE_DOCKER_IMAGE_PRESENT") == "1" else 1)
+elif args[:1] == ["pull"]:
+    status("FAKE_DOCKER_PULL_STATUS")
+elif args[:1] == ["run"] and "--entrypoint" in args:
+    for root, dirs, _files in os.walk(args[-1]):
+        for d in dirs:
+            os.chmod(os.path.join(root, d), 0o755)
+    status("FAKE_DOCKER_CHOWN_STATUS")
+elif args[:1] == ["run"] and "agentic-ci" in args:
+    agent = args[args.index("agentic-ci") :]
+    if os.environ.get("FAKE_WRITE") == "1":
+        workdir = agent[agent.index("--workdir") + 1]
+        with open(os.path.join(workdir, "out", "ai-review-output.json"), "w") as f:
+            f.write("{}")
+    status("FAKE_DOCKER_RUN_STATUS")
+elif args[:1] == ["run"]:
+    status("FAKE_DOCKER_PREPULL_STATUS")
 """
 
 
@@ -383,8 +888,11 @@ class ScriptTestCase(PanelTestCase):
         self.out = os.path.join(self.out_dir, "ai-review-output.json")
         self.bin = os.path.join(self.tmp, "bin")
         self.podman_log = os.path.join(self.tmp, "podman.log")
-        # Always shadow podman: the script pulls the image, and a real pull would hit the network.
+        self.docker_log = os.path.join(self.tmp, "docker.jsonl")
+        # Always shadow podman and docker: the script pulls images, and a real pull would hit the
+        # network.
         write_executable(Path(self.bin, "podman"), FAKE_PODMAN)
+        write_executable(Path(self.bin, "docker"), FAKE_DOCKER)
 
     def env_path(self) -> str:
         return f"{self.bin}{os.pathsep}{os.environ['PATH']}"
@@ -395,6 +903,7 @@ class ScriptTestCase(PanelTestCase):
             GITHUB_WORKSPACE=self.workspace,
             PATH=self.env_path(),
             FAKE_PODMAN_LOG=self.podman_log,
+            FAKE_DOCKER_LOG=self.docker_log,
             RUNNER_TEMP=self.runner_temp,
         )
         full = script_env(**{**defaults, **env})
@@ -411,6 +920,15 @@ class ScriptTestCase(PanelTestCase):
             return []
         return Path(self.podman_log).read_text(encoding="utf-8").splitlines()
 
+    def docker_records(self) -> list[dict]:
+        if not os.path.exists(self.docker_log):
+            return []
+        lines = Path(self.docker_log).read_text(encoding="utf-8").splitlines()
+        return [json.loads(line) for line in lines]
+
+    def docker_calls(self) -> list[list[str]]:
+        return [record["argv"] for record in self.docker_records()]
+
     def move_repo_into_place(self, repo: str) -> str:
         """Move a throwaway repo to where the action's checkout step puts it."""
         os.makedirs(self.workspace, exist_ok=True)
@@ -418,20 +936,24 @@ class ScriptTestCase(PanelTestCase):
         return self.head_dir
 
 
-class CheckTests(ScriptTestCase):
+class CheckTestCase(ScriptTestCase):
+    """Runs the check step with a same-repo pull request event that has a key."""
+
     BASE = dict(
         AI_REVIEW_EVENT="pull_request",
         GITHUB_REPOSITORY="o/r",
         AI_REVIEW_HEAD_REPO="o/r",
         AI_REVIEW_ACTOR="alice",
         AI_REVIEW_TRIGGERING_ACTOR="alice",
-        ANTHROPIC_API_KEY="sk-job",
+        OPENAI_API_KEY="sk-job",
     )
 
     def check(self, **overrides: str):
         env = {**self.BASE, **overrides}
         return self.run_script("check", self.tmp, **env)
 
+
+class CheckTests(CheckTestCase):
     def test_same_repo_run_with_a_key_proceeds(self):
         proc = self.check()
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
@@ -443,9 +965,10 @@ class CheckTests(ScriptTestCase):
             "deleted fork": dict(AI_REVIEW_HEAD_REPO=""),
             "dependabot actor": dict(AI_REVIEW_ACTOR="dependabot[bot]"),
             "dependabot triggering actor": dict(AI_REVIEW_TRIGGERING_ACTOR="dependabot[bot]"),
-            "no key": dict(ANTHROPIC_API_KEY=""),
-            "vertex off": dict(ANTHROPIC_API_KEY="", CLAUDE_CODE_USE_VERTEX="0"),
-            "codex without an openai key": dict(AI_REVIEW_HARNESS="codex"),
+            "no key": dict(OPENAI_API_KEY=""),
+            "codex without an openai key": dict(AI_REVIEW_HARNESS="codex", OPENAI_API_KEY=""),
+            "claude-code without a key": dict(AI_REVIEW_HARNESS="claude-code"),
+            "vertex off": dict(AI_REVIEW_HARNESS="claude-code", CLAUDE_CODE_USE_VERTEX="0"),
         }
         for name, overrides in cases.items():
             with self.subTest(name):
@@ -471,18 +994,18 @@ class CheckTests(ScriptTestCase):
         ):
             with self.subTest(var):
                 Path(self.output).unlink(missing_ok=True)
-                proc = self.check(ANTHROPIC_API_KEY="", **{var: "1"})
+                proc = self.check(AI_REVIEW_HARNESS="claude-code", OPENAI_API_KEY="", **{var: "1"})
                 self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
                 self.assertEqual(self.github_output(), {"skip": "false"})
 
     def test_bedrock_does_not_count_because_agentic_ci_has_no_bedrock_path(self):
-        proc = self.check(ANTHROPIC_API_KEY="", CLAUDE_CODE_USE_BEDROCK="1")
+        proc = self.check(AI_REVIEW_HARNESS="claude-code", CLAUDE_CODE_USE_BEDROCK="1")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual(self.github_output(), {"skip": "true"})
         self.assertNotIn("BEDROCK", proc.stdout)
 
     def test_skip_message_names_the_credential_variables(self):
-        proc = self.check(ANTHROPIC_API_KEY="")
+        proc = self.check(AI_REVIEW_HARNESS="claude-code")
         for name in (
             "ANTHROPIC_API_KEY",
             "CLAUDE_CODE_OAUTH_TOKEN",
@@ -491,8 +1014,22 @@ class CheckTests(ScriptTestCase):
             "GCP_SERVICE_ACCOUNT_KEY",
         ):
             self.assertIn(name, proc.stdout)
-        proc = self.check(ANTHROPIC_API_KEY="", AI_REVIEW_HARNESS="codex")
+        proc = self.check(AI_REVIEW_HARNESS="codex", OPENAI_API_KEY="")
         self.assertIn("OPENAI_API_KEY", proc.stdout)
+
+    def test_an_empty_harness_is_codex(self):
+        for harness in ({}, {"AI_REVIEW_HARNESS": ""}):
+            with self.subTest(harness=harness):
+                Path(self.output).unlink(missing_ok=True)
+                proc = self.check(OPENAI_API_KEY="", ANTHROPIC_API_KEY="sk-a", **harness)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual(self.github_output(), {"skip": "true"})
+                self.assertIn(
+                    "OPENAI_API_KEY is not set, which the codex harness needs", proc.stdout
+                )
+                Path(self.output).unlink()
+                proc = self.check(**harness)
+                self.assertEqual(self.github_output(), {"skip": "false"})
 
     def test_codex_proceeds_with_an_openai_key(self):
         proc = self.check(AI_REVIEW_HARNESS="codex", OPENAI_API_KEY="sk-oai")
@@ -503,7 +1040,7 @@ class CheckTests(ScriptTestCase):
         for value in ("false", "False", "FALSE", ""):
             with self.subTest(value=value):
                 Path(self.output).unlink(missing_ok=True)
-                proc = self.check(ANTHROPIC_API_KEY="", CLAUDE_CODE_USE_VERTEX=value)
+                proc = self.check(AI_REVIEW_HARNESS="claude-code", CLAUDE_CODE_USE_VERTEX=value)
                 self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
                 self.assertEqual(self.github_output(), {"skip": "true"})
 
@@ -516,6 +1053,99 @@ class CheckTests(ScriptTestCase):
                 self.assertIn("::error::", proc.stdout)
                 self.assertEqual(self.github_output(), {})
 
+    def test_a_bot_login_review_py_accepts_passes(self):
+        for login in (
+            "",
+            "my-app[bot]",
+            "github-actions[bot]",
+            "review-bot",
+            "a",
+            "A1-b2",
+            "x" * 39,
+        ):
+            with self.subTest(login=login):
+                Path(self.output).unlink(missing_ok=True)
+                proc = self.check(AI_REVIEW_BOT_LOGIN=login)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual(self.github_output(), {"skip": "false"})
+
+    def test_a_malformed_bot_login_fails_before_any_output(self):
+        for login in (
+            "@ci-bot",
+            "my app[bot]",
+            "My-App[bot]",
+            "-bot",
+            "bot-",
+            "a--b",
+            "x" * 40,
+            "caf\u00e9",
+            "app[bot]x",
+            "a\nb",
+        ):
+            with self.subTest(login=login):
+                Path(self.output).unlink(missing_ok=True)
+                proc = self.check(AI_REVIEW_BOT_LOGIN=login)
+                self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+                self.assertIn("::error::bot_login must be", proc.stdout)
+                self.assertEqual(self.github_output(), {})
+                # One line: the value cannot start a workflow command of its own.
+                self.assertEqual(len(proc.stdout.splitlines()), 1, proc.stdout)
+
+    def test_bot_login_is_checked_even_when_the_run_skips(self):
+        proc = self.check(AI_REVIEW_BOT_LOGIN="@ci-bot", OPENAI_API_KEY="")
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertEqual(self.github_output(), {})
+
+    def test_the_check_accepts_exactly_the_logins_review_py_accepts(self):
+        logins = (
+            "my-app[bot]",
+            "my_app[bot]",
+            "-app[bot]",
+            "a" * 63 + "[bot]",
+            "a" * 64 + "[bot]",
+            "MyApp[bot]",
+            "octocat",
+            "Octo-Cat-1",
+            "octo--cat",
+            "octocat-",
+            "a" * 39,
+            "a" * 40,
+            "octo.cat",
+            "octo_cat",
+            "\u00e9",
+            "[bot]",
+        )
+        for login in logins:
+            with self.subTest(login=login):
+                try:
+                    with patch.dict(os.environ, {"AI_REVIEW_BOT_LOGIN": login}):
+                        review._github_configured_identity()
+                    accepted = True
+                except ValueError:
+                    accepted = False
+                Path(self.output).unlink(missing_ok=True)
+                proc = self.check(AI_REVIEW_BOT_LOGIN=login)
+                self.assertEqual(proc.returncode == 0, accepted, proc.stdout + proc.stderr)
+
+    def test_the_check_validates_what_action_yml_passes_it(self):
+        expression = step_env_value("Check the event and credentials", "AI_REVIEW_BOT_LOGIN")
+        post = step_env_value("Post the review", "AI_REVIEW_BOT_LOGIN")
+        # The caller's bot_login is what the post step uses when github_token is set.
+        cases = (
+            ({"github_token": "github_pat_x", "bot_login": "@ci-bot"}, "@ci-bot"),
+            ({"github_token": "github_pat_x", "bot_login": "review-bot"}, "review-bot"),
+            ({"bot_login": "@ci-bot"}, ""),
+            ({"bot_login": "@ci-bot", "app_id": "1"}, ""),
+            ({}, ""),
+        )
+        for inputs, want in cases:
+            with self.subTest(inputs=inputs):
+                login = evaluate_expression(expression, inputs, {})
+                self.assertEqual(login, want)
+                if inputs.get("github_token"):
+                    self.assertEqual(evaluate_expression(post, inputs, {}), login)
+                self.assertNotIn("github_pat", login)
+
     def test_an_unknown_harness_is_not_skipped_here(self):
         # The check step does not validate the harness: the review step rejects it loudly.
         proc = self.check(AI_REVIEW_HARNESS="bogus")
@@ -523,7 +1153,9 @@ class CheckTests(ScriptTestCase):
         self.assertEqual(self.github_output(), {"skip": "false"})
 
 
-class PrepareTests(ScriptTestCase):
+class PrepareTestCase(ScriptTestCase):
+    """Runs the prepare step against a throwaway PR checkout and a stand-in action tree."""
+
     def setUp(self):
         super().setUp()
         # A stand-in for the action's own tree, which prepare copies into the workdir.
@@ -551,6 +1183,8 @@ class PrepareTests(ScriptTestCase):
             "prepare", repo, AI_REVIEW_BASE_SHA=base, AI_REVIEW_HEAD_SHA=head, **env
         )
 
+
+class PrepareTests(PrepareTestCase):
     def test_diff_starts_at_the_merge_base_not_the_base_tip(self):
         repo, base, head = self.make_pr()
         proc = self.prepare(repo, base, head)
@@ -571,11 +1205,17 @@ class PrepareTests(ScriptTestCase):
         self.assertTrue(Path(self.repo_dir, "feature.txt").is_file())
         self.assertTrue(Path(self.repo_dir, "a.txt").is_file())
 
-    def test_exported_repo_has_no_git_and_keeps_the_files(self):
+    def test_exported_repo_gets_a_fresh_git_at_the_head_and_keeps_the_files(self):
+        # Not the checkout's .git: the container gets one built for it, at the PR head.
         repo, base, head = self.make_pr()
         proc = self.prepare(repo, base, head)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertFalse(Path(self.repo_dir, ".git").exists())
+        self.assertTrue(Path(self.repo_dir, ".git").is_dir())
+        self.assertFalse(Path(self.repo_dir, ".git").is_symlink())
+        self.assertEqual(git(self.repo_dir, "rev-parse", "HEAD").stdout.decode().strip(), head)
+        self.assertNotEqual(
+            os.stat(Path(self.repo_dir, ".git")).st_ino, os.stat(Path(repo, ".git")).st_ino
+        )
         self.assertEqual(Path(self.repo_dir, "a.txt").read_text(encoding="utf-8"), "one\n")
 
     def test_export_keeps_files_the_pr_marks_export_ignore(self):
@@ -585,6 +1225,25 @@ class PrepareTests(ScriptTestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual(Path(self.repo_dir, "secret.txt").read_text(encoding="utf-8"), "s\n")
         self.assertTrue(Path(self.repo_dir, ".gitattributes").is_file())
+
+    def test_diff_shows_files_the_pr_marks_binary(self):
+        repo, base, head = self.make_pr()
+        head = commit(repo, {".gitattributes": "* -diff\n", "hidden.py": "evil()\n"})
+        proc = self.prepare(repo, base, head)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        diff = Path(self.ai_dir, "pr.diff").read_text(encoding="utf-8")
+        self.assertIn("+evil()", diff)
+        self.assertNotIn("Binary files", diff)
+
+    def test_diff_format_ignores_the_runner_git_config(self):
+        repo, base, head = self.make_pr()
+        git(repo, "config", "diff.noprefix", "true")
+        git(repo, "config", "color.ui", "always")
+        proc = self.prepare(repo, base, head)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        diff = Path(self.ai_dir, "pr.diff").read_text(encoding="utf-8")
+        self.assertIn("+++ b/feature.txt", diff)
+        self.assertNotIn("\x1b[", diff)
 
     def test_stale_export_is_replaced(self):
         repo, base, head = self.make_pr()
@@ -700,6 +1359,7 @@ import sys
 env_keys = [
     "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GITHUB_TOKEN", "GH_TOKEN",
     "ACTIONS_ID_TOKEN_REQUEST_TOKEN", "ACTIONS_ID_TOKEN_REQUEST_URL", "UV_NO_CONFIG", "TMPDIR",
+    "AGENT_ENABLED_PLUGINS",
 ]
 args = sys.argv[1:]
 record = {
@@ -720,10 +1380,12 @@ if os.environ.get("FAKE_WRITE") == "1":
 """
 
 
-class ReviewTests(ScriptTestCase):
+class ReviewTestCase(ScriptTestCase):
+    """Runs the review step against a prepared workdir with fake uvx and podman."""
+
     BASE = "a" * 40
     HEAD = "b" * 40
-    IMAGE = "quay.io/aipcc/agentic-ci/claude-runner:latest"
+    IMAGE = "quay.io/aipcc/agentic-ci/codex-runner:latest"
     VERSION = VERIFIED_AGENTIC_CI_VERSION
 
     def setUp(self):
@@ -742,9 +1404,11 @@ class ReviewTests(ScriptTestCase):
             AI_REVIEW_BASE_SHA=self.BASE,
             AI_REVIEW_HEAD_SHA=self.HEAD,
             # The job environment carries the credential, as in a real run.
-            ANTHROPIC_API_KEY="sk-test",
+            OPENAI_API_KEY="sk-test",
             AI_REVIEW_IMAGE=self.IMAGE,
             AI_REVIEW_AGENTIC_CI_VERSION=self.VERSION,
+            # These tests pin the podman argv; tests.test_github_action_backends covers openshell.
+            AI_REVIEW_BACKEND="podman",
             GITHUB_TOKEN="ghs_secret",
             GH_TOKEN="gh_secret",
             ACTIONS_ID_TOKEN_REQUEST_TOKEN="oidc-token",
@@ -761,9 +1425,12 @@ class ReviewTests(ScriptTestCase):
         instructions: bool = False,
         model: str | None = None,
         minutes: int = 20,
-        harness: str = "claude-code",
+        harness: str = "codex",
+        prompt: str | None = None,
     ) -> list[str]:
-        if harness == "claude-code":
+        if prompt is not None:
+            tail = ["--", "--plugin-dir", "/workspace/plugin"] if harness == "claude-code" else []
+        elif harness == "claude-code":
             prompt = (
                 "/code-review-skills:github-code-review /workspace/repo /workspace/pr.diff "
                 f"{self.BASE} {self.HEAD} /workspace/out/ai-review-output.json"
@@ -771,8 +1438,9 @@ class ReviewTests(ScriptTestCase):
             tail = ["--", "--plugin-dir", "/workspace/plugin"]
         else:
             prompt = (
-                "Use the /github-code-review skill with the arguments: /workspace/repo "
-                f"/workspace/pr.diff {self.BASE} {self.HEAD} /workspace/out/ai-review-output.json"
+                "Invoke the /code-review-skills:github-code-review skill with the arguments: "
+                f"/workspace/repo /workspace/pr.diff {self.BASE} {self.HEAD} "
+                "/workspace/out/ai-review-output.json"
             )
             tail = []
         if instructions:
@@ -815,6 +1483,8 @@ class ReviewTests(ScriptTestCase):
         )
         write_executable(Path(self.bin, "timeout"), body)
 
+
+class ReviewTests(ReviewTestCase):
     def test_agent_runs_under_the_timeout(self):
         log = os.path.join(self.tmp, "timeout.log")
         self.fake_timeout(124)
@@ -875,7 +1545,7 @@ class ReviewTests(ScriptTestCase):
     def test_agent_sees_the_key_but_no_write_token(self):
         self.review()
         env = self.record()["env"]
-        self.assertEqual(env["ANTHROPIC_API_KEY"], "sk-test")
+        self.assertEqual(env["OPENAI_API_KEY"], "sk-test")
         for var in (
             "GITHUB_TOKEN",
             "GH_TOKEN",
@@ -900,6 +1570,24 @@ class ReviewTests(ScriptTestCase):
         self.assertIn("::error::", proc.stdout)
         self.assertIn("produced no output", proc.stdout)
 
+    def test_a_codex_run_without_output_points_at_the_image(self):
+        for harness in ({}, {"AI_REVIEW_HARNESS": "codex"}):
+            with self.subTest(harness=harness):
+                proc = self.review(write_output=False, **harness)
+                self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+                (line,) = [x for x in proc.stdout.splitlines() if x.startswith("::error::")]
+                self.assertIn("produced no output", line)
+                self.assertIn("must ship github-code-review:", line)
+                self.assertNotIn("code-review-panel", line)
+                self.assertIn("image input", line)
+                self.assertIn("README", line)
+
+    def test_a_claude_code_run_without_output_gets_no_image_hint(self):
+        proc = self.review(write_output=False, AI_REVIEW_HARNESS="claude-code")
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("produced no output", proc.stdout)
+        self.assertNotIn("must ship", proc.stdout)
+
     def test_an_empty_output_file_fails(self):
         write(self.out_dir, "ai-review-output.json", "")
         proc = self.review(write_output=False)
@@ -919,7 +1607,7 @@ class ReviewTests(ScriptTestCase):
 
     def test_fails_without_the_plugin_copy(self):
         shutil.rmtree(os.path.join(self.ai_dir, "plugin"))
-        proc = self.review()
+        proc = self.review(AI_REVIEW_HARNESS="claude-code", ANTHROPIC_API_KEY="sk-a")
         self.assertEqual(proc.returncode, 1)
         self.assertFalse(os.path.exists(self.log))
 
@@ -945,17 +1633,35 @@ class ReviewTests(ScriptTestCase):
         self.assertEqual(self.record()["env"]["OPENAI_API_KEY"], "sk-oai")
         self.assertNotIn("sk-oai", " ".join(self.record()["argv"]))
 
-    def test_an_empty_image_picks_the_harness_runner(self):
-        self.review(AI_REVIEW_IMAGE="")
-        self.assertEqual(
-            self.podman_calls(), ["pull quay.io/aipcc/agentic-ci/claude-runner:latest"]
-        )
-        self.assertIn("claude-runner:latest", " ".join(self.record()["argv"]))
-        self.review(AI_REVIEW_IMAGE="", AI_REVIEW_HARNESS="codex", OPENAI_API_KEY="sk-oai")
-        self.assertIn(
-            "codex-runner:latest",
-            self.podman_calls()[-1],
-        )
+    def test_claude_code_harness_argv_and_credentials(self):
+        proc = self.review(AI_REVIEW_HARNESS="claude-code", ANTHROPIC_API_KEY="sk-ant")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(self.record()["argv"], self.expected_argv(harness="claude-code"))
+        self.assertEqual(self.record()["env"]["ANTHROPIC_API_KEY"], "sk-ant")
+        self.assertNotIn("sk-ant", " ".join(self.record()["argv"]))
+
+    def test_an_empty_harness_is_codex(self):
+        for harness in ({}, {"AI_REVIEW_HARNESS": ""}):
+            with self.subTest(harness=harness):
+                proc = self.review(**harness)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual(self.record()["argv"], self.expected_argv(harness="codex"))
+
+    def test_an_empty_image_picks_the_runner_image_of_the_harness(self):
+        # The podman backend cannot run the sandbox images, so it keeps the runner family.
+        for harness, image in (
+            ("", "quay.io/aipcc/agentic-ci/codex-runner:latest"),
+            ("codex", "quay.io/aipcc/agentic-ci/codex-runner:latest"),
+            ("claude-code", "quay.io/aipcc/agentic-ci/claude-runner:latest"),
+        ):
+            with self.subTest(harness=harness):
+                Path(self.podman_log).unlink(missing_ok=True)
+                proc = self.review(AI_REVIEW_IMAGE="", AI_REVIEW_HARNESS=harness)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual(self.podman_calls(), [f"pull {image}"])
+                argv = self.record()["argv"]
+                self.assertEqual(argv[argv.index("--image") + 1], image)
+                self.assertNotIn("sandbox", " ".join(argv))
 
     def test_invalid_image_is_rejected(self):
         for value in ("quay.io/x/y z:latest", "img\tname"):
@@ -1045,10 +1751,10 @@ class ReviewTests(ScriptTestCase):
         self.assertEqual(self.podman_calls(), [])
 
     def test_a_local_image_is_not_pulled(self):
-        proc = self.review(AI_REVIEW_IMAGE="localhost/claude-runner:dev")
+        proc = self.review(AI_REVIEW_IMAGE="localhost/codex-runner:dev")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual(self.podman_calls(), [])
-        self.assertIn("localhost/claude-runner:dev", self.record()["argv"])
+        self.assertIn("localhost/codex-runner:dev", self.record()["argv"])
 
     def test_a_registry_image_is_pulled(self):
         self.review(AI_REVIEW_IMAGE="quay.io/localhost/x:1")
@@ -1093,7 +1799,7 @@ class PostTests(ScriptTestCase):
         self.repo = self.move_repo_into_place(repo)
         self.action_path = os.path.join(self.tmp, "action")
         self.log = os.path.join(self.tmp, "review-py.json")
-        write_executable(Path(self.action_path, REVIEW_PY_REL), FAKE_REVIEW_PY)
+        write_fake_review_py(self.action_path, FAKE_REVIEW_PY)
         write(self.out_dir, "ai-review-output.json", '{"summary": "ok"}')
 
     def post(self, **env: str):
@@ -1119,7 +1825,7 @@ class PostTests(ScriptTestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         record = self.recorded()
         self.assertEqual(record["argv"][:3], ["post", "--platform", "github"])
-        copy = record["argv"][3]
+        copy = record["argv"][-1]
         self.assertNotEqual(copy, self.out)
         self.assertTrue(copy.startswith(self.runner_temp + os.sep), copy)
         self.assertEqual(record["output"], '{"summary": "ok"}')
@@ -1138,14 +1844,16 @@ class PostTests(ScriptTestCase):
         proc = self.post(AGENT_MODEL="some-model")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         env = self.recorded()["env"]
-        self.assertEqual(env["AGENT_TOOL"], "claude-code")
+        self.assertEqual(env["AGENT_TOOL"], "codex")
         self.assertEqual(env["AGENT_MODEL"], "some-model")
         self.assertEqual(env["AGENT_REASONING_EFFORT"], script_constant("AGENT_EFFORT"))
 
     def test_the_footer_names_the_harness(self):
-        proc = self.post(AI_REVIEW_HARNESS="codex")
-        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertEqual(self.recorded()["env"]["AGENT_TOOL"], "codex")
+        for harness, tool in (("codex", "codex"), ("claude-code", "claude-code"), ("", "codex")):
+            with self.subTest(harness=harness):
+                proc = self.post(AI_REVIEW_HARNESS=harness)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual(self.recorded()["env"]["AGENT_TOOL"], tool)
 
     def test_an_already_dirty_checkout_still_posts(self):
         write(self.repo, "a.txt", "normalized differently\n")
@@ -1194,7 +1902,7 @@ class PostTests(ScriptTestCase):
         self.assert_refused(self.post(RUNNER_TEMP=""))
 
     def test_review_py_failure_fails_the_step(self):
-        write_executable(Path(self.action_path, REVIEW_PY_REL), FAKE_REVIEW_PY + "\nsys.exit(1)\n")
+        write_fake_review_py(self.action_path, FAKE_REVIEW_PY + "\nsys.exit(1)\n")
         proc = self.post()
         self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
         self.assertTrue(os.path.exists(self.log))
@@ -1202,6 +1910,39 @@ class PostTests(ScriptTestCase):
     def test_non_executable_poster_is_refused(self):
         Path(self.action_path, REVIEW_PY_REL).chmod(0o644)
         self.assert_refused(self.post())
+
+    def test_a_missing_or_linked_lock_is_refused(self):
+        lock = Path(self.action_path, REVIEW_PY_REL + ".lock")
+        lock.unlink()
+        self.assert_refused(self.post())
+        lock.symlink_to(Path(self.action_path, REVIEW_PY_REL))
+        self.assert_refused(self.post())
+
+
+class ReviewPyLockTests(unittest.TestCase):
+    """review.py resolves its dependencies from its lock in steps that hold a token."""
+
+    def test_every_review_py_call_requires_the_lock(self):
+        calls = [
+            line
+            for line in SCRIPT.read_text(encoding="utf-8").splitlines()
+            if "UV_PYTHON=" in line and not line.lstrip().startswith("#")
+        ]
+        self.assertEqual(len(calls), 3, calls)
+        for line in calls:
+            with self.subTest(line):
+                self.assertIn("UV_NO_CONFIG=1 UV_LOCKED=1", line)
+
+    @unittest.skipUnless(HAVE_UV, "uv is not installed")
+    def test_the_lock_matches_review_py(self):
+        proc = subprocess.run(
+            ["uv", "lock", "--script", str(REPO_ROOT / REVIEW_PY_REL), "--check", "--offline"],
+            env={**os.environ, "UV_NO_CONFIG": "1"},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
 
 
 class WorkdirGuardTests(ScriptTestCase):
@@ -1279,11 +2020,29 @@ class CleanupTests(ScriptTestCase):
     def test_removes_leftover_private_tmpdirs_under_runner_temp_and_nothing_else(self):
         write(self.runner_temp, "ai-review-tmp.AbC123/credentials.json", "{}")
         write(self.runner_temp, "ai-review-tmp.XyZ789/credentials.json", "{}")
+        write(self.runner_temp, "other/file.txt", "x\n")
+        write(self.runner_temp, "ai-review-postx/file.txt", "x\n")
+        proc = self.cleanup()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(sorted(os.listdir(self.runner_temp)), ["ai-review-postx", "other"])
+
+    def test_removes_the_post_steps_copies_of_the_review_output(self):
         write(self.runner_temp, "ai-review-post.Q1/ai-review-output.json", "{}")
+        write(self.runner_temp, "ai-review-post.Q1/posted", "")
+        write(self.runner_temp, "ai-review-post.R2/ai-review-output.json", "{}")
         write(self.runner_temp, "other/file.txt", "x\n")
         proc = self.cleanup()
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertEqual(sorted(os.listdir(self.runner_temp)), ["ai-review-post.Q1", "other"])
+        self.assertEqual(os.listdir(self.runner_temp), ["other"])
+
+    def test_a_symlinked_post_copy_is_not_followed(self):
+        target = tempfile.mkdtemp(dir=self.tmp)
+        write(target, "precious.txt", "x\n")
+        link = os.path.join(self.runner_temp, "ai-review-post.Link01")
+        os.symlink(target, link)
+        self.assertEqual(self.cleanup().returncode, 0)
+        self.assertTrue(os.path.exists(os.path.join(target, "precious.txt")))
+        self.assertTrue(os.path.islink(link))
 
     def test_a_failed_removal_still_removes_the_private_tmpdirs_and_fails_at_the_end(self):
         write(self.ai_dir, "out/locked/file.txt", "x\n")
@@ -1315,9 +2074,34 @@ class CleanupTests(ScriptTestCase):
         shutil.rmtree(self.ai_dir)
         self.assertEqual(self.cleanup().returncode, 0)
 
-    def test_cleanup_does_not_call_podman(self):
-        self.cleanup()
-        self.assertEqual(self.podman_calls(), [])
+    def test_cleanup_removes_only_containers_that_mount_the_workdir(self):
+        containers = {"c1": [self.ai_dir], "c2": ["/elsewhere"], "c3": ["/x", self.ai_dir]}
+        proc = self.cleanup(FAKE_PODMAN_CONTAINERS=json.dumps(containers))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        removed = [c for c in self.podman_calls() if c.startswith("rm ")]
+        self.assertEqual(removed, ["rm -f c1", "rm -f c3"])
+
+    def test_cleanup_without_containers_only_lists_them(self):
+        proc = self.cleanup()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual([c.split()[0] for c in self.podman_calls()], ["ps"])
+
+    def test_a_failed_container_removal_still_removes_the_workdirs_and_fails(self):
+        proc = self.cleanup(
+            FAKE_PODMAN_CONTAINERS=json.dumps({"c1": [self.ai_dir]}), FAKE_PODMAN_RM_STATUS="1"
+        )
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertFalse(os.path.exists(self.ai_dir))
+
+    def test_cleanup_without_podman_still_removes_the_workdirs(self):
+        # Only the tools cleanup needs, so a podman installed on the host stays out of reach.
+        tools = os.path.join(self.tmp, "tools")
+        os.makedirs(tools)
+        for tool in ("bash", "rm"):
+            os.symlink(shutil.which(tool), os.path.join(tools, tool))
+        proc = self.cleanup(PATH=tools)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertFalse(os.path.exists(self.ai_dir))
 
     def test_a_symlink_is_not_followed(self):
         for path in (self.ai_dir, self.head_dir):

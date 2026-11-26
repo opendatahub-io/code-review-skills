@@ -9,6 +9,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import sys
 import unittest
 from argparse import Namespace
@@ -39,6 +40,8 @@ HEAD = "a" * 40
 OLD = "b" * 40
 NEWER = "c" * 40
 ZWSP = "\u200b"
+# An @ that GitHub would turn into a mention: not after a word character, before one.
+LIVE_MENTION_RE = re.compile(r"(?<![A-Za-z0-9])@(?=[A-Za-z0-9])")
 OURS_REST = {"login": "github-actions[bot]", "type": "Bot"}
 OURS_GQL = {"__typename": "Bot", "login": "github-actions"}
 HUMAN_GQL = {"__typename": "User", "login": "bob"}
@@ -845,6 +848,13 @@ class RenderedBodyTests(GitHubTestCase):
         before_prompt = body.split("Copy-paste this")[0]
         self.assertEqual(before_prompt.count("```") % 2, 0)
 
+    def test_a_fence_opened_in_a_positive_aspect_cannot_expose_the_fix_prompt(self):
+        data = review_data(
+            [finding()], positive_aspects=["x\n  ```\n  code"], fix_prompt="ping @org/team"
+        )
+        self.post(data)
+        self.assertIsNone(LIVE_MENTION_RE.search(self.fake.summary_body()))
+
     def test_null_summary_fields_do_not_crash_the_poster(self):
         data = review_data([finding()], positive_aspects=None, fix_prompt=["not", "a string"])
         data["summary"] = None
@@ -913,29 +923,37 @@ class TextSafetyTests(unittest.TestCase):
         text = review._github_text("a <!-- b\n```\n<!-- ai-review -->\n```\n`<!-- x -->`")
         self.assertNotIn("<!--", text)
 
-    def test_code_stays_verbatim(self):
-        for text in (
-            "`@property` is fine",
-            "```python\n@pytest.fixture\n```",
-            "~~~\n@scope/pkg\n~~~",
-            "mail a@b.com",
-            "install pkg@1.0",
-            "`@types/node` and `` `@x` ``",
+    def test_mentions_in_code_are_defused_too(self):
+        # A regex cannot find code the way GitHub does, so code gets no exemption.
+        for text, expected in (
+            ("`@property` is fine", f"`@{ZWSP}property` is fine"),
+            ("```python\n@pytest.fixture\n```", f"```python\n@{ZWSP}pytest.fixture\n```"),
+            ("~~~\n@scope/pkg\n~~~", f"~~~\n@{ZWSP}scope/pkg\n~~~"),
+            ("\\`@org/team` now", f"\\`@{ZWSP}org/team` now"),
         ):
+            with self.subTest(text):
+                self.assertEqual(review._github_text(text), expected)
+
+    def test_addresses_and_versions_stay_verbatim(self):
+        for text in ("mail a@b.com", "install pkg@1.0"):
             with self.subTest(text):
                 self.assertEqual(review._github_text(text), text)
 
     def test_mention_after_a_fence_is_defused(self):
         text = review._github_text("```\n@a\n```\n@b")
-        self.assertEqual(text, f"```\n@a\n```\n@{ZWSP}b")
+        self.assertEqual(text, f"```\n@{ZWSP}a\n```\n@{ZWSP}b")
 
-    def test_escaped_backtick_does_not_open_a_code_span(self):
-        for text, expected in (
-            ("see \\`@org/team` now", f"see \\`@{ZWSP}org/team` now"),
-            ("\\\\`@org/team` now", "\\\\`@org/team` now"),
-        ):
-            with self.subTest(text):
-                self.assertEqual(review._github_text(text), expected)
+    def test_a_fence_hidden_in_an_html_block_cannot_keep_a_mention_live(self):
+        text = review._github_text("<div>\n```\n@evil\n```\n</div>")
+        self.assertIsNone(LIVE_MENTION_RE.search(text))
+
+    def test_a_code_span_across_lines_cannot_keep_a_mention_live(self):
+        text = review._github_text("foo `bar\nbaz` @evil `qux`")
+        self.assertIsNone(LIVE_MENTION_RE.search(text))
+
+    def test_a_fence_opened_in_a_list_item_closes_at_its_indentation(self):
+        text = review._github_text("- x\n  ```\n  code")
+        self.assertEqual(text, "- x\n  ```\n  code\n  ```")
 
     def test_backtick_fence_with_a_backtick_in_its_info_string_is_not_a_fence(self):
         text = review._github_text("```x`\n@org/team\n```")
@@ -946,7 +964,13 @@ class TextSafetyTests(unittest.TestCase):
         body = review._github_build_summary_body(
             review_data(fix_prompt="x ```` y\n@user"), marker()
         )
-        self.assertIn("`````\nx ```` y\n@user\n`````", body)
+        self.assertIn(f"`````\nx ```` y\n@{ZWSP}user\n`````", body)
+
+    def test_cutting_inside_a_code_span_cannot_expose_a_mention(self):
+        text = review._github_text("a" * 100 + " `@evil " + "b" * 100 + "`")
+        capped = review._github_cap(text, marker(), limit=len(marker()) + 130)
+        self.assertIn("*(truncated)*", capped)
+        self.assertIsNone(LIVE_MENTION_RE.search(capped))
 
     def test_suggestion_code_is_left_verbatim(self):
         fix = {"code": "x = '@user'  # <!-- c -->\n"}

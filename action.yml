@@ -1,29 +1,43 @@
 name: AI Code Review
 description: >-
-  Review a pull request with Claude and post inline comments, applicable
+  Review a pull request with an AI agent and post inline comments, applicable
   suggestions and a summary. The agent only reads code. A separate step posts.
 author: opendatahub-io
 
 inputs:
   harness:
     description: >-
-      Agent harness agentic-ci runs: 'claude-code' or 'codex'. The credentials
+      Agent harness agentic-ci runs: 'codex' or 'claude-code'. The credentials
       are not inputs: set the keys agentic-ci reads in the job environment (see
       the README).
     required: false
-    default: 'claude-code'
+    default: 'codex'
   model:
     description: Model for the review. Empty uses the harness default.
     required: false
     default: ''
   agentic_ci_version:
-    description: Version of the agentic-ci package that runs the agent in a container. The default is the one the action was checked against.
+    description: >-
+      Version of agentic-ci that runs the agent. With the openshell backend it is
+      the tag of the quay.io/aipcc/agentic-ci/openshell image, whose bundled
+      agentic-ci runs, and '<tag>@sha256:<digest>' pins that image by digest.
+      With the podman backend it is the PyPI version uvx installs. The default
+      is the one the action was checked against.
     required: false
     default: '0.5.15'
+  backend:
+    description: >-
+      Where agentic-ci runs the agent. 'openshell' runs the openshell image as a
+      privileged docker container, which runs the agent in an OpenShell sandbox.
+      'podman' runs agentic-ci on the runner, which starts a Podman container.
+    required: false
+    default: 'openshell'
   image:
     description: >-
-      Container image the agent runs in. Empty picks the runner image that
-      matches the harness. The default tag floats, so pin a digest to freeze it.
+      Container image the agent runs in. Empty picks the agentic-ci image that
+      matches the harness and the backend: the sandbox image for openshell, the
+      runner image for podman. The default tag floats, so pin a digest to freeze
+      it.
     required: false
     default: ''
   review_instructions:
@@ -31,9 +45,11 @@ inputs:
     required: false
     default: ''
   timeout_minutes:
-    description: Wall-clock limit for the agent step, in minutes. The step fails when the review takes longer.
+    description: >-
+      Wall-clock limit for the agent step, in minutes. The step fails when the
+      review takes longer. Empty means 20 in standard mode and 75 in deep mode.
     required: false
-    default: '20'
+    default: ''
   chill_mode:
     description: Drop suggestion-level comments ('true' or 'false').
     required: false
@@ -42,6 +58,72 @@ inputs:
     description: Post applicable suggestions from fix objects ('true' or 'false').
     required: false
     default: 'true'
+  mode:
+    description: >-
+      'standard' runs one review pass. 'deep' runs the code-review-panel skill:
+      one reviewer per lens plus skeptics, for many times the cost. Deep mode
+      ignores review_instructions and reads REVIEW.md from the base branch.
+    required: false
+    default: 'standard'
+  deep_review_job:
+    description: >-
+      Display name of the job that runs this action with mode 'deep': its name
+      when it sets one, else its job key; under a reusable workflow, the
+      calling job's. A standard review stands down when that job has started or
+      succeeded for the same head. Needs 'actions: read' on private
+      repositories.
+    required: false
+    default: 'deep-review'
+  recommend_deep_review:
+    description: >-
+      In standard mode, triage the change on the runner before the review and
+      recommend a deep review in the summary when it touches high-risk paths
+      ('true' or 'false').
+    required: false
+    default: 'false'
+  deep_review_label:
+    description: >-
+      Label that starts the deep review job, which the deep review
+      recommendation tells people to add. Keep it equal to the label in that
+      job's 'if:'.
+    required: false
+    default: 'deep-review'
+  suggest_reviewers:
+    description: >-
+      In standard mode, after the review is posted, comment once with up to five
+      reviewers picked from the history of the changed files ('true' or
+      'false'). A failed suggestion only warns.
+    required: false
+    default: 'false'
+  app_id:
+    description: >-
+      App ID or Client ID of a GitHub App to post as. When set, the action
+      mints a token for this repository right before it posts, and the review
+      appears as <app-slug>[bot]. Empty posts with the workflow token.
+    required: false
+    default: ''
+  app_private_key:
+    description: >-
+      Private key of the GitHub App named by app_id. Pass it from a secret. Only
+      the step that mints the token reads it.
+    required: false
+    default: ''
+  github_token:
+    description: >-
+      Token to post with instead of a minted App token or the workflow token,
+      such as one the caller minted or a fine-grained personal access token.
+      It needs pull requests and issues write, contents read and actions read.
+      Only the post step holds it, and no App token is minted when it is set.
+      Set bot_login with it.
+    required: false
+    default: ''
+  bot_login:
+    description: >-
+      Login of the account github_token belongs to: <app-slug>[bot] for a
+      GitHub App, or the user login behind a personal access token. Read only
+      when github_token is set.
+    required: false
+    default: ''
 
 runs:
   using: composite
@@ -56,26 +138,14 @@ runs:
         AI_REVIEW_ACTOR: ${{ github.actor }}
         AI_REVIEW_TRIGGERING_ACTOR: ${{ github.triggering_actor }}
         AI_REVIEW_HARNESS: ${{ inputs.harness }}
-
-    - name: Check out the pull request head
-      if: steps.check.outputs.skip != 'true'
-      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      with:
-        ref: ${{ github.event.pull_request.head.sha }}
-        fetch-depth: 0
-        persist-credentials: false
-        # Outside .ai-review: the container mounts that directory and must not reach the checkout's .git.
-        path: .ai-review-head
-
-    - name: Prepare the diff
-      if: steps.check.outputs.skip != 'true'
-      shell: bash
-      working-directory: .ai-review-head
-      run: '"$GITHUB_ACTION_PATH/action/review-pr.sh" prepare'
-      env:
-        AI_REVIEW_BASE_SHA: ${{ github.event.pull_request.base.sha }}
-        AI_REVIEW_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        AI_REVIEW_INSTRUCTIONS: ${{ inputs.review_instructions }}
+        AI_REVIEW_MODE: ${{ inputs.mode }}
+        AI_REVIEW_DRAFT: ${{ github.event.pull_request.draft }}
+        # Validated before the agent spends on the review, like bot_login.
+        AI_REVIEW_RECOMMEND_DEEP: ${{ inputs.recommend_deep_review }}
+        AI_REVIEW_DEEP_LABEL: ${{ inputs.deep_review_label }}
+        # The bot_login the post step will use, checked before the agent spends on the review.
+        # Only whether github_token is set reaches this step, never the token.
+        AI_REVIEW_BOT_LOGIN: ${{ inputs.github_token != '' && inputs.bot_login || '' }}
 
     - name: Set up uv
       if: steps.check.outputs.skip != 'true'
@@ -83,9 +153,52 @@ runs:
       with:
         # uvx runs agentic-ci and uv runs review.py. The default cache would hash the PR's whole tree.
         enable-cache: false
+        # review.py runs from its lock with UV_LOCKED=1, so a uv release that reads the lock
+        # differently must not reach the post step unannounced.
+        version: "0.13.10"
+        # setup-uv reads required-version from a uv.toml or pyproject.toml here. The workspace
+        # root can hold the PR's files, which could pick a uv that ignores UV_NO_CONFIG.
+        working-directory: ${{ github.action_path }}
+
+    - name: Check for a review that should win
+      id: standdown
+      if: steps.check.outputs.skip != 'true'
+      shell: bash
+      # Holds the token only to read the Actions API and the pull request: review.py makes no
+      # write call here. Runs before the checkout and the agent, so a review that would be
+      # replaced costs neither. Not the workspace, which can hold the PR's files.
+      working-directory: ${{ runner.temp }}
+      run: '"$GITHUB_ACTION_PATH/action/review-pr.sh" standdown'
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+        AI_REVIEW_MODE: ${{ inputs.mode }}
+        AI_REVIEW_DEEP_JOB: ${{ inputs.deep_review_job }}
+
+    - name: Check out the pull request head
+      if: steps.check.outputs.skip != 'true' && steps.standdown.outputs.stand_down != 'true'
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      with:
+        ref: ${{ github.event.pull_request.head.sha }}
+        fetch-depth: 0
+        persist-credentials: false
+        # Outside .ai-review: the container mounts that directory and must not reach the checkout's .git.
+        # The prepare step builds the container's own .git from it, without its config or remote.
+        path: .ai-review-head
+
+    - name: Prepare the diff
+      if: steps.check.outputs.skip != 'true' && steps.standdown.outputs.stand_down != 'true'
+      shell: bash
+      working-directory: .ai-review-head
+      run: '"$GITHUB_ACTION_PATH/action/review-pr.sh" prepare'
+      env:
+        AI_REVIEW_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        AI_REVIEW_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        AI_REVIEW_INSTRUCTIONS: ${{ inputs.review_instructions }}
+        AI_REVIEW_MODE: ${{ inputs.mode }}
+        AI_REVIEW_RECOMMEND_DEEP: ${{ inputs.recommend_deep_review }}
 
     - name: Review the pull request
-      if: steps.check.outputs.skip != 'true'
+      if: steps.check.outputs.skip != 'true' && steps.standdown.outputs.stand_down != 'true'
       shell: bash
       # Not the checkout: uvx must not read a uv.toml or pyproject.toml that arrives with the PR.
       working-directory: .ai-review
@@ -98,26 +211,63 @@ runs:
         AI_REVIEW_TIMEOUT_MINUTES: ${{ inputs.timeout_minutes }}
         AI_REVIEW_AGENTIC_CI_VERSION: ${{ inputs.agentic_ci_version }}
         AI_REVIEW_IMAGE: ${{ inputs.image }}
+        AI_REVIEW_MODE: ${{ inputs.mode }}
+        AI_REVIEW_BACKEND: ${{ inputs.backend }}
+        # Only read to warn that deep mode ignores it.
+        AI_REVIEW_INSTRUCTIONS: ${{ inputs.review_instructions }}
         # The agent never holds a token that can write to the repository.
         GITHUB_TOKEN: ''
         GH_TOKEN: ''
         ACTIONS_ID_TOKEN_REQUEST_TOKEN: ''
         ACTIONS_ID_TOKEN_REQUEST_URL: ''
 
+    - name: Mint the posting token
+      id: app-token
+      if: steps.check.outputs.skip != 'true' && steps.standdown.outputs.stand_down != 'true' && inputs.app_id != '' && inputs.github_token == ''
+      # After the review, so the agent never runs while the token exists. The token is masked,
+      # scoped to this repository, and revoked when the job ends. A failed mint fails the job
+      # rather than posting under the workflow token's identity. A caller's token wins, so no
+      # App token is minted next to it, and a mint that would fail cannot stop that token.
+      uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
+      with:
+        client-id: ${{ inputs.app_id }}
+        private-key: ${{ inputs.app_private_key }}
+        repositories: ${{ github.event.repository.name }}
+        permission-pull-requests: write
+        permission-issues: write
+        # The history query of the reviewer suggestions.
+        permission-contents: read
+        # The check for a review that should win, right before posting.
+        permission-actions: read
+
     - name: Post the review
-      if: steps.check.outputs.skip != 'true'
+      if: steps.check.outputs.skip != 'true' && steps.standdown.outputs.stand_down != 'true'
       shell: bash
       working-directory: .ai-review-head
       run: '"$GITHUB_ACTION_PATH/action/review-pr.sh" post'
       env:
-        GITHUB_TOKEN: ${{ github.token }}
+        # The first that is set: the caller's token, the minted App token, the workflow token.
+        GITHUB_TOKEN: ${{ inputs.github_token || steps.app-token.outputs.token || github.token }}
+        # The account the token posts as. Empty means github-actions[bot].
+        AI_REVIEW_BOT_LOGIN: ${{ inputs.github_token != '' && inputs.bot_login || inputs.github_token == '' && steps.app-token.outputs.app-slug && format('{0}[bot]', steps.app-token.outputs.app-slug) || '' }}
+        # Only whether a caller token is set, so the step can warn about an empty bot_login.
+        AI_REVIEW_CALLER_TOKEN: ${{ inputs.github_token != '' }}
         CHILL_MODE: ${{ inputs.chill_mode }}
         INLINE_FIXES: ${{ inputs.inline_fixes }}
         AGENT_MODEL: ${{ inputs.model }}
         AI_REVIEW_HARNESS: ${{ inputs.harness }}
+        AI_REVIEW_MODE: ${{ inputs.mode }}
+        AI_REVIEW_DEEP_JOB: ${{ inputs.deep_review_job }}
+        AI_REVIEW_RECOMMEND_DEEP: ${{ inputs.recommend_deep_review }}
+        AI_REVIEW_DEEP_LABEL: ${{ inputs.deep_review_label }}
+        AI_REVIEW_SUGGEST_REVIEWERS: ${{ inputs.suggest_reviewers }}
 
     # Composite actions have no post hook, so this step always runs.
     - name: Remove the checkout
       if: always()
       shell: bash
       run: '"$GITHUB_ACTION_PATH/action/review-pr.sh" cleanup'
+      env:
+        AI_REVIEW_BACKEND: ${{ inputs.backend }}
+        # Names the openshell image that gives root's leftovers back to the runner user.
+        AI_REVIEW_AGENTIC_CI_VERSION: ${{ inputs.agentic_ci_version }}

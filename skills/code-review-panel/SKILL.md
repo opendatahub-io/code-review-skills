@@ -95,7 +95,8 @@ The panel works because each judgment is independent; these rules keep it so in 
 5. Write `<scratch>/findings.json` (schema in report.md): each common finding with its `lens`;
    security findings exactly as the finder returned them plus `"lens": "security"`; every
    finder's `still_present` ids in one list, its `fixed` entries in another, each with the
-   finder's `lens` added, and its `unread` paths in a third. Then run (report reads the known
+   finder's `lens` added, and its `unread` paths in a third, each as `{"path": "<path>",
+   "lens": "<the finder's lens>"}`. Then run (report reads the known
    findings file triage recorded in the plan):
 
    ```text

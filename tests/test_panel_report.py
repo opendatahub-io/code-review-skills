@@ -1773,5 +1773,249 @@ class InputFileTests(ReportTestCase):
         self.assertNotIn("Traceback", proc.stderr)
 
 
+def lens_names(plan: Plan) -> list[str]:
+    return [lens["name"] for lens in plan.data["lenses"]]
+
+
+def unread_by(plan: Plan, path: str, skip: tuple[str, ...] = ()) -> list[dict]:
+    """The merged unread list when every lens of the plan but those in skip missed path."""
+    return [{"path": path, "lens": name} for name in lens_names(plan) if name not in skip]
+
+
+class UnreadByLensTests(ReportTestCase):
+    """A file is not read for the review when no lens read it, or the security lens did not."""
+
+    def test_file_another_lens_read_is_no_gap(self) -> None:
+        readers = ("correctness", "security")
+        doc = findings_doc([], unread=unread_by(FX.standard, "src/b.py", skip=readers))
+        gitlab = self.path("gl-partly.json")
+        out = self.report(FX.standard, doc, [], "--gitlab-json", gitlab).stdout
+        self.assert_starts_with(out, "**Nothing to fix.** No lens reported a finding.")
+        self.assertNotIn("files not read", out)
+        self.assertIn("Approval hint: needs a human (code changes)", out)
+        others = ", ".join(n for n in lens_names(FX.standard) if n not in readers)
+        self.assertIn(f"- Read by some lenses only: src/b.py (not read by {others})", out)
+        summary = load_json(gitlab)["summary"]
+        self.assertNotIn("not read", summary)
+
+    def test_file_only_the_security_lens_missed_is_not_read(self) -> None:
+        unread = [{"path": "src/b.py", "lens": "security"}]
+        gitlab = self.path("gl-security.json")
+        out = self.report(FX.standard, findings_doc([], unread=unread), [], "--gitlab-json", gitlab)
+        self.assert_starts_with(out.stdout, "**Review incomplete:** 1 files not read\n")
+        self.assertIn("Approval hint: needs a human (code changes; files not read)", out.stdout)
+        self.assertNotIn("Read by some lenses only", out.stdout)
+        self.assert_starts_with(
+            load_json(gitlab)["summary"], "**Review incomplete:** 1 files not read\n"
+        )
+
+    def test_file_every_lens_missed_is_not_read(self) -> None:
+        unread = unread_by(FX.standard, "src/b.py") + [{"path": "src/a.py", "lens": "testing"}]
+        gitlab = self.path("gl-unread.json")
+        out = self.report(FX.standard, findings_doc([], unread=unread), [], "--gitlab-json", gitlab)
+        self.assert_starts_with(out.stdout, "**Review incomplete:** 1 files not read\n")
+        self.assertIn("Not covered: files not read: src/b.py", out.stdout)
+        self.assertIn("- Read by some lenses only: src/a.py (not read by testing)", out.stdout)
+        self.assertIn("Approval hint: needs a human (code changes; files not read)", out.stdout)
+        summary = load_json(gitlab)["summary"]
+        self.assert_starts_with(summary, "**Review incomplete:** 1 files not read\n")
+        self.assertIn("files not read", summary.rsplit("Approval hint:", 1)[1])
+
+    def test_counted_finding_head_counts_only_files_no_lens_read(self) -> None:
+        unread = unread_by(FX.standard, "src/b.py", skip=("testing", "security")) + unread_by(
+            FX.standard, "src/c.py"
+        )
+        doc = findings_doc([row(cls="added-bug", line=30)], unread=unread)
+        gitlab = self.path("gl-counted.json")
+        proc = self.report(FX.standard, doc, upheld(G1), "--gitlab-json", gitlab)
+        self.assert_starts_with(
+            proc.stdout,
+            "**1 to fix:** 1 blocking, 0 major, 0 minor; review incomplete: 1 files not read\n",
+        )
+        self.assert_starts_with(
+            load_json(gitlab)["summary"],
+            "**1 to fix** (1 inline, all listed below); review incomplete: 1 files not read\n",
+        )
+
+    def test_lens_not_covered_reads_nothing(self) -> None:
+        unread = unread_by(FX.standard, "src/b.py", skip=("testing",))
+        doc = findings_doc([], unread=unread, not_covered=["testing"])
+        out = self.report(FX.standard, doc, []).stdout
+        self.assert_starts_with(
+            out, "**Review incomplete:** lenses not covered: testing; 1 files not read\n"
+        )
+
+    def test_bare_path_still_counts_as_read_by_no_lens(self) -> None:
+        unread = ["src/b.py", {"path": "src/a.py", "lens": "testing"}]
+        out = self.report(FX.standard, findings_doc([], unread=unread), []).stdout
+        self.assert_starts_with(out, "**Review incomplete:** 1 files not read\n")
+        self.assertIn("- Not covered: files not read: src/b.py\n", out)
+
+    def test_unknown_lens_warns_and_counts_the_file_as_not_read(self) -> None:
+        unread = [{"path": "src/b.py", "lens": "style"}]
+        out = self.report(FX.standard, findings_doc([], unread=unread), []).stdout
+        self.assert_starts_with(out, "**Review incomplete:** 1 files not read\n")
+        self.assertIn("names lens 'style', which is not a lens of this plan", out)
+
+    def test_malformed_unread_entry_exits_2(self) -> None:
+        for bad in ([{"path": "src/b.py"}], [{"path": 3, "lens": "testing"}], [7]):
+            with self.subTest(bad=bad):
+                proc = self.report(FX.standard, findings_doc([], unread=bad), [], code=2)
+                self.assertIn("unread", proc.stderr)
+
+    def test_known_item_its_own_lens_read_is_checked(self) -> None:
+        # Testing skipped src/a.py, but correctness, the known item's lens, read it.
+        unread = [{"path": "src/a.py", "lens": "testing"}]
+        fixed = [{"id": A, "reason": "src/a.py:3 now stops at the end.", "lens": "correctness"}]
+        out = self.path("known-out.json")
+        proc = self.report(
+            FX.known, findings_doc([], unread=unread, fixed=fixed), [], "--known-out", out
+        )
+        self.assert_starts_with(proc.stdout, "**Nothing to fix.**")
+        self.assertIn("Fixed since the last round: [" + A, proc.stdout)
+        self.assertNotIn("Not checked this round", proc.stdout)
+
+    def test_known_item_its_own_lens_skipped_stays_open_unchecked(self) -> None:
+        unread = [{"path": "src/a.py", "lens": "correctness"}]
+        fixed = [{"id": A, "reason": "src/a.py:3 now stops at the end.", "lens": "correctness"}]
+        proc = self.report(FX.known, findings_doc([], unread=unread, fixed=fixed), [])
+        self.assert_starts_with(
+            proc.stdout, "**Nothing new to fix;** 1 earlier findings still open"
+        )
+        self.assertIn(
+            "Not checked this round (lens not run or not covered, or file not read): [", proc.stdout
+        )
+        self.assertIn("- Read by some lenses only: src/a.py (not read by correctness)", proc.stdout)
+
+
+class VerdictLocationTests(ReportTestCase):
+    """A skeptic's verdict can move a finding to the right line of its file."""
+
+    def moved(self, **facts) -> list[dict]:
+        return [
+            verdict(G2, "facts", refuted=False, **facts),
+            verdict(G2, "impact", refuted=False),
+        ]
+
+    def test_corrected_line_is_used_inline_in_the_summary_and_the_report(self) -> None:
+        # The finder cites src/a.py:2, an unchanged line; the code is at the added line 30.
+        doc = findings_doc([row(cls="old-line-bug", line=2, sev="major")])
+        gitlab, known = self.path("gl-moved.json"), self.path("known-moved.json")
+        verdicts = self.moved(location={"file": "src/a.py", "line": 30})
+        proc = self.report(
+            FX.standard, doc, verdicts, "--gitlab-json", gitlab, "--known-out", known
+        )
+        self.assertIn(
+            f"**[{G2}] old-line-bug in src/a.py** (src/a.py:30, correctness)", proc.stdout
+        )
+        self.assertIn("facts: location corrected from src/a.py:2 to src/a.py:30", proc.stdout)
+        g = load_json(gitlab)
+        self.assertEqual([(c["file"], c["line"]) for c in g["inline_comments"]], [("src/a.py", 30)])
+        self.assert_starts_with(g["summary"], "**1 to fix** (1 inline, all listed below)")
+        self.assertIn(
+            f"- [{G2}] major, inline: old-line-bug in src/a.py (src/a.py:30,", g["summary"]
+        )
+        item = load_json(known)["findings"][0]
+        self.assertEqual((item["id"], item["line"]), (G2, 30))
+
+    def test_corrected_line_drops_the_same_place_from_instances(self) -> None:
+        instances = [{"file": "src/a.py", "line": 30}, {"file": "src/b.py", "line": 1}]
+        doc = findings_doc([row(cls="old-line-bug", line=2, sev="major", instances=instances)])
+        verdicts = self.moved(location={"file": "./src/a.py", "line": 30})
+        out = self.report(FX.standard, doc, verdicts).stdout
+        self.assertIn("- Also at: src/b.py:1\n", out)
+
+    def test_location_in_another_file_is_ignored_with_a_warning(self) -> None:
+        doc = findings_doc([row(cls="old-line-bug", line=2, sev="major")])
+        verdicts = self.moved(location={"file": "src/b.py", "line": 1})
+        out = self.report(FX.standard, doc, verdicts).stdout
+        self.assertIn("(src/a.py:2, correctness)", out)
+        self.assertIn(f"{G2}: the facts verdict moves it to src/b.py, not its file src/a.py", out)
+        self.assertNotIn("location corrected", out)
+
+    def test_malformed_location_exits_2(self) -> None:
+        doc = findings_doc([row(cls="old-line-bug", line=2, sev="major")])
+        for bad in ("src/a.py:30", {"file": "src/a.py", "line": -1}, {"line": 30}):
+            with self.subTest(bad=bad):
+                proc = self.report(FX.standard, doc, self.moved(location=bad), code=2)
+                self.assertIn("location", proc.stderr)
+
+    def test_facts_location_wins_over_reproduce(self) -> None:
+        a = finding_id("correctness", "off-by-one", "src/a.py")
+        verdicts = [
+            verdict(a, "facts", refuted=False, location={"file": "src/a.py", "line": 31}),
+            verdict(a, "impact", refuted=False),
+            verdict(a, "reproduce", result="upheld", location={"file": "src/a.py", "line": 30}),
+        ]
+        out = self.report(FX.deep, findings_doc([row()]), verdicts).stdout
+        self.assertIn("(src/a.py:31, correctness)", out)
+        self.assertIn(
+            f"{a}: the reproduce verdict puts it at line 30, the facts verdict at line 31", out
+        )
+
+    def test_location_of_a_skeptic_the_lens_does_not_run_is_ignored(self) -> None:
+        # The standard plan runs no reproduce skeptic.
+        doc = findings_doc([row(cls="old-line-bug", line=2, sev="major")])
+        verdicts = self.moved() + [
+            verdict(G2, "reproduce", result="upheld", location={"file": "src/a.py", "line": 30})
+        ]
+        out = self.report(FX.standard, doc, verdicts).stdout
+        self.assertIn("(src/a.py:2, correctness)", out)
+
+
+class SummaryOnlyEvidenceTests(ReportTestCase):
+    """A counted finding with no inline comment carries its evidence and fix in the summary."""
+
+    def gitlab(self, rows: list[dict], verdicts: list[dict], name: str) -> dict:
+        path = self.path(name)
+        self.report(FX.standard, findings_doc(rows), verdicts, "--gitlab-json", path)
+        return load_json(path)
+
+    def test_summary_only_finding_gets_evidence_and_fix(self) -> None:
+        rows = [
+            row(cls="added-bug", line=30, evidence="inline evidence", fix="inline fix"),
+            row(cls="old-line-bug", line=2, sev="major", evidence="old evidence", fix="old fix"),
+        ]
+        summary = self.gitlab(rows, upheld(G1) + upheld(G2), "gl-ev.json")["summary"]
+        self.assertIn(
+            f"- [{G2}] major: old-line-bug in src/a.py (src/a.py:2, correctness)\n"
+            "  - Evidence: old evidence\n"
+            "  - Fix: old fix\n",
+            summary,
+        )
+        self.assertNotIn("inline evidence", summary)
+        self.assertNotIn("inline fix", summary)
+
+    def test_evidence_is_one_bounded_line_and_neutralized(self) -> None:
+        evidence = "Starts here.\n```\n/approve\n# heading\n@all " + "x" * 900
+        rows = [row(cls="old-line-bug", line=2, sev="major", evidence=evidence, fix="\n/close\n")]
+        summary = self.gitlab(rows, upheld(G2), "gl-long.json")["summary"]
+        line = next(ln for ln in summary.split("\n") if ln.startswith("  - Evidence: "))
+        self.assertTrue(line.startswith("  - Evidence: Starts here. ``` /approve # heading @​all x"))
+        self.assertTrue(line.endswith("..."), line)
+        self.assertLessEqual(len(line) - len("  - Evidence: "), 500 + 1)
+        self.assertIn("  - Fix: /close\n", summary)
+        self.assertNotIn("\n```", summary)
+        slash = [ln for ln in summary.split("\n") if ln.lstrip().startswith("/")]
+        self.assertEqual(slash, [])
+
+    def test_minors_over_the_nit_cap_stay_title_only(self) -> None:
+        rows = twelve_minors()[:6]
+        ids = [finding_id(r["lens"], r["class"], r["file"]) for r in rows]
+        verdicts = [v for fid in ids for v in upheld(fid)]
+        summary = self.gitlab(rows, verdicts, "gl-nit.json")["summary"]
+        hidden = [ln for ln in summary.split("\n") if "over the nit cap" in ln]
+        self.assertEqual(len(hidden), 1, summary)
+        self.assertEqual(summary.count("  - Evidence: "), 5, summary)
+
+    @unittest.skipUnless(HAVE_UV, "review.py runs through uv")
+    def test_review_py_display_accepts_the_summary(self) -> None:
+        path = self.path("gl-display.json")
+        doc = findings_doc([row(cls="old-line-bug", line=2, sev="major", evidence="e\n`x`")])
+        self.report(FX.standard, doc, upheld(G2), "--gitlab-json", path)
+        proc = review_py_display(path)
+        self.assertEqual(proc.returncode, 0, proc.stderr[-400:])
+
+
 if __name__ == "__main__":
     unittest.main()
