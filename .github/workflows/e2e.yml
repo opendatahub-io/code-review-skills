@@ -12,6 +12,7 @@ on:
       - 'skills/**'
       - 'renovate.json'
       - '.github/workflows/e2e.yml'
+      - '.github/e2e-check-summary.sh'
 
 permissions: {}
 
