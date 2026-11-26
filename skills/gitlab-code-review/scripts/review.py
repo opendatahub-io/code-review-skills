@@ -56,6 +56,11 @@ Usage:
   review.py stand-down --platform github --mode standard|deep [--deep-job NAME]
   review.py display review.json [--chill|--no-chill] [--inline-fixes|--no-inline-fixes]
   review.py suggest-reviewers [--verbose]
+  review.py suggest-reviewers --platform github [--verbose]
+
+'suggest-reviewers --platform github' runs in a checkout holding the pull
+request's base and head commits, and reads the same environment as 'post
+--platform github'. GITHUB_TOKEN also needs contents: read for the history query.
 """
 
 from __future__ import annotations
@@ -2459,6 +2464,10 @@ def gitlab_has_reviewer_suggestion(session: requests.Session, api_base: str) -> 
 
 def cmd_suggest_reviewers(args: argparse.Namespace) -> None:
     """Identify and suggest reviewers for the MR based on git history."""
+    if getattr(args, "platform", "auto") == "github":
+        _github_suggest_reviewers(args)
+        return
+
     token = os.environ.get("GITLAB_API_TOKEN")
     if not token:
         _error("GITLAB_API_TOKEN environment variable is required")
@@ -2539,6 +2548,260 @@ def cmd_suggest_reviewers(args: argparse.Namespace) -> None:
         if verbose:
             print(resp.text, file=sys.stderr)
         sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# Suggest reviewers on GitHub
+# ---------------------------------------------------------------------------
+
+# History is read for at most this many changed files: 20 queries, about 20 GraphQL points.
+_GITHUB_SUGGEST_MAX_FILES = 400
+_GITHUB_HISTORY_PER_FILE = 50
+_GITHUB_IGNORE_REVS_FILE = ".git-blame-ignore-revs"
+_GITHUB_IGNORE_REV_RE = re.compile(r"[0-9a-f]{40,64}")
+
+
+class _GitHubSuggestError(Exception):
+    """A lookup or the post failed; the suggestion is skipped with a warning."""
+
+
+def _github_git(*args: str) -> bytes:
+    try:
+        return subprocess.check_output(["git", *args], stderr=subprocess.DEVNULL)
+    except (subprocess.CalledProcessError, OSError) as e:
+        raise _GitHubSuggestError(f"git {args[0]} failed") from e
+
+
+def _github_changed_files(base_sha: str, head_sha: str) -> list[str]:
+    """Files the pull request adds or modifies, diffed from the merge base to the head.
+
+    -z keeps paths unquoted; a path that is not UTF-8 cannot be looked up and is skipped.
+    """
+    merge_base = _github_git("merge-base", base_sha, head_sha).decode("ascii", "replace").strip()
+    if not _GITHUB_SHA_RE.match(merge_base):
+        raise _GitHubSuggestError("git merge-base found no common commit")
+    out = _github_git(
+        "diff", "--name-only", "--diff-filter=d", "--no-ext-diff", "-z", merge_base, head_sha
+    )
+    files = []
+    for raw in out.split(b"\0"):
+        try:
+            path = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+        if path:
+            files.append(path)
+    return files
+
+
+def _github_ignored_revs(head_sha: str) -> set[str]:
+    """Commits listed in .git-blame-ignore-revs at the head; none when the file is absent."""
+    try:
+        out = subprocess.check_output(
+            ["git", "show", "--no-textconv", f"{head_sha}:{_GITHUB_IGNORE_REVS_FILE}"],
+            stderr=subprocess.DEVNULL,
+        )
+    except (subprocess.CalledProcessError, OSError):
+        return set()
+    revs = set()
+    for line in out.decode("utf-8", "replace").splitlines():
+        rev = line.split("#", 1)[0].strip().lower()
+        if _GITHUB_IGNORE_REV_RE.fullmatch(rev):
+            revs.add(rev)
+    return revs
+
+
+def _github_history_query(count: int) -> str:
+    """History of ``count`` paths at one commit. Paths are variables, never query text."""
+    decls = "".join(f", $p{i}: String!" for i in range(count))
+    fields = "\n".join(
+        f"        f{i}: history(first: {_GITHUB_HISTORY_PER_FILE}, path: $p{i}) "
+        "{ nodes { oid author { user { __typename login } } } }"
+        for i in range(count)
+    )
+    return (
+        "query($owner: String!, $name: String!, $oid: GitObjectID!" + decls + ") {\n"
+        "  repository(owner: $owner, name: $name) {\n"
+        "    object(oid: $oid) {\n"
+        "      ... on Commit {\n" + fields + "\n      }\n    }\n  }\n}"
+    )
+
+
+def _github_history_login(node: Any, ignored: set[str], pr_author: str) -> str | None:
+    """The login to credit for one history commit, or None when it does not count."""
+    if not isinstance(node, dict):
+        return None
+    oid = node.get("oid")
+    if isinstance(oid, str) and oid.lower() in ignored:
+        return None
+    author = node.get("author")
+    user = author.get("user") if isinstance(author, dict) else None
+    # A commit email linked to no account gives a null user.
+    if not isinstance(user, dict) or user.get("__typename") != "User":
+        return None
+    login = user.get("login")
+    # The login goes into a live @mention, so it must be a plain GitHub user login.
+    if (
+        not isinstance(login, str)
+        or login.endswith("[bot]")
+        or not _GITHUB_USER_LOGIN_RE.fullmatch(login)
+    ):
+        return None
+    if login.lower() == pr_author.lower():
+        return None
+    return login
+
+
+def _github_history_authors(
+    session: requests.Session,
+    ctx: _GitHubContext,
+    oid: str,
+    files: list[str],
+    ignored: set[str],
+    pr_author: str,
+) -> list[tuple[str, int]]:
+    """Commit counts per login over the files' history at ``oid``, highest first."""
+    counts: dict[str, int] = {}
+    logins: dict[str, str] = {}
+    for start in range(0, len(files), _FILES_PER_GRAPHQL_BATCH):
+        batch = files[start : start + _FILES_PER_GRAPHQL_BATCH]
+        variables: dict[str, Any] = {"owner": ctx.owner, "name": ctx.repo, "oid": oid}
+        variables.update((f"p{i}", path) for i, path in enumerate(batch))
+        resp = session.post(
+            ctx.graphql_url,
+            json={"query": _github_history_query(len(batch)), "variables": variables},
+        )
+        if resp.status_code != 200:
+            raise _GitHubSuggestError(f"the history query failed (HTTP {resp.status_code})")
+        payload = resp.json()
+        if not isinstance(payload, dict) or payload.get("errors"):
+            raise _GitHubSuggestError("the history query returned errors")
+        data = payload.get("data")
+        repository = data.get("repository") if isinstance(data, dict) else None
+        commit = repository.get("object") if isinstance(repository, dict) else None
+        if not isinstance(commit, dict):
+            raise _GitHubSuggestError(f"the history query found no commit {oid[:8]}")
+        for i in range(len(batch)):
+            connection = commit.get(f"f{i}")
+            nodes = connection.get("nodes") if isinstance(connection, dict) else None
+            for node in nodes if isinstance(nodes, list) else []:
+                login = _github_history_login(node, ignored, pr_author)
+                if login is None:
+                    continue
+                # Logins are case-insensitive; credit one account once.
+                key = login.lower()
+                logins.setdefault(key, login)
+                counts[key] = counts.get(key, 0) + 1
+    ranked = sorted(counts, key=lambda key: (-counts[key], key))
+    return [(logins[key], counts[key]) for key in ranked]
+
+
+def _github_reviewer_comment(reviewers: list[tuple[str, int]]) -> str:
+    """The suggestion comment; logins passed the user login check, so each @ is a mention."""
+    lines = [
+        "## Suggested Reviewers",
+        "",
+        "The following users have recently contributed to the files modified in this "
+        "pull request and may be well-suited to review these changes:",
+        "",
+        "| Reviewer | Commits on modified files |",
+        "|----------|--------------------------|",
+    ]
+    lines.extend(f"| @{login} | {count} |" for login, count in reviewers)
+    mentions = " ".join(f"@{login}" for login, _ in reviewers)
+    lines.extend(
+        [
+            "",
+            f"{mentions}, please consider reviewing this pull request.",
+            "",
+            SUGGESTED_REVIEWERS_MARKER,
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _github_has_reviewer_suggestion(session: requests.Session, ctx: _GitHubContext) -> bool:
+    """Whether one of our accounts already posted a comment ending with the marker.
+
+    Reads every page: a partial list could miss the comment and post a second one.
+    """
+    url = f"{ctx.repo_url}/issues/{ctx.number}/comments"
+    for comment in _github_paginated_get(session, ctx, url, strict=True):
+        if not isinstance(comment, dict):
+            continue
+        body = comment.get("body")
+        if (
+            isinstance(body, str)
+            and body.strip().endswith(SUGGESTED_REVIEWERS_MARKER)
+            and _github_comment_is_ours(comment.get("user"))
+        ):
+            return True
+    return False
+
+
+def _github_post_reviewer_suggestion(
+    session: requests.Session, ctx: _GitHubContext, base_sha: str, pr_author: str
+) -> None:
+    if _github_has_reviewer_suggestion(session, ctx):
+        _success("Reviewers already suggested, skipping")
+        return
+
+    _step("Getting modified files...")
+    files = _github_changed_files(base_sha, ctx.head_sha)
+    if not files:
+        _step("No modified files found, skipping reviewer suggestion")
+        return
+    if len(files) > _GITHUB_SUGGEST_MAX_FILES:
+        _step(
+            f"Found {len(files)} modified files; reading the history of the first "
+            f"{_GITHUB_SUGGEST_MAX_FILES}"
+        )
+        files = files[:_GITHUB_SUGGEST_MAX_FILES]
+    else:
+        _step(f"Found {len(files)} modified file(s)")
+
+    ignored = _github_ignored_revs(ctx.head_sha)
+    if ignored:
+        _step(f"Ignoring {len(ignored)} commit(s) listed in {_GITHUB_IGNORE_REVS_FILE}")
+
+    # History at the base, as GitLab reads the default branch: the pull request's own
+    # commits do not count.
+    _step("Querying git history for file authors...")
+    reviewers = _github_history_authors(session, ctx, base_sha, files, ignored, pr_author)
+    reviewers = reviewers[:_MAX_SUGGESTED_REVIEWERS]
+    if not reviewers:
+        _step("No suitable reviewers found, skipping reviewer suggestion")
+        return
+
+    _step(f"Suggesting {len(reviewers)} reviewer(s): {', '.join(r for r, _ in reviewers)}")
+    resp = session.post(
+        f"{ctx.repo_url}/issues/{ctx.number}/comments",
+        json={"body": _github_reviewer_comment(reviewers)},
+    )
+    if not 200 <= resp.status_code < 300:
+        raise _GitHubSuggestError(f"posting the comment failed (HTTP {resp.status_code})")
+    _success(f"Reviewer suggestion posted to pull request #{ctx.number}")
+
+
+def _github_suggest_reviewers(args: argparse.Namespace) -> None:
+    """Suggest reviewers on the pull request from the history of the files it changes.
+
+    Exits 1 only on an unusable environment. Every other failure warns and exits 0:
+    a missing suggestion must never fail the review.
+    """
+    ctx = _github_load_context()
+    if ctx.base_sha is None or ctx.author_login is None:
+        _error("The pull_request event payload needs base.sha and user.login")
+        sys.exit(1)
+    session = _github_session(ctx)
+    try:
+        _github_post_reviewer_suggestion(session, ctx, ctx.base_sha, ctx.author_login)
+    except _GitHubSuggestError as e:
+        _github_annotation("warning", f"Reviewer suggestion skipped: {e}")
+    except (requests.exceptions.RequestException, ValueError) as e:
+        _github_annotation(
+            "warning", f"Reviewer suggestion skipped: GitHub API error ({type(e).__name__}): {e}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -2687,6 +2950,15 @@ def main() -> None:
 
     suggest_parser = subparsers.add_parser(
         "suggest-reviewers", help="Suggest reviewers based on git history"
+    )
+    suggest_parser.add_argument(
+        "--platform",
+        choices=["auto", "github"],
+        default="auto",
+        help=(
+            "auto suggests on the GitLab merge request; github comments on the pull request "
+            "named by the Actions event (never auto-detected)"
+        ),
     )
     suggest_parser.add_argument("--verbose", action="store_true", help="Verbose output")
     suggest_parser.set_defaults(func=cmd_suggest_reviewers)
