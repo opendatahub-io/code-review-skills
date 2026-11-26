@@ -262,8 +262,12 @@ class ActionStaticTests(PanelTestCase):
                 self.assertNotEqual(proc.returncode, 0)
                 self.assertEqual(proc.stdout, "")
 
-    def test_the_review_step_uses_the_podman_family(self):
-        self.assertIn('default_image "$harness" podman', script_function("cmd_review"))
+    def test_the_review_step_uses_the_family_of_its_backend(self):
+        self.assertIn('default_image "$harness" "$backend"', script_function("cmd_review"))
+
+    def test_backend_defaults_to_openshell(self):
+        self.assertEqual(input_default("backend"), "openshell")
+        self.assertIn('backend="${AI_REVIEW_BACKEND:-openshell}"', script_function("cmd_review"))
 
     def test_no_node_or_claude_invocation(self):
         action = ACTION_YML.read_text(encoding="utf-8")
@@ -311,8 +315,8 @@ class ActionStaticTests(PanelTestCase):
         self.assertIn(f'HEAD_DIR="${{GITHUB_WORKSPACE:-}}/{path}"', text)
         self.assertIn('AI_DIR="${GITHUB_WORKSPACE:-}/.ai-review"', text)
         cleanup = script_function("cmd_cleanup")
-        self.assertIn('"$AI_DIR" "$HEAD_DIR"', cleanup)
-        self.assertIn('rm -rf -- "$dir"', cleanup)
+        self.assertIn('rm -rf -- "$AI_DIR"', cleanup)
+        self.assertIn('rm -rf -- "$HEAD_DIR"', cleanup)
 
     def test_checkout_is_not_under_the_mounted_workdir(self):
         m = re.search(r"(?m)^\s*path:\s*(\S+)\s*$", find_step("Check out the pull request head"))
@@ -338,15 +342,23 @@ class ActionStaticTests(PanelTestCase):
             self.assertNotIn("checkout changed", (REPO_ROOT / doc).read_text(encoding="utf-8"))
 
     def test_agent_runs_under_an_interrupting_timeout_with_a_margin(self):
-        review = script_function("cmd_review")
-        self.assertIn('timeout -s INT --kill-after=60s "${minutes}m"', review)
-        self.assertIn('--timeout "$(( (minutes + 5) * 60 ))"', review)
+        for function in ("run_podman_agent", "run_openshell_agent"):
+            with self.subTest(function):
+                self.assertIn(
+                    'timeout -s INT --kill-after=60s "${minutes}m"', script_function(function)
+                )
+        self.assertIn('--timeout "$(( (minutes + 5) * 60 ))"', script_function("cmd_review"))
 
     def test_image_is_pulled_in_its_own_bounded_step(self):
-        review = script_function("cmd_review")
-        pull = review.index('timeout 15m podman pull "$image"')
-        run_agent = review.index("timeout -s INT")
-        self.assertLess(pull, run_agent)
+        podman = script_function("run_podman_agent")
+        self.assertLess(
+            podman.index('timeout 15m podman pull "$image"'), podman.index("timeout -s INT")
+        )
+        openshell = script_function("run_openshell_agent")
+        self.assertLess(
+            openshell.index('timeout 15m docker pull --quiet "$openshell_image"'),
+            openshell.index("timeout -s INT --kill-after=60s"),
+        )
 
     def test_effort_comes_from_one_constant(self):
         script = SCRIPT.read_text(encoding="utf-8")
@@ -380,6 +392,13 @@ class ActionStaticTests(PanelTestCase):
             ("Review the pull request", "AI_REVIEW_IMAGE", "inputs.image"),
             ("Review the pull request", "AI_REVIEW_INSTRUCTIONS", "inputs.review_instructions"),
             ("Prepare the diff", "AI_REVIEW_INSTRUCTIONS", "inputs.review_instructions"),
+            ("Review the pull request", "AI_REVIEW_BACKEND", "inputs.backend"),
+            ("Remove the checkout", "AI_REVIEW_BACKEND", "inputs.backend"),
+            (
+                "Remove the checkout",
+                "AI_REVIEW_AGENTIC_CI_VERSION",
+                "inputs.agentic_ci_version",
+            ),
         )
         for step, var, expr in wiring:
             with self.subTest(var=var, step=step):
@@ -433,6 +452,60 @@ sys.exit(int(os.environ.get("FAKE_PODMAN_STATUS", "0")))
 """
 
 
+# Stands in for docker, so no test touches a real container: appends each call's argv and
+# environment to FAKE_DOCKER_LOG as one JSON line.
+# FAKE_DOCKER_CONTAINERS and FAKE_DOCKER_VOLUMES map names to their ai-review.workdir label, for
+# `ps` and `volume ls` with a label filter. A `run` of agentic-ci writes the review output when
+# FAKE_WRITE is 1, and a `run` of chown makes the workdir removable again.
+FAKE_DOCKER = """
+import json
+import os
+import sys
+
+args = sys.argv[1:]
+log = os.environ.get("FAKE_DOCKER_LOG")
+if log:
+    with open(log, "a", encoding="utf-8") as f:
+        f.write(json.dumps({"argv": args, "env": dict(os.environ)}) + "\\n")
+
+
+def status(name):
+    sys.exit(int(os.environ.get(name, "0")))
+
+
+def labelled(var):
+    items = json.loads(os.environ.get(var, "{}"))
+    wanted = args[args.index("--filter") + 1]
+    print("\\n".join(k for k, v in items.items() if wanted == f"label=ai-review.workdir={v}"))
+
+
+if args[:1] == ["ps"]:
+    labelled("FAKE_DOCKER_CONTAINERS")
+elif args[:2] == ["volume", "ls"]:
+    labelled("FAKE_DOCKER_VOLUMES")
+elif args[:2] == ["volume", "rm"] or args[:1] == ["rm"]:
+    status("FAKE_DOCKER_RM_STATUS")
+elif args[:2] == ["image", "inspect"]:
+    sys.exit(0 if os.environ.get("FAKE_DOCKER_IMAGE_PRESENT") == "1" else 1)
+elif args[:1] == ["pull"]:
+    status("FAKE_DOCKER_PULL_STATUS")
+elif args[:1] == ["run"] and "--entrypoint" in args:
+    for root, dirs, _files in os.walk(args[-1]):
+        for d in dirs:
+            os.chmod(os.path.join(root, d), 0o755)
+    status("FAKE_DOCKER_CHOWN_STATUS")
+elif args[:1] == ["run"] and "agentic-ci" in args:
+    agent = args[args.index("agentic-ci") :]
+    if os.environ.get("FAKE_WRITE") == "1":
+        workdir = agent[agent.index("--workdir") + 1]
+        with open(os.path.join(workdir, "out", "ai-review-output.json"), "w") as f:
+            f.write("{}")
+    status("FAKE_DOCKER_RUN_STATUS")
+elif args[:1] == ["run"]:
+    status("FAKE_DOCKER_PREPULL_STATUS")
+"""
+
+
 class ScriptTestCase(PanelTestCase):
     def setUp(self):
         self.tmp = self.make_tmpdir()
@@ -447,8 +520,11 @@ class ScriptTestCase(PanelTestCase):
         self.out = os.path.join(self.out_dir, "ai-review-output.json")
         self.bin = os.path.join(self.tmp, "bin")
         self.podman_log = os.path.join(self.tmp, "podman.log")
-        # Always shadow podman: the script pulls the image, and a real pull would hit the network.
+        self.docker_log = os.path.join(self.tmp, "docker.jsonl")
+        # Always shadow podman and docker: the script pulls images, and a real pull would hit the
+        # network.
         write_executable(Path(self.bin, "podman"), FAKE_PODMAN)
+        write_executable(Path(self.bin, "docker"), FAKE_DOCKER)
 
     def env_path(self) -> str:
         return f"{self.bin}{os.pathsep}{os.environ['PATH']}"
@@ -459,6 +535,7 @@ class ScriptTestCase(PanelTestCase):
             GITHUB_WORKSPACE=self.workspace,
             PATH=self.env_path(),
             FAKE_PODMAN_LOG=self.podman_log,
+            FAKE_DOCKER_LOG=self.docker_log,
             RUNNER_TEMP=self.runner_temp,
         )
         full = script_env(**{**defaults, **env})
@@ -474,6 +551,15 @@ class ScriptTestCase(PanelTestCase):
         if not os.path.exists(self.podman_log):
             return []
         return Path(self.podman_log).read_text(encoding="utf-8").splitlines()
+
+    def docker_records(self) -> list[dict]:
+        if not os.path.exists(self.docker_log):
+            return []
+        lines = Path(self.docker_log).read_text(encoding="utf-8").splitlines()
+        return [json.loads(line) for line in lines]
+
+    def docker_calls(self) -> list[list[str]]:
+        return [record["argv"] for record in self.docker_records()]
 
     def move_repo_into_place(self, repo: str) -> str:
         """Move a throwaway repo to where the action's checkout step puts it."""
@@ -859,6 +945,8 @@ class ReviewTestCase(ScriptTestCase):
             OPENAI_API_KEY="sk-test",
             AI_REVIEW_IMAGE=self.IMAGE,
             AI_REVIEW_AGENTIC_CI_VERSION=self.VERSION,
+            # These tests pin the podman argv; tests.test_github_action_backends covers openshell.
+            AI_REVIEW_BACKEND="podman",
             GITHUB_TOKEN="ghs_secret",
             GH_TOKEN="gh_secret",
             ACTIONS_ID_TOKEN_REQUEST_TOKEN="oidc-token",

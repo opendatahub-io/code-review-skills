@@ -17,13 +17,24 @@ inputs:
     required: false
     default: ''
   agentic_ci_version:
-    description: Version of the agentic-ci package that runs the agent in a container. The default is the one the action was checked against.
+    description: >-
+      Version of agentic-ci that runs the agent. With the openshell backend it is
+      the tag of the quay.io/aipcc/agentic-ci/openshell image, whose bundled
+      agentic-ci runs. The default is the one the action was checked against.
     required: false
     default: '0.5.15'
+  backend:
+    description: >-
+      Where agentic-ci runs the agent. 'openshell' runs the openshell image as a
+      privileged docker container, which runs the agent in an OpenShell sandbox.
+      'podman' runs agentic-ci on the runner, which starts a Podman container.
+    required: false
+    default: 'openshell'
   image:
     description: >-
-      Container image the agent runs in. Empty picks the agentic-ci runner image
-      that matches the harness. The default tag floats, so pin a digest to freeze
+      Container image the agent runs in. Empty picks the agentic-ci image that
+      matches the harness and the backend: the sandbox image for openshell, the
+      runner image for podman. The default tag floats, so pin a digest to freeze
       it.
     required: false
     default: ''
@@ -116,6 +127,7 @@ runs:
         AI_REVIEW_AGENTIC_CI_VERSION: ${{ inputs.agentic_ci_version }}
         AI_REVIEW_IMAGE: ${{ inputs.image }}
         AI_REVIEW_MODE: ${{ inputs.mode }}
+        AI_REVIEW_BACKEND: ${{ inputs.backend }}
         # Only read to warn that deep mode ignores it.
         AI_REVIEW_INSTRUCTIONS: ${{ inputs.review_instructions }}
         # The agent never holds a token that can write to the repository.
@@ -141,3 +153,7 @@ runs:
       if: always()
       shell: bash
       run: '"$GITHUB_ACTION_PATH/action/review-pr.sh" cleanup'
+      env:
+        AI_REVIEW_BACKEND: ${{ inputs.backend }}
+        # Names the openshell image that gives root's leftovers back to the runner user.
+        AI_REVIEW_AGENTIC_CI_VERSION: ${{ inputs.agentic_ci_version }}
