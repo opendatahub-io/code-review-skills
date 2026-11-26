@@ -898,6 +898,12 @@ run_podman_agent() {
         uvx --from "agentic-ci==$version" agentic-ci "$@" || AGENT_STATUS=$?
 }
 
+# review.py runs in steps that hold a token, so its dependencies come from the lock next to it,
+# never from a fresh resolve: uv fails on a stale lock with UV_LOCKED=1, but ignores a missing one.
+require_review_lock() {
+    [ ! -L "$1.lock" ] && [ -f "$1.lock" ] || error "$1.lock is missing or not a regular file"
+}
+
 cmd_post() {
     require_workspace
     refuse_redirected_workdirs
@@ -905,6 +911,7 @@ cmd_post() {
     [ -n "${RUNNER_TEMP:-}" ] || error "RUNNER_TEMP is not set"
     local review_py="$GITHUB_ACTION_PATH/$REVIEW_PY_REL"
     [ -x "$review_py" ] || error "$review_py is missing or not executable"
+    require_review_lock "$review_py"
     require_mode
 
     # review.py would take github-actions[bot] for its own account, while the token posts as
@@ -966,13 +973,13 @@ cmd_post() {
 
     # uv must ignore config and .python-version files that arrive with the PR.
     local status=0
-    UV_NO_CONFIG=1 UV_PYTHON="$(command -v python3)" \
+    UV_NO_CONFIG=1 UV_LOCKED=1 UV_PYTHON="$(command -v python3)" \
         "$review_py" "${args[@]}" "$copy_dir/ai-review-output.json" || status=$?
     [ "$status" -eq 0 ] || exit "$status"
 
     # Suggestions only follow a review that posted, and never decide the step's status.
     if [ -n "$suggest" ] && [ ! -L "$posted_flag" ] && [ -f "$posted_flag" ]; then
-        UV_NO_CONFIG=1 UV_PYTHON="$(command -v python3)" \
+        UV_NO_CONFIG=1 UV_LOCKED=1 UV_PYTHON="$(command -v python3)" \
             "$review_py" suggest-reviewers --platform github || status=$?
         [ "$status" -eq 0 ] || warning "Could not suggest reviewers (review.py exit $status)"
     fi
@@ -988,6 +995,7 @@ cmd_standdown() {
     [ -n "${GITHUB_ACTION_PATH:-}" ] || error "GITHUB_ACTION_PATH is not set"
     local review_py="$GITHUB_ACTION_PATH/$REVIEW_PY_REL"
     [ -x "$review_py" ] || error "$review_py is missing or not executable"
+    require_review_lock "$review_py"
     require_mode
 
     local args=(stand-down --platform github --mode "$REVIEW_MODE")
@@ -1001,7 +1009,7 @@ cmd_standdown() {
     harden_git
     local status=0
     # uv must ignore config and .python-version files, here or above this directory.
-    UV_NO_CONFIG=1 UV_PYTHON="$(command -v python3)" "$review_py" "${args[@]}" || status=$?
+    UV_NO_CONFIG=1 UV_LOCKED=1 UV_PYTHON="$(command -v python3)" "$review_py" "${args[@]}" || status=$?
     case "$status" in
         0)
             echo "stand_down=false" >>"${GITHUB_OUTPUT:-/dev/null}"

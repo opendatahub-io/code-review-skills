@@ -13,11 +13,10 @@ from unittest.mock import patch
 
 from tests.helpers import make_repo, write
 from tests.test_github_action import (
-    REVIEW_PY_REL,
     ScriptTestCase,
     evaluate_expression,
     step_env_value,
-    write_executable,
+    write_fake_review_py,
 )
 from tests.test_github_review import review
 
@@ -60,7 +59,7 @@ class PostExtrasTestCase(ScriptTestCase):
         self.repo = self.move_repo_into_place(repo)
         self.action_path = os.path.join(self.tmp, "action")
         self.log = os.path.join(self.tmp, "review-py.jsonl")
-        write_executable(Path(self.action_path, REVIEW_PY_REL), FAKE_REVIEW_PY)
+        write_fake_review_py(self.action_path, FAKE_REVIEW_PY)
         write(self.out_dir, "ai-review-output.json", '{"summary": "ok"}')
 
     def post(self, **env: str):

@@ -22,6 +22,7 @@ from tests.test_github_action import (
     ScriptTestCase,
     script_constant,
     write_executable,
+    write_fake_review_py,
 )
 from tests.test_github_review import review
 
@@ -119,7 +120,7 @@ class FakeReviewPyMixin:
     def install_fake_review_py(self) -> None:
         self.action_path = os.path.join(self.tmp, "action")
         self.log = os.path.join(self.tmp, "review-py.jsonl")
-        write_executable(Path(self.action_path, REVIEW_PY_REL), FAKE_REVIEW_PY)
+        write_fake_review_py(self.action_path, FAKE_REVIEW_PY)
 
     def calls(self) -> list[dict]:
         return read_log(self.log)
@@ -238,6 +239,13 @@ class StanddownTests(FakeReviewPyMixin, ScriptTestCase):
         self.assertIn("not executable", proc.stdout)
         proc = self.standdown(GITHUB_ACTION_PATH="")
         self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertEqual(self.calls(), [])
+
+    def test_a_missing_lock_fails_before_review_py(self):
+        Path(self.action_path, REVIEW_PY_REL + ".lock").unlink()
+        proc = self.standdown()
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn(".lock is missing", proc.stdout)
         self.assertEqual(self.calls(), [])
 
     def test_a_symlinked_workdir_is_refused(self):

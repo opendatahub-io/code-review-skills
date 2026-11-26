@@ -12,10 +12,12 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from tests.helpers import (
+    HAVE_UV,
     REPO_ROOT,
     PanelTestCase,
     commit,
@@ -612,6 +614,10 @@ class ActionStaticTests(PanelTestCase):
         block = find_step("Set up uv")
         self.assertRegex(block, r"(?m)^\s*enable-cache:\s*false\s*$")
 
+    def test_setup_uv_installs_a_pinned_version(self):
+        block = find_step("Set up uv")
+        self.assertRegex(block, r'(?m)^\s*version:\s*"\d+\.\d+\.\d+"\s*$')
+
     def test_setup_uv_reads_its_version_from_the_action_not_the_workspace(self):
         block = find_step("Set up uv")
         self.assertRegex(block, r"(?m)^\s*working-directory:\s*\$\{\{ github\.action_path \}\}\s*$")
@@ -779,6 +785,13 @@ def write_executable(path: Path, body: str) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(f"#!{sys.executable}\n{body}", encoding="utf-8")
     path.chmod(0o755)
+    return path
+
+
+def write_fake_review_py(action_path: str, body: str) -> Path:
+    """Put a stand-in review.py, with the lock the action requires next to it, in action_path."""
+    path = write_executable(Path(action_path, REVIEW_PY_REL), body)
+    path.with_name(path.name + ".lock").write_text("", encoding="utf-8")
     return path
 
 
@@ -1786,7 +1799,7 @@ class PostTests(ScriptTestCase):
         self.repo = self.move_repo_into_place(repo)
         self.action_path = os.path.join(self.tmp, "action")
         self.log = os.path.join(self.tmp, "review-py.json")
-        write_executable(Path(self.action_path, REVIEW_PY_REL), FAKE_REVIEW_PY)
+        write_fake_review_py(self.action_path, FAKE_REVIEW_PY)
         write(self.out_dir, "ai-review-output.json", '{"summary": "ok"}')
 
     def post(self, **env: str):
@@ -1889,7 +1902,7 @@ class PostTests(ScriptTestCase):
         self.assert_refused(self.post(RUNNER_TEMP=""))
 
     def test_review_py_failure_fails_the_step(self):
-        write_executable(Path(self.action_path, REVIEW_PY_REL), FAKE_REVIEW_PY + "\nsys.exit(1)\n")
+        write_fake_review_py(self.action_path, FAKE_REVIEW_PY + "\nsys.exit(1)\n")
         proc = self.post()
         self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
         self.assertTrue(os.path.exists(self.log))
@@ -1897,6 +1910,39 @@ class PostTests(ScriptTestCase):
     def test_non_executable_poster_is_refused(self):
         Path(self.action_path, REVIEW_PY_REL).chmod(0o644)
         self.assert_refused(self.post())
+
+    def test_a_missing_or_linked_lock_is_refused(self):
+        lock = Path(self.action_path, REVIEW_PY_REL + ".lock")
+        lock.unlink()
+        self.assert_refused(self.post())
+        lock.symlink_to(Path(self.action_path, REVIEW_PY_REL))
+        self.assert_refused(self.post())
+
+
+class ReviewPyLockTests(unittest.TestCase):
+    """review.py resolves its dependencies from its lock in steps that hold a token."""
+
+    def test_every_review_py_call_requires_the_lock(self):
+        calls = [
+            line
+            for line in SCRIPT.read_text(encoding="utf-8").splitlines()
+            if "UV_PYTHON=" in line and not line.lstrip().startswith("#")
+        ]
+        self.assertEqual(len(calls), 3, calls)
+        for line in calls:
+            with self.subTest(line):
+                self.assertIn("UV_NO_CONFIG=1 UV_LOCKED=1", line)
+
+    @unittest.skipUnless(HAVE_UV, "uv is not installed")
+    def test_the_lock_matches_review_py(self):
+        proc = subprocess.run(
+            ["uv", "lock", "--script", str(REPO_ROOT / REVIEW_PY_REL), "--check", "--offline"],
+            env={**os.environ, "UV_NO_CONFIG": "1"},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
 
 
 class WorkdirGuardTests(ScriptTestCase):
