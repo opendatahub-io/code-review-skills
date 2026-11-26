@@ -48,16 +48,34 @@ FORBIDDEN_CONFIG_PREFIXES = (
 SECRET = "ghs_SECRETSECRETSECRET"
 
 
+SAFE_DIRECTORY = (
+    "First run git config --global --add safe.directory /workspace/repo, because the "
+    "repository can belong to another user."
+)
+
+
 def deep_prompt(harness: str, base: str, head: str) -> str:
     task = (
-        f"the committed changes in /workspace/repo from base {base} to head {head}. Run its "
-        f"triage from inside /workspace/repo with --base {base} --head {head}, pass --gitlab-json "
-        "/workspace/out/ai-review-output.json to its final report command, and do not post "
-        "anything."
+        f"the committed changes in /workspace/repo from base {base} to head {head}. "
+        f"{SAFE_DIRECTORY} Run its triage from inside /workspace/repo with --base {base} "
+        f"--head {head}, pass --gitlab-json /workspace/out/ai-review-output.json to its final "
+        "report command, and do not post anything."
     )
     if harness == "claude-code":
         return f"/code-review-skills:code-review-panel Review {task}"
-    return f"Use the /code-review-panel skill to review {task}"
+    return f"Invoke the /code-review-skills:code-review-panel skill to review {task}"
+
+
+# Stands in for git: reports FAKE_GIT_VERSION and hands every other call to the real git.
+FAKE_GIT = """
+import os
+import sys
+
+if sys.argv[1:] == ["--version"]:
+    print(os.environ["FAKE_GIT_VERSION"])
+    sys.exit(0)
+os.execv(os.environ["REAL_GIT"], ["git"] + sys.argv[1:])
+"""
 
 
 class ModeStaticTests(PanelTestCase):
@@ -129,19 +147,42 @@ class DeepReviewTests(ReviewTestCase):
         # Stands in for the .git prepare builds. The review step only tests that it exists.
         os.makedirs(os.path.join(self.repo_dir, ".git"))
 
-    def deep_argv(self, harness: str = "claude-code", minutes: int = 75) -> list[str]:
+    def deep_argv(self, harness: str = "codex", minutes: int = 75) -> list[str]:
         prompt = deep_prompt(harness, self.BASE, self.HEAD)
         return self.expected_argv(harness=harness, minutes=minutes, prompt=prompt)
 
     def test_deep_argv_for_claude_code(self):
-        proc = self.review(AI_REVIEW_MODE="deep")
+        proc = self.review(AI_REVIEW_MODE="deep", AI_REVIEW_HARNESS="claude-code")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertEqual(self.record()["argv"], self.deep_argv())
+        self.assertEqual(self.record()["argv"], self.deep_argv(harness="claude-code"))
 
     def test_deep_argv_for_codex(self):
         proc = self.review(AI_REVIEW_MODE="deep", AI_REVIEW_HARNESS="codex", OPENAI_API_KEY="k")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual(self.record()["argv"], self.deep_argv(harness="codex"))
+
+    def test_an_empty_harness_runs_the_codex_panel(self):
+        for harness in ({}, {"AI_REVIEW_HARNESS": ""}):
+            with self.subTest(harness=harness):
+                proc = self.review(AI_REVIEW_MODE="deep", **harness)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual(self.record()["argv"], self.deep_argv(harness="codex"))
+
+    def test_the_deep_prompt_makes_git_accept_the_mounted_repo(self):
+        # On a root runner the agent's user does not own the mount, and git refuses it.
+        for harness in ("claude-code", "codex"):
+            with self.subTest(harness):
+                self.review(AI_REVIEW_MODE="deep", AI_REVIEW_HARNESS=harness)
+                argv = self.record()["argv"]
+                prompt = argv[argv.index("--effort") + 2]
+                self.assertIn(SAFE_DIRECTORY, prompt)
+                self.assertLess(prompt.index(SAFE_DIRECTORY), prompt.index("triage"))
+
+    def test_the_standard_prompt_does_not_touch_git_config(self):
+        for harness in ("claude-code", "codex"):
+            with self.subTest(harness):
+                self.review(AI_REVIEW_HARNESS=harness)
+                self.assertNotIn("safe.directory", " ".join(self.record()["argv"]))
 
     def test_the_deep_prompt_is_one_line(self):
         for harness in ("claude-code", "codex"):
@@ -153,20 +194,27 @@ class DeepReviewTests(ReviewTestCase):
                 self.assertIn("--gitlab-json /workspace/out/ai-review-output.json", prompt)
 
     def test_deep_mode_ignores_the_instructions_with_a_warning(self):
+        proc = self.review(AI_REVIEW_MODE="deep", AI_REVIEW_INSTRUCTIONS="Focus on tests")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(self.record()["argv"], self.deep_argv())
+        self.assertNotIn("instructions", " ".join(self.record()["argv"]))
+        self.assertIn("::warning::review_instructions is ignored in deep mode", proc.stdout)
+
+    def test_deep_mode_without_instructions_does_not_warn(self):
+        proc = self.review(AI_REVIEW_MODE="deep", AI_REVIEW_INSTRUCTIONS="")
+        self.assertNotIn("::warning::", proc.stdout)
+
+    def test_deep_mode_ignores_a_stray_instructions_file(self):
+        # The warning follows the input, and the file never reaches the deep prompt.
         write(self.ai_dir, "instructions.md", "Focus on tests\n")
         proc = self.review(AI_REVIEW_MODE="deep")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual(self.record()["argv"], self.deep_argv())
-        self.assertNotIn("instructions.md", " ".join(self.record()["argv"]))
-        self.assertIn("::warning::review_instructions is ignored in deep mode", proc.stdout)
-
-    def test_deep_mode_without_instructions_does_not_warn(self):
-        proc = self.review(AI_REVIEW_MODE="deep")
         self.assertNotIn("::warning::", proc.stdout)
 
     def test_standard_mode_with_instructions_does_not_warn(self):
         write(self.ai_dir, "instructions.md", "Focus on tests\n")
-        proc = self.review(AI_REVIEW_MODE="standard")
+        proc = self.review(AI_REVIEW_MODE="standard", AI_REVIEW_INSTRUCTIONS="Focus on tests\n")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual(self.record()["argv"], self.expected_argv(instructions=True))
         self.assertNotIn("::warning::", proc.stdout)
@@ -224,7 +272,7 @@ class DeepReviewTests(ReviewTestCase):
     def test_the_agent_holds_no_write_token_in_deep_mode(self):
         self.review(AI_REVIEW_MODE="deep")
         env = self.record()["env"]
-        self.assertEqual(env["ANTHROPIC_API_KEY"], "sk-test")
+        self.assertEqual(env["OPENAI_API_KEY"], "sk-test")
         for var in (
             "GITHUB_TOKEN",
             "GH_TOKEN",
@@ -387,6 +435,60 @@ class ContainerRepoTests(PrepareTestCase):
                 _repo, _base, head = self.prepared(AI_REVIEW_MODE=mode)
                 self.assertEqual(self.container_git("rev-parse", "HEAD"), head)
                 self.assertLessEqual(self.config_keys(), CONFIG_ALLOW_LIST)
+
+    def test_deep_mode_writes_no_instructions_into_the_mount(self):
+        repo, base, head = self.make_pr()
+        write(self.ai_dir, "instructions.md", "stale")
+        proc = self.prepare(repo, base, head, AI_REVIEW_MODE="deep", AI_REVIEW_INSTRUCTIONS="x")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertFalse(Path(self.ai_dir, "instructions.md").exists())
+        self.assertNotIn("::warning::", proc.stdout)
+
+    def test_standard_mode_still_writes_the_instructions(self):
+        repo, base, head = self.make_pr()
+        for mode in ("standard", ""):
+            with self.subTest(mode=mode):
+                proc = self.prepare(
+                    repo, base, head, AI_REVIEW_MODE=mode, AI_REVIEW_INSTRUCTIONS="x"
+                )
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual(
+                    Path(self.ai_dir, "instructions.md").read_text(encoding="utf-8"), "x"
+                )
+
+    def fake_git(self, version: str) -> dict[str, str]:
+        write_executable(Path(self.bin, "git"), FAKE_GIT)
+        return dict(FAKE_GIT_VERSION=version, REAL_GIT=shutil.which("git"))
+
+    def test_an_old_git_fails_before_touching_the_workdir(self):
+        repo, base, head = self.make_pr()
+        for version in ("git version 2.28.1", "git version 1.99.0", "git version 2.9.5"):
+            with self.subTest(version):
+                proc = self.prepare(repo, base, head, **self.fake_git(version))
+                self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+                self.assertIn("::error::git 2.29 or later is required", proc.stdout)
+                self.assertIn(version, proc.stdout)
+                self.assertFalse(Path(self.ai_dir, "pr.diff").exists())
+
+    def test_a_git_that_is_new_enough_proceeds(self):
+        for version in (
+            "git version 2.29.0",
+            "git version 2.39.3 (Apple Git-146)",
+            "git version 2.043.0",
+            "git version 3.0.0",
+        ):
+            with self.subTest(version):
+                shutil.rmtree(self.workspace, ignore_errors=True)
+                repo, base, head = self.make_pr()
+                proc = self.prepare(repo, base, head, **self.fake_git(version))
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertTrue(Path(self.ai_dir, "pr.diff").exists())
+
+    def test_an_unreadable_git_version_fails(self):
+        repo, base, head = self.make_pr()
+        proc = self.prepare(repo, base, head, **self.fake_git("something else"))
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("::error::Could not read the git version", proc.stdout)
 
     def test_an_invalid_mode_fails_before_touching_the_workdir(self):
         repo, base, head = self.make_pr()

@@ -9,6 +9,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -97,6 +98,22 @@ def script_constant(name: str) -> str:
     m = re.search(rf"(?m)^{name}=(\S+)$", SCRIPT.read_text(encoding="utf-8"))
     assert m, f"constant {name} not found in review-pr.sh"
     return m.group(1)
+
+
+def run_script_function(name: str, *args: str) -> subprocess.CompletedProcess:
+    """Run one function of review-pr.sh with the script's constants, but not its main."""
+    constants = "\n".join(
+        line
+        for line in SCRIPT.read_text(encoding="utf-8").splitlines()
+        if re.match(r"^[A-Z_]+=", line)
+    )
+    source = "\n".join([constants, script_function("error"), script_function(name)])
+    return subprocess.run(
+        ["bash", "-c", f'{source}\n{name} "$@"', "bash", *args],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
 
 
 def without_comments(text: str) -> str:
@@ -206,16 +223,47 @@ class ActionStaticTests(PanelTestCase):
         )
         self.assertIn(f"`{VERIFIED_AGENTIC_CI_VERSION}`", row)
 
-    def test_an_empty_image_picks_the_harness_runner(self):
-        self.assertEqual(input_default("harness"), "claude-code")
-        self.assertEqual(input_default("image"), "")
+    def test_codex_is_the_default_harness(self):
+        self.assertEqual(input_default("harness"), "codex")
         script = SCRIPT.read_text(encoding="utf-8")
+        self.assertEqual(len(re.findall(r"AI_REVIEW_HARNESS:-", script)), 3)
+        self.assertEqual(len(re.findall(r"AI_REVIEW_HARNESS:-codex\}", script)), 3)
+
+    def test_the_action_description_names_no_harness_vendor(self):
+        text = ACTION_YML.read_text(encoding="utf-8")
+        description = text.split("\ndescription:", 1)[1].split("\nauthor:", 1)[0]
+        self.assertNotRegex(description, r"(?i)claude|anthropic")
+
+    def test_image_constants_name_both_families(self):
+        self.assertEqual(input_default("image"), "")
         for harness in ("claude", "codex"):
-            m = re.search(rf'(?m)^{harness.upper()}_RUNNER_IMAGE="(\S+)"$', script)
-            self.assertTrue(m, f"{harness}_RUNNER_IMAGE not found in review-pr.sh")
-            self.assertTrue(
-                m.group(1).startswith(f"quay.io/aipcc/agentic-ci/{harness}-runner:"), m.group(1)
-            )
+            for family in ("runner", "sandbox"):
+                with self.subTest(harness=harness, family=family):
+                    self.assertEqual(
+                        script_constant(f"{harness.upper()}_{family.upper()}_IMAGE"),
+                        f'"quay.io/aipcc/agentic-ci/{harness}-{family}:latest"',
+                    )
+
+    def test_default_image_picks_the_family_of_the_backend(self):
+        cases = {
+            ("codex", "podman"): "quay.io/aipcc/agentic-ci/codex-runner:latest",
+            ("claude-code", "podman"): "quay.io/aipcc/agentic-ci/claude-runner:latest",
+            ("codex", "openshell"): "quay.io/aipcc/agentic-ci/codex-sandbox:latest",
+            ("claude-code", "openshell"): "quay.io/aipcc/agentic-ci/claude-sandbox:latest",
+        }
+        for (harness, backend), image in cases.items():
+            with self.subTest(harness=harness, backend=backend):
+                proc = run_script_function("default_image", harness, backend)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual(proc.stdout, image + "\n")
+        for args in (("opencode", "podman"), ("codex", "docker"), ("", "")):
+            with self.subTest(args=args):
+                proc = run_script_function("default_image", *args)
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertEqual(proc.stdout, "")
+
+    def test_the_review_step_uses_the_podman_family(self):
+        self.assertIn('default_image "$harness" podman', script_function("cmd_review"))
 
     def test_no_node_or_claude_invocation(self):
         action = ACTION_YML.read_text(encoding="utf-8")
@@ -330,6 +378,7 @@ class ActionStaticTests(PanelTestCase):
                 "inputs.agentic_ci_version",
             ),
             ("Review the pull request", "AI_REVIEW_IMAGE", "inputs.image"),
+            ("Review the pull request", "AI_REVIEW_INSTRUCTIONS", "inputs.review_instructions"),
             ("Prepare the diff", "AI_REVIEW_INSTRUCTIONS", "inputs.review_instructions"),
         )
         for step, var, expr in wiring:
@@ -442,7 +491,7 @@ class CheckTestCase(ScriptTestCase):
         AI_REVIEW_HEAD_REPO="o/r",
         AI_REVIEW_ACTOR="alice",
         AI_REVIEW_TRIGGERING_ACTOR="alice",
-        ANTHROPIC_API_KEY="sk-job",
+        OPENAI_API_KEY="sk-job",
     )
 
     def check(self, **overrides: str):
@@ -462,9 +511,10 @@ class CheckTests(CheckTestCase):
             "deleted fork": dict(AI_REVIEW_HEAD_REPO=""),
             "dependabot actor": dict(AI_REVIEW_ACTOR="dependabot[bot]"),
             "dependabot triggering actor": dict(AI_REVIEW_TRIGGERING_ACTOR="dependabot[bot]"),
-            "no key": dict(ANTHROPIC_API_KEY=""),
-            "vertex off": dict(ANTHROPIC_API_KEY="", CLAUDE_CODE_USE_VERTEX="0"),
-            "codex without an openai key": dict(AI_REVIEW_HARNESS="codex"),
+            "no key": dict(OPENAI_API_KEY=""),
+            "codex without an openai key": dict(AI_REVIEW_HARNESS="codex", OPENAI_API_KEY=""),
+            "claude-code without a key": dict(AI_REVIEW_HARNESS="claude-code"),
+            "vertex off": dict(AI_REVIEW_HARNESS="claude-code", CLAUDE_CODE_USE_VERTEX="0"),
         }
         for name, overrides in cases.items():
             with self.subTest(name):
@@ -490,18 +540,18 @@ class CheckTests(CheckTestCase):
         ):
             with self.subTest(var):
                 Path(self.output).unlink(missing_ok=True)
-                proc = self.check(ANTHROPIC_API_KEY="", **{var: "1"})
+                proc = self.check(AI_REVIEW_HARNESS="claude-code", OPENAI_API_KEY="", **{var: "1"})
                 self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
                 self.assertEqual(self.github_output(), {"skip": "false"})
 
     def test_bedrock_does_not_count_because_agentic_ci_has_no_bedrock_path(self):
-        proc = self.check(ANTHROPIC_API_KEY="", CLAUDE_CODE_USE_BEDROCK="1")
+        proc = self.check(AI_REVIEW_HARNESS="claude-code", CLAUDE_CODE_USE_BEDROCK="1")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual(self.github_output(), {"skip": "true"})
         self.assertNotIn("BEDROCK", proc.stdout)
 
     def test_skip_message_names_the_credential_variables(self):
-        proc = self.check(ANTHROPIC_API_KEY="")
+        proc = self.check(AI_REVIEW_HARNESS="claude-code")
         for name in (
             "ANTHROPIC_API_KEY",
             "CLAUDE_CODE_OAUTH_TOKEN",
@@ -510,8 +560,22 @@ class CheckTests(CheckTestCase):
             "GCP_SERVICE_ACCOUNT_KEY",
         ):
             self.assertIn(name, proc.stdout)
-        proc = self.check(ANTHROPIC_API_KEY="", AI_REVIEW_HARNESS="codex")
+        proc = self.check(AI_REVIEW_HARNESS="codex", OPENAI_API_KEY="")
         self.assertIn("OPENAI_API_KEY", proc.stdout)
+
+    def test_an_empty_harness_is_codex(self):
+        for harness in ({}, {"AI_REVIEW_HARNESS": ""}):
+            with self.subTest(harness=harness):
+                Path(self.output).unlink(missing_ok=True)
+                proc = self.check(OPENAI_API_KEY="", ANTHROPIC_API_KEY="sk-a", **harness)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual(self.github_output(), {"skip": "true"})
+                self.assertIn(
+                    "OPENAI_API_KEY is not set, which the codex harness needs", proc.stdout
+                )
+                Path(self.output).unlink()
+                proc = self.check(**harness)
+                self.assertEqual(self.github_output(), {"skip": "false"})
 
     def test_codex_proceeds_with_an_openai_key(self):
         proc = self.check(AI_REVIEW_HARNESS="codex", OPENAI_API_KEY="sk-oai")
@@ -522,7 +586,7 @@ class CheckTests(CheckTestCase):
         for value in ("false", "False", "FALSE", ""):
             with self.subTest(value=value):
                 Path(self.output).unlink(missing_ok=True)
-                proc = self.check(ANTHROPIC_API_KEY="", CLAUDE_CODE_USE_VERTEX=value)
+                proc = self.check(AI_REVIEW_HARNESS="claude-code", CLAUDE_CODE_USE_VERTEX=value)
                 self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
                 self.assertEqual(self.github_output(), {"skip": "true"})
 
@@ -773,7 +837,7 @@ class ReviewTestCase(ScriptTestCase):
 
     BASE = "a" * 40
     HEAD = "b" * 40
-    IMAGE = "quay.io/aipcc/agentic-ci/claude-runner:latest"
+    IMAGE = "quay.io/aipcc/agentic-ci/codex-runner:latest"
     VERSION = VERIFIED_AGENTIC_CI_VERSION
 
     def setUp(self):
@@ -792,7 +856,7 @@ class ReviewTestCase(ScriptTestCase):
             AI_REVIEW_BASE_SHA=self.BASE,
             AI_REVIEW_HEAD_SHA=self.HEAD,
             # The job environment carries the credential, as in a real run.
-            ANTHROPIC_API_KEY="sk-test",
+            OPENAI_API_KEY="sk-test",
             AI_REVIEW_IMAGE=self.IMAGE,
             AI_REVIEW_AGENTIC_CI_VERSION=self.VERSION,
             GITHUB_TOKEN="ghs_secret",
@@ -811,7 +875,7 @@ class ReviewTestCase(ScriptTestCase):
         instructions: bool = False,
         model: str | None = None,
         minutes: int = 20,
-        harness: str = "claude-code",
+        harness: str = "codex",
         prompt: str | None = None,
     ) -> list[str]:
         if prompt is not None:
@@ -824,8 +888,9 @@ class ReviewTestCase(ScriptTestCase):
             tail = ["--", "--plugin-dir", "/workspace/plugin"]
         else:
             prompt = (
-                "Use the /github-code-review skill with the arguments: /workspace/repo "
-                f"/workspace/pr.diff {self.BASE} {self.HEAD} /workspace/out/ai-review-output.json"
+                "Invoke the /code-review-skills:github-code-review skill with the arguments: "
+                f"/workspace/repo /workspace/pr.diff {self.BASE} {self.HEAD} "
+                "/workspace/out/ai-review-output.json"
             )
             tail = []
         if instructions:
@@ -930,7 +995,7 @@ class ReviewTests(ReviewTestCase):
     def test_agent_sees_the_key_but_no_write_token(self):
         self.review()
         env = self.record()["env"]
-        self.assertEqual(env["ANTHROPIC_API_KEY"], "sk-test")
+        self.assertEqual(env["OPENAI_API_KEY"], "sk-test")
         for var in (
             "GITHUB_TOKEN",
             "GH_TOKEN",
@@ -974,7 +1039,7 @@ class ReviewTests(ReviewTestCase):
 
     def test_fails_without_the_plugin_copy(self):
         shutil.rmtree(os.path.join(self.ai_dir, "plugin"))
-        proc = self.review()
+        proc = self.review(AI_REVIEW_HARNESS="claude-code", ANTHROPIC_API_KEY="sk-a")
         self.assertEqual(proc.returncode, 1)
         self.assertFalse(os.path.exists(self.log))
 
@@ -1000,17 +1065,35 @@ class ReviewTests(ReviewTestCase):
         self.assertEqual(self.record()["env"]["OPENAI_API_KEY"], "sk-oai")
         self.assertNotIn("sk-oai", " ".join(self.record()["argv"]))
 
-    def test_an_empty_image_picks_the_harness_runner(self):
-        self.review(AI_REVIEW_IMAGE="")
-        self.assertEqual(
-            self.podman_calls(), ["pull quay.io/aipcc/agentic-ci/claude-runner:latest"]
-        )
-        self.assertIn("claude-runner:latest", " ".join(self.record()["argv"]))
-        self.review(AI_REVIEW_IMAGE="", AI_REVIEW_HARNESS="codex", OPENAI_API_KEY="sk-oai")
-        self.assertIn(
-            "codex-runner:latest",
-            self.podman_calls()[-1],
-        )
+    def test_claude_code_harness_argv_and_credentials(self):
+        proc = self.review(AI_REVIEW_HARNESS="claude-code", ANTHROPIC_API_KEY="sk-ant")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(self.record()["argv"], self.expected_argv(harness="claude-code"))
+        self.assertEqual(self.record()["env"]["ANTHROPIC_API_KEY"], "sk-ant")
+        self.assertNotIn("sk-ant", " ".join(self.record()["argv"]))
+
+    def test_an_empty_harness_is_codex(self):
+        for harness in ({}, {"AI_REVIEW_HARNESS": ""}):
+            with self.subTest(harness=harness):
+                proc = self.review(**harness)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual(self.record()["argv"], self.expected_argv(harness="codex"))
+
+    def test_an_empty_image_picks_the_runner_image_of_the_harness(self):
+        # The podman backend cannot run the sandbox images, so it keeps the runner family.
+        for harness, image in (
+            ("", "quay.io/aipcc/agentic-ci/codex-runner:latest"),
+            ("codex", "quay.io/aipcc/agentic-ci/codex-runner:latest"),
+            ("claude-code", "quay.io/aipcc/agentic-ci/claude-runner:latest"),
+        ):
+            with self.subTest(harness=harness):
+                Path(self.podman_log).unlink(missing_ok=True)
+                proc = self.review(AI_REVIEW_IMAGE="", AI_REVIEW_HARNESS=harness)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual(self.podman_calls(), [f"pull {image}"])
+                argv = self.record()["argv"]
+                self.assertEqual(argv[argv.index("--image") + 1], image)
+                self.assertNotIn("sandbox", " ".join(argv))
 
     def test_invalid_image_is_rejected(self):
         for value in ("quay.io/x/y z:latest", "img\tname"):
@@ -1100,10 +1183,10 @@ class ReviewTests(ReviewTestCase):
         self.assertEqual(self.podman_calls(), [])
 
     def test_a_local_image_is_not_pulled(self):
-        proc = self.review(AI_REVIEW_IMAGE="localhost/claude-runner:dev")
+        proc = self.review(AI_REVIEW_IMAGE="localhost/codex-runner:dev")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual(self.podman_calls(), [])
-        self.assertIn("localhost/claude-runner:dev", self.record()["argv"])
+        self.assertIn("localhost/codex-runner:dev", self.record()["argv"])
 
     def test_a_registry_image_is_pulled(self):
         self.review(AI_REVIEW_IMAGE="quay.io/localhost/x:1")
@@ -1193,14 +1276,16 @@ class PostTests(ScriptTestCase):
         proc = self.post(AGENT_MODEL="some-model")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         env = self.recorded()["env"]
-        self.assertEqual(env["AGENT_TOOL"], "claude-code")
+        self.assertEqual(env["AGENT_TOOL"], "codex")
         self.assertEqual(env["AGENT_MODEL"], "some-model")
         self.assertEqual(env["AGENT_REASONING_EFFORT"], script_constant("AGENT_EFFORT"))
 
     def test_the_footer_names_the_harness(self):
-        proc = self.post(AI_REVIEW_HARNESS="codex")
-        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertEqual(self.recorded()["env"]["AGENT_TOOL"], "codex")
+        for harness, tool in (("codex", "codex"), ("claude-code", "claude-code"), ("", "codex")):
+            with self.subTest(harness=harness):
+                proc = self.post(AI_REVIEW_HARNESS=harness)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual(self.recorded()["env"]["AGENT_TOOL"], tool)
 
     def test_an_already_dirty_checkout_still_posts(self):
         write(self.repo, "a.txt", "normalized differently\n")

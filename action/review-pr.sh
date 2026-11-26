@@ -18,7 +18,7 @@
 #   AI_REVIEW_DRAFT               pull_request.draft (check)
 #   AI_REVIEW_BASE_SHA            pull_request.base.sha (prepare, review)
 #   AI_REVIEW_HEAD_SHA            pull_request.head.sha (prepare, review)
-#   AI_REVIEW_INSTRUCTIONS        review_instructions input (prepare)
+#   AI_REVIEW_INSTRUCTIONS        review_instructions input (prepare, review)
 #   AI_REVIEW_MODEL               model input (review)
 #   AI_REVIEW_TIMEOUT_MINUTES     timeout_minutes input (review)
 #   AI_REVIEW_AGENTIC_CI_VERSION  agentic_ci_version input (review)
@@ -60,9 +60,16 @@ STANDARD_TIMEOUT_MINUTES=20
 DEEP_TIMEOUT_MINUTES=75
 # Reasoning effort of the agent, which the summary footer also reports.
 AGENT_EFFORT=high
-# The runner image of each harness, used when the image input is empty.
+# The default image of each harness when the image input is empty. The sandbox images are for
+# the openshell backend: they keep their config under a user that the podman backend does not
+# run the agent as, so podman keeps the runner images.
 CLAUDE_RUNNER_IMAGE="quay.io/aipcc/agentic-ci/claude-runner:latest"
 CODEX_RUNNER_IMAGE="quay.io/aipcc/agentic-ci/codex-runner:latest"
+CLAUDE_SANDBOX_IMAGE="quay.io/aipcc/agentic-ci/claude-sandbox:latest"
+CODEX_SANDBOX_IMAGE="quay.io/aipcc/agentic-ci/codex-sandbox:latest"
+# The oldest git whose fetch has --no-write-fetch-head and --no-auto-maintenance.
+MIN_GIT_MAJOR=2
+MIN_GIT_MINOR=29
 # The largest review output the post step accepts, in bytes.
 MAX_OUTPUT_BYTES=1048576
 REVIEW_PY_REL="skills/gitlab-code-review/scripts/review.py"
@@ -140,6 +147,30 @@ harden_git() {
     export GIT_CONFIG_KEY_1=core.hooksPath GIT_CONFIG_VALUE_1=/dev/null
 }
 
+# The image for a harness on a backend, when the image input is empty.
+default_image() {
+    case "$1:$2" in
+        claude-code:podman) echo "$CLAUDE_RUNNER_IMAGE" ;;
+        codex:podman) echo "$CODEX_RUNNER_IMAGE" ;;
+        claude-code:openshell) echo "$CLAUDE_SANDBOX_IMAGE" ;;
+        codex:openshell) echo "$CODEX_SANDBOX_IMAGE" ;;
+        *) return 1 ;;
+    esac
+}
+
+# Older runners can ship a git that lacks the fetch options build_container_repo needs.
+require_git_version() {
+    local version
+    version="$(git --version 2>/dev/null)" || error "git is not installed on the runner"
+    [[ "$version" =~ ^git\ version\ ([0-9]+)\.([0-9]+) ]] \
+        || error "Could not read the git version from: '$version'"
+    local major=$((10#${BASH_REMATCH[1]})) minor=$((10#${BASH_REMATCH[2]}))
+    if [ "$major" -lt "$MIN_GIT_MAJOR" ] \
+        || { [ "$major" -eq "$MIN_GIT_MAJOR" ] && [ "$minor" -lt "$MIN_GIT_MINOR" ]; }; then
+        error "git $MIN_GIT_MAJOR.$MIN_GIT_MINOR or later is required, the runner has: $version"
+    fi
+}
+
 # Whether the job environment carries a credential agentic-ci can use for the harness.
 # The keys are agentic-ci's, not the action's: it reads them from the environment.
 has_harness_credentials() {
@@ -161,7 +192,7 @@ cmd_check() {
     refuse_redirected_workdirs
     local skip_reason=""
     local actor="${AI_REVIEW_ACTOR:-}" triggering="${AI_REVIEW_TRIGGERING_ACTOR:-}"
-    local harness="${AI_REVIEW_HARNESS:-claude-code}"
+    local harness="${AI_REVIEW_HARNESS:-codex}"
 
     if [ "${AI_REVIEW_EVENT:-}" != "pull_request" ]; then
         error "This action only supports the pull_request event, got '${AI_REVIEW_EVENT:-}'. Do not use pull_request_target: it runs with write access on code from forks."
@@ -243,6 +274,7 @@ cmd_prepare() {
     done
     reject_whitespace "$AI_DIR"
     require_mode
+    require_git_version
     local base="${AI_REVIEW_BASE_SHA:-}" head="${AI_REVIEW_HEAD_SHA:-}"
     require_sha "pull_request.base.sha" "$base"
     require_sha "pull_request.head.sha" "$head"
@@ -277,7 +309,8 @@ cmd_prepare() {
     # where earlier steps can leave credentials, and the workdirs themselves.
     tar -C "$GITHUB_ACTION_PATH" -cf - .claude-plugin skills | tar -C "$PLUGIN_DIR" -xf -
 
-    if [ -n "${AI_REVIEW_INSTRUCTIONS:-}" ]; then
+    # Deep mode never passes the instructions, so they stay off the mount.
+    if [ "$REVIEW_MODE" = "standard" ] && [ -n "${AI_REVIEW_INSTRUCTIONS:-}" ]; then
         printf '%s' "$AI_REVIEW_INSTRUCTIONS" >"$INSTRUCTIONS_FILE"
     fi
 }
@@ -287,7 +320,7 @@ cmd_review() {
     refuse_redirected_workdirs
     reject_whitespace "$AI_DIR"
     require_mode
-    local harness="${AI_REVIEW_HARNESS:-claude-code}"
+    local harness="${AI_REVIEW_HARNESS:-codex}"
     case "$harness" in
         claude-code | codex) ;;
         *) error "harness must be claude-code or codex, got: '$harness'" ;;
@@ -306,10 +339,7 @@ cmd_review() {
 
     local image="${AI_REVIEW_IMAGE:-}" version="${AI_REVIEW_AGENTIC_CI_VERSION:-}"
     if [ -z "$image" ]; then
-        case "$harness" in
-            claude-code) image="$CLAUDE_RUNNER_IMAGE" ;;
-            codex) image="$CODEX_RUNNER_IMAGE" ;;
-        esac
+        image="$(default_image "$harness" podman)" || error "No default image for $harness"
     fi
     [ -n "${RUNNER_TEMP:-}" ] || error "RUNNER_TEMP is not set"
     case "$image" in
@@ -349,28 +379,31 @@ cmd_review() {
 
     # Every path the prompt carries is a container path. Claude Code runs the skill from the
     # action's own plugin copy, so the prompt is its slash command. Codex has no plugin flag:
-    # it loads the skill installed in its runner image, and the prompt names it the way
-    # agentic-ci's skill runs do.
+    # it loads the skill installed in its image, and the prompt names it the way the GitLab
+    # job does.
     local prompt
     if [ "$REVIEW_MODE" = "deep" ]; then
         # The panel writes gitlab-code-review's JSON, which the post step validates and posts like
         # a standard review. It takes the repo's guidance from REVIEW.md at the base ref, so a PR
         # cannot loosen its own review, and free-form instructions are not passed. One line: the
         # prompt is a single argument.
-        local task="the committed changes in $CONTAINER_DIR/repo from base $base to head $head. Run its triage from inside $CONTAINER_DIR/repo with --base $base --head $head, pass --gitlab-json $CONTAINER_DIR/out/ai-review-output.json to its final report command, and do not post anything."
+        # On a root runner the agent runs as another user than the owner of the mounted repo, so
+        # git refuses it as dubious ownership. A global safe.directory reaches the triage's own
+        # git calls and every subagent, where a -c on one command would not.
+        local task="the committed changes in $CONTAINER_DIR/repo from base $base to head $head. First run git config --global --add safe.directory $CONTAINER_DIR/repo, because the repository can belong to another user. Run its triage from inside $CONTAINER_DIR/repo with --base $base --head $head, pass --gitlab-json $CONTAINER_DIR/out/ai-review-output.json to its final report command, and do not post anything."
         if [ "$harness" = "claude-code" ]; then
             prompt="/code-review-skills:code-review-panel Review $task"
         else
-            prompt="Use the /code-review-panel skill to review $task"
+            prompt="Invoke the /code-review-skills:code-review-panel skill to review $task"
         fi
-        if [ -f "$INSTRUCTIONS_FILE" ]; then
+        if [ -n "${AI_REVIEW_INSTRUCTIONS:-}" ]; then
             warning "review_instructions is ignored in deep mode: the panel reads REVIEW.md from the base branch instead."
         fi
     else
         if [ "$harness" = "claude-code" ]; then
             prompt="/code-review-skills:github-code-review $CONTAINER_DIR/repo $CONTAINER_DIR/pr.diff $base $head $CONTAINER_DIR/out/ai-review-output.json"
         else
-            prompt="Use the /github-code-review skill with the arguments: $CONTAINER_DIR/repo $CONTAINER_DIR/pr.diff $base $head $CONTAINER_DIR/out/ai-review-output.json"
+            prompt="Invoke the /code-review-skills:github-code-review skill with the arguments: $CONTAINER_DIR/repo $CONTAINER_DIR/pr.diff $base $head $CONTAINER_DIR/out/ai-review-output.json"
         fi
         if [ -f "$INSTRUCTIONS_FILE" ]; then
             prompt="$prompt $CONTAINER_DIR/instructions.md"
@@ -444,7 +477,7 @@ cmd_post() {
     harden_git
 
     # What agentic-ci exports inside its sandbox, for the footer.
-    export AGENT_TOOL="${AI_REVIEW_HARNESS:-claude-code}" AGENT_REASONING_EFFORT="$AGENT_EFFORT"
+    export AGENT_TOOL="${AI_REVIEW_HARNESS:-codex}" AGENT_REASONING_EFFORT="$AGENT_EFFORT"
 
     # uv must ignore config and .python-version files that arrive with the PR.
     UV_NO_CONFIG=1 UV_PYTHON="$(command -v python3)" \

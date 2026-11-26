@@ -107,23 +107,25 @@ jobs:
     timeout-minutes: 45
     env:
       # The credential is not an input: set the key agentic-ci reads in the job environment.
-      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
     steps:
       - uses: opendatahub-io/code-review-skills@<full commit sha>
 ```
 
 Pin a full commit SHA: there are no release tags yet. The action checks out the PR head itself, so the job needs no checkout step. Draft pull requests are skipped with a notice, and `ready_for_review` reviews them once they are marked ready.
 
-Requirements: Podman on the runner, and a credential for the harness in the job's `env:`. For `claude-code` that is `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN` (a token from `claude setup-token`); for `codex` it is `OPENAI_API_KEY`. For Vertex, set `GCLOUD_CREDENTIALS` or `GCP_SERVICE_ACCOUNT_KEY` in the job's `env:`, or set `CLAUDE_CODE_USE_VERTEX=1` on its own, which needs application default credentials as a file (`~/.config/gcloud/application_default_credentials.json` or `GOOGLE_APPLICATION_CREDENTIALS`), plus `ANTHROPIC_VERTEX_PROJECT_ID` (or `GCP_PROJECT_ID`). The GCE metadata server is not supported, so `GCLOUD_CREDENTIALS` or `GCP_SERVICE_ACCOUNT_KEY` are the portable options. agentic-ci resolves the credentials. Bedrock is not supported. The Podman on GitHub-hosted runners can need the crun workaround from agentic-ci's [setup-podman action](https://github.com/opendatahub-io/agentic-ci/blob/main/.github/actions/setup-podman/action.yml). The action does not run `sudo` for you, so add that step to the job when the container fails to start.
+Requirements: Podman and git 2.29 or later on the runner, and a credential for the harness in the job's `env:`. For `codex`, the default, that is `OPENAI_API_KEY`; for `claude-code` it is `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN` (a token from `claude setup-token`). For Vertex, set `GCLOUD_CREDENTIALS` or `GCP_SERVICE_ACCOUNT_KEY` in the job's `env:`, or set `CLAUDE_CODE_USE_VERTEX=1` on its own, which needs application default credentials as a file (`~/.config/gcloud/application_default_credentials.json` or `GOOGLE_APPLICATION_CREDENTIALS`), plus `ANTHROPIC_VERTEX_PROJECT_ID` (or `GCP_PROJECT_ID`). The GCE metadata server is not supported, so `GCLOUD_CREDENTIALS` or `GCP_SERVICE_ACCOUNT_KEY` are the portable options. agentic-ci resolves the credentials. Bedrock is not supported. The Podman on GitHub-hosted runners can need the crun workaround from agentic-ci's [setup-podman action](https://github.com/opendatahub-io/agentic-ci/blob/main/.github/actions/setup-podman/action.yml). The action does not run `sudo` for you, so add that step to the job when the container fails to start.
 
-To run Codex instead, set `harness: codex` and put `OPENAI_API_KEY` in the job's `env:`; the image then defaults to `quay.io/aipcc/agentic-ci/codex-runner:latest`. Codex has no plugin flag, so it does not load the action's own copy of the skill: it loads the `github-code-review` skill installed in its runner image from the skills-registry. The image must be a build that already includes that skill; an older image cannot find it, and the run fails with "produced no output". The image version, not the action version, then decides which skill revision runs, so pin the image by digest.
+Codex has no plugin flag, so it does not load the action's own copy of the skill: it loads the `github-code-review` skill installed in its image from the skills-registry. The image must be a build that already includes that skill: the first agentic-ci release after 0.5.15, or a `:latest` built after 2026-11-25, when code-review-skills commit `ac21ab6` added it. An older image cannot find the skill, and the run fails with "produced no output". The image version, not the action version, then decides which skill revision runs, so pin the image by digest.
+
+To run Claude Code instead, set `harness: claude-code` and put its credential in the job's `env:`; the image then defaults to `quay.io/aipcc/agentic-ci/claude-runner:latest`. Claude Code loads the skills from the action's own copy, so it does not depend on which skills the image ships.
 
 | Input | Default | Description |
 |-------|---------|-------------|
-| `harness` | `claude-code` | Agent harness agentic-ci runs: `claude-code` or `codex`. |
+| `harness` | `codex` | Agent harness agentic-ci runs: `codex` or `claude-code`. |
 | `model` | harness default | Model for the review, also shown in the summary footer. |
 | `agentic_ci_version` | `0.5.15` | Version of the `agentic-ci` package that runs the agent. Every flag the action passes was checked against the default. |
-| `image` | runner image for the harness | Container image the agent runs in. Empty picks `quay.io/aipcc/agentic-ci/claude-runner:latest` or `.../codex-runner:latest`. The default tag floats: pin a digest (`...runner@sha256:<digest>`) to freeze it. |
+| `image` | runner image for the harness | Container image the agent runs in. Empty picks the agentic-ci runner image: `quay.io/aipcc/agentic-ci/codex-runner:latest` or `.../claude-runner:latest`. The `*-sandbox` images do not work here: they keep their config under a user that the Podman run does not start the agent as. The default tag floats until the action pins an agentic-ci release: pin a digest (`...runner@sha256:<digest>`) to freeze it. Codex needs an image that ships its skills (see above). |
 | `mode` | `standard` | `standard` runs one review pass with `github-code-review`. `deep` runs `code-review-panel`, which ignores `review_instructions` (see [Deep review](#deep-review)). |
 | `timeout_minutes` | `20` standard, `75` deep | Wall-clock limit for the agent step. The step fails when the review takes longer. Empty picks the default for the mode. |
 | `review_instructions` | -- | Extra guidance such as focus areas or team standards, passed to the review as a file. Standard mode only. |
@@ -170,14 +172,14 @@ jobs:
     # The image pull (up to 15 minutes), timeout_minutes (75 by default in deep mode) and the checkout.
     timeout-minutes: 120
     env:
-      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
     steps:
       - uses: opendatahub-io/code-review-skills@<full commit sha>
         with:
           mode: deep
 ```
 
-The panel writes the same review JSON, and the post step validates and posts it like a standard review, under the same summary comment and marker. A deep review and a standard review of the same pull request therefore replace each other's comments: the one that finishes last is what the pull request shows. Deep mode ignores `review_instructions` with a warning, because the panel reads its guidance from `REVIEW.md` at the base branch, so a pull request cannot loosen its own review. With `harness: codex`, the runner image must also include the `code-review-panel` skill.
+The panel writes the same review JSON, and the post step validates and posts it like a standard review, under the same summary comment and marker. A deep review and a standard review of the same pull request therefore replace each other's comments: the one that finishes last is what the pull request shows. Deep mode ignores `review_instructions` with a warning, because the panel reads its guidance from `REVIEW.md` at the base branch, so a pull request cannot loosen its own review. With `harness: codex`, the panel also comes from the image: `code-review-panel` predates `github-code-review`, so an image that ships the one ships both.
 
 ## Development
 

@@ -1,17 +1,17 @@
 name: AI Code Review
 description: >-
-  Review a pull request with Claude and post inline comments, applicable
+  Review a pull request with an AI agent and post inline comments, applicable
   suggestions and a summary. The agent only reads code. A separate step posts.
 author: opendatahub-io
 
 inputs:
   harness:
     description: >-
-      Agent harness agentic-ci runs: 'claude-code' or 'codex'. The credentials
+      Agent harness agentic-ci runs: 'codex' or 'claude-code'. The credentials
       are not inputs: set the keys agentic-ci reads in the job environment (see
       the README).
     required: false
-    default: 'claude-code'
+    default: 'codex'
   model:
     description: Model for the review. Empty uses the harness default.
     required: false
@@ -22,8 +22,9 @@ inputs:
     default: '0.5.15'
   image:
     description: >-
-      Container image the agent runs in. Empty picks the runner image that
-      matches the harness. The default tag floats, so pin a digest to freeze it.
+      Container image the agent runs in. Empty picks the agentic-ci runner image
+      that matches the harness. The default tag floats, so pin a digest to freeze
+      it.
     required: false
     default: ''
   review_instructions:
@@ -115,6 +116,8 @@ runs:
         AI_REVIEW_AGENTIC_CI_VERSION: ${{ inputs.agentic_ci_version }}
         AI_REVIEW_IMAGE: ${{ inputs.image }}
         AI_REVIEW_MODE: ${{ inputs.mode }}
+        # Only read to warn that deep mode ignores it.
+        AI_REVIEW_INSTRUCTIONS: ${{ inputs.review_instructions }}
         # The agent never holds a token that can write to the repository.
         GITHUB_TOKEN: ''
         GH_TOKEN: ''
