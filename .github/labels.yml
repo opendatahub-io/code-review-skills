@@ -91,3 +91,8 @@
 - name: idea
   description: Community idea or suggestion
   color: f29e4c
+
+# AI review
+- name: deep-review
+  description: Run the deep AI review (code-review-panel) on this pull request
+  color: 1d76db

@@ -1,0 +1,58 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:base"
+  ],
+  "enabledManagers": [
+    "custom.regex"
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Default agentic-ci images of the GitHub Action",
+      "managerFilePatterns": [
+        "action/review-pr.sh"
+      ],
+      "matchStrings": [
+        "#\\s*renovate:\\s*datasource=docker\\n[A-Z_]+=\"(?<depName>quay\\.io/aipcc/agentic-ci/[^:\"]+):(?<currentValue>[\\d.]+)\""
+      ],
+      "datasourceTemplate": "docker",
+      "versioningTemplate": "semver"
+    },
+    {
+      "customType": "regex",
+      "description": "Default agentic_ci_version of the GitHub Action, the openshell image tag",
+      "managerFilePatterns": [
+        "action.yml"
+      ],
+      "matchStrings": [
+        "#\\s*renovate:\\s*datasource=docker\\s+depName=(?<depName>\\S+)\\n\\s*default:\\s*'(?<currentValue>[\\d.]+)'"
+      ],
+      "datasourceTemplate": "docker",
+      "versioningTemplate": "semver"
+    },
+    {
+      "customType": "regex",
+      "description": "The agentic_ci_version default in the README inputs table and the version the tests expect",
+      "managerFilePatterns": [
+        "README.md",
+        "tests/test_github_action.py"
+      ],
+      "matchStrings": [
+        "\\| `agentic_ci_version` \\| `(?<currentValue>[\\d.]+)` \\|",
+        "VERIFIED_AGENTIC_CI_VERSION = \"(?<currentValue>[\\d.]+)\""
+      ],
+      "depNameTemplate": "quay.io/aipcc/agentic-ci/openshell",
+      "datasourceTemplate": "docker",
+      "versioningTemplate": "semver"
+    }
+  ],
+  "packageRules": [
+    {
+      "groupName": "agentic-ci images",
+      "matchPackageNames": [
+        "/^quay\\.io/aipcc/agentic-ci//"
+      ]
+    }
+  ]
+}

@@ -110,11 +110,16 @@ DEEP_TIMEOUT_MINUTES=75
 AGENT_EFFORT=high
 # The default image of each harness when the image input is empty. The sandbox images are for
 # the openshell backend: they keep their config under a user that the podman backend does not
-# run the agent as, so podman keeps the runner images.
-CLAUDE_RUNNER_IMAGE="quay.io/aipcc/agentic-ci/claude-runner:latest"
-CODEX_RUNNER_IMAGE="quay.io/aipcc/agentic-ci/codex-runner:latest"
-CLAUDE_SANDBOX_IMAGE="quay.io/aipcc/agentic-ci/claude-sandbox:latest"
-CODEX_SANDBOX_IMAGE="quay.io/aipcc/agentic-ci/codex-sandbox:latest"
+# run the agent as, so podman keeps the runner images. They are the agentic_ci_version release,
+# and move with it.
+# renovate: datasource=docker
+CLAUDE_RUNNER_IMAGE="quay.io/aipcc/agentic-ci/claude-runner:0.5.16"
+# renovate: datasource=docker
+CODEX_RUNNER_IMAGE="quay.io/aipcc/agentic-ci/codex-runner:0.5.16"
+# renovate: datasource=docker
+CLAUDE_SANDBOX_IMAGE="quay.io/aipcc/agentic-ci/claude-sandbox:0.5.16"
+# renovate: datasource=docker
+CODEX_SANDBOX_IMAGE="quay.io/aipcc/agentic-ci/codex-sandbox:0.5.16"
 # The oldest git whose fetch has --no-write-fetch-head and --no-auto-maintenance.
 MIN_GIT_MAJOR=2
 MIN_GIT_MINOR=29
@@ -754,13 +759,13 @@ cmd_review() {
         # The version is the openshell image's tag, which allows fewer characters than a
         # version, and can pin the image by digest.
         if [[ ! "${version%%@*}" =~ $version_re ]] || ! openshell_image_ref "$version" >/dev/null; then
-            error "agentic_ci_version must be a tag of the openshell image with the openshell backend, such as 0.5.15, or a tag pinned to a digest, such as 0.5.15@sha256:<64 lowercase hex digits>, got: '$version'"
+            error "agentic_ci_version must be a tag of the openshell image with the openshell backend, such as 0.5.16, or a tag pinned to a digest, such as 0.5.16@sha256:<64 lowercase hex digits>, got: '$version'"
         fi
     else
         case "$version" in
             *@*) error "agentic_ci_version is the PyPI version of agentic-ci with backend: podman, so it cannot pin a digest: only the openshell image is pinned by digest, got: '$version'" ;;
         esac
-        [[ "$version" =~ $version_re ]] || error "agentic_ci_version must be a package version such as 0.5.15, got: '$version'"
+        [[ "$version" =~ $version_re ]] || error "agentic_ci_version must be a package version such as 0.5.16, got: '$version'"
     fi
     local minutes="${AI_REVIEW_TIMEOUT_MINUTES:-}"
     if [ -z "$minutes" ]; then
