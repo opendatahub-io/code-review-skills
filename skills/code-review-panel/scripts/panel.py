@@ -56,6 +56,8 @@ FINDER_KEYS = {
     "pre_existing",
 }
 VERDICT_KEYS = {"confidence", "excluded_by", "reason"}
+# A verdict may also correct the finding's line, which report reads from any skeptic.
+VERDICT_OPTIONAL_KEYS = {"location"}
 FILTER_SCALE = (1, 10)
 JSON_EXAMPLE_RE = re.compile(r"^```json\n(.*?)^```", re.M | re.S)
 PERSONA_HEADINGS = ["Stance", "Grounding", "Checklist", "Output"]
@@ -510,10 +512,11 @@ def check_contracts(finder_text: str, filter_text: str) -> None:
         )
     example = example_json(FILTER, filter_text)
     keys = set(example) if isinstance(example, dict) else set()
-    if keys != VERDICT_KEYS:
+    if not VERDICT_KEYS <= keys <= VERDICT_KEYS | VERDICT_OPTIONAL_KEYS:
         raise PanelError(
             f"incomplete install: {FILTER}'s verdict example has keys {sorted(keys)}; this "
-            f"panel reads {sorted(VERDICT_KEYS)}",
+            f"panel reads {sorted(VERDICT_KEYS)} and optionally "
+            f"{sorted(VERDICT_OPTIONAL_KEYS)}",
             3,
         )
     flat = " ".join(filter_text.split())
@@ -2043,10 +2046,19 @@ def load_findings(path: str, plan: dict, warnings: list[str]) -> dict:
     rows = data.get("findings")
     if not isinstance(rows, list):
         raise PanelError(f"findings file {path}: findings must be a list")
-    for key in ("not_covered", "still_present", "unread"):
+    for key in ("not_covered", "still_present"):
         value = data.get(key, [])
         if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
             raise PanelError(f"findings file {path}: {key} must be a list of strings")
+    unread = data.get("unread", [])
+    if not isinstance(unread, list) or not all(
+        isinstance(u, str)
+        or (isinstance(u, dict) and all(isinstance(u.get(k), str) for k in ("path", "lens")))
+        for u in unread
+    ):
+        raise PanelError(
+            f"findings file {path}: unread must be a list of paths or {{path, lens}} objects"
+        )
     fixed = data.get("fixed", [])
     if not isinstance(fixed, list) or not all(
         isinstance(f, dict) and all(isinstance(f.get(k), str) for k in ("id", "reason", "lens"))
@@ -2077,16 +2089,75 @@ def load_findings(path: str, plan: dict, warnings: list[str]) -> dict:
         for j, inst in enumerate(out["instances"]):
             inst["file"] = norm(inst["file"], f"{where}.instances[{j}].file")
         mapped.append(out)
+    not_covered = data.get("not_covered", [])
+    review_unread, by_lens = split_unread(unread, plan, norm, warnings)
     return {
         "independent": data["independent"],
         "candidates": max(candidates, len(mapped) + low),
         "dropped_low": low,
-        "not_covered": data.get("not_covered", []),
+        "not_covered": not_covered,
         "still_present": data.get("still_present", []),
         "fixed": [{k: f[k] for k in ("id", "reason", "lens")} for f in fixed],
-        "unread": [norm(u, f"unread[{k}]") for k, u in enumerate(data.get("unread", []))],
+        "unread": review_unread + unread_by_all(plan, not_covered, by_lens, review_unread),
+        "unread_by_lens": by_lens,
         "rows": mapped,
     }
+
+
+def split_unread(
+    unread: list, plan: dict, norm: PathNormalizer, warnings: list[str]
+) -> tuple[list[str], dict[str, list[str]]]:
+    """Split the merged unread list into the paths no lens read (a bare path) and each
+    lens's own unread paths ({path, lens}, in the order listed)."""
+    lenses = {lens["name"] for lens in plan["lenses"]}
+    review: list[str] = []
+    by_lens: dict[str, list[str]] = {}
+    for k, u in enumerate(unread):
+        if isinstance(u, str):
+            review.append(norm(u, f"unread[{k}]"))
+            continue
+        p = norm(u["path"], f"unread[{k}].path")
+        if u["lens"] not in lenses:
+            # Nobody can say which lens skipped it, so it counts as read by none.
+            warnings.append(
+                f"unread[{k}] names lens {u['lens']!r}, which is not a lens of this plan; "
+                "counted as not read by any lens"
+            )
+            if p not in review:
+                review.append(p)
+        elif p not in by_lens.setdefault(u["lens"], []):
+            by_lens[u["lens"]].append(p)
+    return review, by_lens
+
+
+def unread_by_all(
+    plan: dict, not_covered: list[str], by_lens: dict[str, list[str]], skip: list[str]
+) -> list[str]:
+    """The per-lens unread paths that count as not read for the review: every lens that ran
+    listed them, or the security lens did, since no other lens covers what it checks.
+    A lens in not_covered read nothing, so it never counts as having read a path."""
+    readers = [lens["name"] for lens in plan["lenses"] if lens["name"] not in not_covered]
+    security = by_lens.get("security", ())
+    out: list[str] = []
+    for paths in by_lens.values():
+        for p in paths:
+            if p in skip or p in out:
+                continue
+            if p in security or all(p in by_lens.get(lens, ()) for lens in readers):
+                out.append(p)
+    return out
+
+
+def partly_unread(data: dict) -> list[tuple[str, list[str]]]:
+    """Paths some lenses did not read but another lens did, with the lenses that skipped them."""
+    unread = set(data["unread"])
+    out: dict[str, list[str]] = {}
+    by_lens = data.get("unread_by_lens", {})
+    for lens in sorted(by_lens, key=lambda name: LENS_ORDER.get(name, len(LENS_ORDER))):
+        for p in by_lens[lens]:
+            if p not in unread:
+                out.setdefault(p, []).append(lens)
+    return list(out.items())
 
 
 def warn_missing_at_head(plan: dict, rows: list[dict], warnings: list[str]) -> None:
@@ -2268,6 +2339,8 @@ def load_verdicts(path: str, warnings: list[str]) -> tuple[dict, dict]:
             continue
         if obj.get("skeptic") not in SKEPTICS:
             raise PanelError(f"{where}: skeptic must be one of {', '.join(SKEPTICS)}")
+        if obj.get("location") is not None:
+            obj["location"] = location(obj["location"], f"{where}: location")
         verdicts.setdefault(obj["id"], {})[obj["skeptic"]] = obj
     return verdicts, resolutions
 
@@ -2389,8 +2462,51 @@ def verdict_vote(fid: str, name: str, verdict, notes: list[str], warnings: list[
     return not refuted
 
 
+# A skeptic that read the code may correct the finder's line; the first of these wins.
+LOCATION_ORDER = ("facts", "reproduce", "impact")
+
+
+def relocate(
+    row: dict, got: dict, skeptics: list[str], norm: PathNormalizer, warnings: list[str]
+) -> None:
+    """Move the row to the line a skeptic's verdict names in the same file. The id stays:
+    it is the finder's, and the next round's finder reports the bug where it is."""
+    moves = []
+    for name in (s for s in LOCATION_ORDER if s in skeptics):
+        loc = (got.get(name) or {}).get("location")
+        if loc is None:
+            continue
+        file = norm(loc["file"], f"{row['id']} {name} verdict location")
+        if file != row["file"]:
+            warnings.append(
+                f"{row['id']}: the {name} verdict moves it to {file}, not its file "
+                f"{row['file']}; location ignored"
+            )
+            continue
+        moves.append((name, loc["line"]))
+    if not moves:
+        return
+    name, line = moves[0]
+    file = row["file"]
+    for other, other_line in moves[1:]:
+        if other_line != line:
+            warnings.append(
+                f"{row['id']}: the {other} verdict puts it at line {other_line}, the {name} "
+                f"verdict at line {line}; line {line} used"
+            )
+    if line == row["line"]:
+        return
+    old = place(row)
+    row["line"] = line
+    new = place(row)
+    # The new place is the finding's own now, so it is no other place of the same bug.
+    row["instances"] = [i for i in row["instances"] if (i["file"], i["line"]) != (file, line)]
+    row["notes"].append(f"{name}: location corrected from {old} to {new}")
+
+
 def apply_verdicts(rows: list[dict], plan: dict, verdicts: dict, resolutions: dict, warnings):
     skeptics = {lens["name"]: lens["skeptics"] for lens in plan["lenses"]}
+    norm = PathNormalizer(plan, warnings)
     ids = {row["id"] for row in rows}
     for fid in sorted(set(verdicts) | set(resolutions)):
         if fid not in ids:
@@ -2398,14 +2514,16 @@ def apply_verdicts(rows: list[dict], plan: dict, verdicts: dict, resolutions: di
     for row in rows:
         if row["status"] != "pending":
             continue
+        lens_skeptics = skeptics.get(row["lens"], ["facts", "impact"])
         result = vote(
             row,
-            skeptics.get(row["lens"], ["facts", "impact"]),
+            lens_skeptics,
             verdicts,
             plan.get("security") or {},
             warnings,
         )
         row["notes"] = result["notes"]
+        relocate(row, verdicts.get(row["id"], {}), lens_skeptics, norm, warnings)
         row["missing"] = result["missing"]
         row["pre_existing"] = result["pre_existing"]
         status = result["result"]
@@ -2517,18 +2635,21 @@ class Outcome:
 
 def unchecked_known(plan: dict, data: dict, known: dict) -> list[dict]:
     """Open known items no finder of their lens checked: the lens is not in this plan, it
-    is listed in not_covered, or the item's file or an instance's file is listed in unread.
-    They count as still present, never as fixed."""
+    is listed in not_covered, or the item's file or an instance's file is one its lens did
+    not read. They count as still present, never as fixed."""
     planned = {lens["name"] for lens in plan["lenses"]}
     failed = set(data["not_covered"])
     unread = set(data["unread"])
+    by_lens = data.get("unread_by_lens", {})
+
+    def skipped(item: dict) -> bool:
+        files = unread | set(by_lens.get(item["lens"], ()))
+        return item["file"] in files or any(inst["file"] in files for inst in item["instances"])
+
     return [
         i
         for i in open_items(known, known["round"])
-        if i["lens"] not in planned
-        or i["lens"] in failed
-        or i["file"] in unread
-        or any(inst["file"] in unread for inst in i["instances"])
+        if i["lens"] not in planned or i["lens"] in failed or skipped(i)
     ]
 
 
@@ -2711,6 +2832,13 @@ def fold(plan: dict, data: dict, rows: list[dict], out: Outcome, warnings) -> li
         gaps.append("checks were not independent")
     if gaps:
         lines.append(f"- Not covered: {'; '.join(gaps)}")
+    partly = partly_unread(data) if "unread" in data else []
+    if partly:
+        # Another lens read each of these, so they are no gap of the review.
+        lines.append(
+            "- Read by some lenses only: "
+            + "; ".join(f"{esc(p)} (not read by {', '.join(lenses)})" for p, lenses in partly)
+        )
     # Triage warnings explain the run (a shallow clone, a dirty tree), so they are notes,
     # not gaps; the ones that weaken the review also add an approval reason.
     if plan["warnings"]:
@@ -2858,6 +2986,8 @@ def added_lines(plan: dict, files: set[str]) -> set[tuple[str, int]]:
 # Gitaly's similarity for MR diffs (internal/gitaly/service/diff/commit_diff.go).
 RENAME_SIMILARITY = "--find-renames=30%"
 GITLAB_SEVERITY = {"blocking": "critical", "major": "major", "minor": "minor"}
+# Characters of evidence and of fix the summary gives a finding with no inline comment.
+SUMMARY_TEXT_CAP = 500
 # A line whose first non-space character is "/" is a GitLab quick action (/approve,
 # /label, /close) that GitLab runs as the poster.
 QUICK_ACTION_RE = re.compile(r"(^|[\r\n])([^\S\r\n]*)/")
@@ -2903,6 +3033,16 @@ def gitlab_comment(row: dict) -> str:
     return gitlab_text("\n\n".join(parts))
 
 
+def summary_text(text: str) -> str:
+    """Finding text as one bounded line of a summary list item: a newline there could
+    open a fence or a heading that swallows the rest of the summary."""
+    flat = " ".join(str(text).split()) or "none given"
+    # Cut before escaping, so the cut never splits an escape.
+    if len(flat) > SUMMARY_TEXT_CAP:
+        flat = flat[: SUMMARY_TEXT_CAP - 3].rstrip() + "..."
+    return esc(flat)
+
+
 def gitlab_json(plan: dict, out: Outcome, first: str) -> dict:
     added = added_lines(plan, {r["file"] for r in out.listed if r["line"]})
     inline = [r for r in out.listed if (r["file"], r["line"]) in added]
@@ -2922,6 +3062,10 @@ def gitlab_json(plan: dict, out: Outcome, first: str) -> dict:
         lines.append(
             f"- [{r['id']}] {r['severity']}{mark}: {r['title']} ({esc(place(r))}, {r['lens']})"
         )
+        if r not in inline:
+            # No inline comment carries its evidence and fix, so the summary does.
+            lines.append(f"  - Evidence: {summary_text(r['evidence'])}")
+            lines.append(f"  - Fix: {summary_text(r['fix'])}")
     for r in out.hidden_minors:
         lines.append(f"- [{r['id']}] minor, over the nit cap: {r['title']} ({esc(place(r))})")
     for r in out.by_status.get("over-cap", []):

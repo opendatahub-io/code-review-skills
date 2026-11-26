@@ -1327,6 +1327,15 @@ class InstallCheckTests(PanelTestCase):
         code, err = self.triage_install()
         self.assertEqual(code, 0, err[-400:])
 
+    def test_filter_verdict_may_carry_a_location(self) -> None:
+        edit = self.rewrite(
+            "security-diff-review/references/filter.md",
+            '"excluded_by": null,',
+            '"excluded_by": null, "location": {"file": "src/a.py", "line": 3},',
+        )
+        code, err = self.triage_install(edit)
+        self.assertEqual(code, 0, err[-400:])
+
     def test_mismatches_exit_3(self) -> None:
         finder = "security-diff-review/references/finder.md"
         filt = "security-diff-review/references/filter.md"
@@ -1340,6 +1349,9 @@ class InstallCheckTests(PanelTestCase):
             ),
             "review_completed missing": self.rewrite(finder, '"review_completed"', '"done"'),
             "verdict key renamed": self.rewrite(filt, '"excluded_by": null,', '"rule": null,'),
+            "verdict key added": self.rewrite(
+                filt, '"excluded_by": null,', '"excluded_by": null, "cwe": "CWE-89",'
+            ),
             "scale changed": self.rewrite(
                 filt, "`confidence` is an integer from 1 to 10", "`confidence` is 0 to 1"
             ),
