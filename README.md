@@ -98,6 +98,8 @@ concurrency:
 permissions:
   contents: read
   pull-requests: write
+  # Lets the review find a deep review of the same commit and stand down for it.
+  actions: read
 
 jobs:
   review:
@@ -133,6 +135,8 @@ To run Claude Code instead, set `harness: claude-code` and put its credential in
 | `review_instructions` | -- | Extra guidance such as focus areas or team standards, passed to the review as a file. Standard mode only. |
 | `chill_mode` | `true` | Drop suggestion-level comments. |
 | `inline_fixes` | `true` | Post `fix` objects as applicable suggestions. |
+| `recommend_deep_review` | `false` | Standard mode only. Before the agent starts, run the panel's triage on the runner and, when it picks the deep tier, add a line to the summary that recommends adding the `deep-review` label and names what triggered it (see [Deep review](#deep-review)). |
+| `deep_review_job` | `deep-review` | Display name of the job that runs the action with `mode: deep`, which a standard review stands down for (see [Deep review](#deep-review)). |
 
 ### Backends
 
@@ -150,7 +154,7 @@ To run Claude Code instead, set `harness: claude-code` and put its credential in
 Limitations:
 
 - Only the `pull_request` event is supported. Runs for pull requests from forks and runs triggered by Dependabot exit 0 with a notice, because they get no secrets and a read-only token. A run without a credential for the harness in the job environment, or for a draft pull request, does the same.
-- The action posts as `github-actions[bot]` with the workflow token, and recognizes its own comments by that login and a marker. Run one copy of the action per pull request: two would fight over the same comments.
+- The action posts as `github-actions[bot]` with the workflow token, and recognizes its own comments by that login and a marker. Run one standard and at most one deep copy of the action per pull request: two of the same mode would fight over the same comments.
 - The action fetches the full history of the PR head (`fetch-depth: 0`) on every run, to find the merge base reliably, and copies the history of the base and the head into the agent's repository. On a very large repo that costs time and disk on every push.
 - A very large diff can exceed what the agent reads in one run. The review then says in its summary that it covered only part of the diff.
 - The agent runs in a sandbox (OpenShell, or a Podman container with `backend: podman`) with every tool the harness provides enabled, so the sandbox is the boundary, not a tool allowlist. It reads an export of the PR's working tree in `.ai-review/repo` under the workspace, with a git repository of its own: HEAD detached at the PR head and the full history of the base and the head, fetched from the checkout's objects without its config, remotes, hooks or credentials. The checkout itself, with its `.git`, sits in `.ai-review-head` and is never mounted, so the container never sees it or the write token. The action never runs git in `.ai-review` once the agent starts. The post step reads one file from the mount, refuses a symlink or anything over 1 MiB, and posts a copy of it. Both directories are removed at the end.
@@ -173,13 +177,17 @@ on:
 permissions:
   contents: read
   pull-requests: write
+  actions: read
 
 jobs:
   deep-review:
     # When the label is added, and on later pushes while it is set. Other labels do not start it.
+    # Never for a draft: a deep job that skips one still succeeds, and the standard review of
+    # that commit would stand down for it.
     if: >-
+      !github.event.pull_request.draft && (
       github.event.action == 'labeled' && github.event.label.name == 'deep-review' ||
-      github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'deep-review')
+      github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'deep-review'))
     # Its own group, so a deep review and a standard review do not cancel each other.
     concurrency:
       group: ai-deep-review-${{ github.event.pull_request.number }}
@@ -195,7 +203,19 @@ jobs:
           mode: deep
 ```
 
-The panel writes the same review JSON, and the post step validates and posts it like a standard review, under the same summary comment and marker. A deep review and a standard review of the same pull request therefore replace each other's comments: the one that finishes last is what the pull request shows. Deep mode ignores `review_instructions` with a warning, because the panel reads its guidance from `REVIEW.md` at the base branch, so a pull request cannot loosen its own review. With `harness: codex`, the panel also comes from the image: `code-review-panel` predates `github-code-review`, so an image that ships the one ships both.
+The panel writes the same review JSON, and the post step validates and posts it like a standard review, under the same summary comment and marker, so a deep review and a standard review of the same pull request would replace each other's comments. Instead, the review that should win is the one the pull request shows:
+
+- A standard review stands down when a job named by `deep_review_job` has started for the same commit (queued, waiting or in progress) or has succeeded for it. A deep job that failed, was cancelled or was skipped does not count.
+- A deep review stands down when the pull request has a newer commit than the one it reviewed.
+- Each review checks before the agent starts, then again before it deletes old threads and before it writes the summary, so one that starts while the other runs still wins. A review that stands down exits 0 with a notice and posts nothing.
+
+`deep_review_job` is the deep job's display name as GitHub shows it: its `name:` when it sets one, otherwise its job key (`deep-review` in the example above). With `name: Deep review`, set `deep_review_job: Deep review` in the standard job's `with:`. When the deep job calls a reusable workflow, use the calling job's name: GitHub lists the called jobs as `<caller> / <job>`. A matrix job matches as `<name> (<values>)`. The match is exact and case sensitive, so a name that is only a prefix or a suffix of another job's name does not match it.
+
+The standard review finds the deep job through the Actions API, so its job needs `actions: read`. The check fails open: when the API refuses it (for example a private repository without `actions: read`) or cannot answer, the review warns once, names the permission, and goes ahead as if there were no deep review. The deep review's own check reads only the pull request. A `deep-review` label added by a workflow with the `GITHUB_TOKEN` does not start a run: a person or a GitHub App must add it.
+
+With `recommend_deep_review: 'true'`, a standard review runs the panel's triage on the runner before the agent starts, on the agent's copy of the repository, with no token and an empty environment, under a 60 second limit. When the triage picks the deep tier, the summary gets one line that recommends adding the `deep-review` label and names the categories and paths behind it. The log shows only the tier. A triage that fails or times out only warns, and the summary then has no recommendation. A deep review never recommends one.
+
+Deep mode ignores `review_instructions` with a warning, because the panel reads its guidance from `REVIEW.md` at the base branch, so a pull request cannot loosen its own review. With `harness: codex`, the panel also comes from the image: `code-review-panel` predates `github-code-review`, so an image that ships the one ships both.
 
 ## Development
 

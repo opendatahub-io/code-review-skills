@@ -172,10 +172,20 @@ class ActionStaticTests(PanelTestCase):
             self.assertRegex(block, rf"""(?m)^\s*{var}:\s*(''|"")\s*$""")
         self.assertNotIn("github.token", block)
 
-    def test_only_the_post_step_holds_the_write_token(self):
-        for block in action_steps():
-            if "github.token" in block:
-                self.assertIn('review-pr.sh" post', block)
+    def test_only_the_standdown_and_post_steps_hold_the_token(self):
+        holders = [
+            re.search(r"(?m)^name:\s*(.+)$", block).group(1).strip()
+            for block in action_steps()
+            if "github.token" in block
+        ]
+        self.assertEqual(holders, ["Check for a review that should win", "Post the review"])
+        self.assertIn('review-pr.sh" standdown', run_text(find_step(holders[0])))
+        self.assertIn('review-pr.sh" post', run_text(find_step(holders[1])))
+        for holder in holders:
+            with self.subTest(holder):
+                self.assertRegex(
+                    find_step(holder), r"(?m)^\s*GITHUB_TOKEN:\s*\$\{\{ github\.token \}\}\s*$"
+                )
 
     def test_post_step_pins_uv_and_the_platform(self):
         self.assertIn('review-pr.sh" post', run_text(find_step("Post the review")))
@@ -191,6 +201,37 @@ class ActionStaticTests(PanelTestCase):
             if "id: check" in block or "name: Remove the checkout" in block:
                 continue
             self.assertIn("steps.check.outputs.skip != 'true'", block)
+
+    def test_only_review_and_post_honor_stand_down(self):
+        gated = [
+            re.search(r"(?m)^name:\s*(.+)$", block).group(1).strip()
+            for block in action_steps()
+            if "steps.standdown.outputs.stand_down" in block
+        ]
+        self.assertEqual(gated, ["Review the pull request", "Post the review"])
+        for step in gated:
+            with self.subTest(step):
+                self.assertRegex(
+                    find_step(step),
+                    r"(?m)^\s*if: steps\.check\.outputs\.skip != 'true' && "
+                    r"steps\.standdown\.outputs\.stand_down != 'true'\s*$",
+                )
+
+    def test_standdown_runs_after_uv_and_before_the_review(self):
+        names = [
+            re.search(r"(?m)^name:\s*(.+)$", block).group(1).strip() for block in action_steps()
+        ]
+        standdown = names.index("Check for a review that should win")
+        self.assertEqual(names[standdown - 1], "Set up uv")
+        self.assertEqual(names[standdown + 1], "Review the pull request")
+        block = find_step("Check for a review that should win")
+        self.assertRegex(block, r"(?m)^\s*id:\s*standdown\s*$")
+        self.assertEqual(working_directory(block), ".ai-review-head")
+
+    def test_stand_down_inputs_default_to_off_and_the_conventional_job_name(self):
+        self.assertEqual(input_default("recommend_deep_review"), "false")
+        self.assertEqual(input_default("deep_review_job"), "deep-review")
+        self.assertEqual(script_constant("DEFAULT_DEEP_JOB"), '"deep-review"')
 
     def test_every_input_is_documented_in_the_readme(self):
         text = ACTION_YML.read_text(encoding="utf-8")
@@ -394,6 +435,12 @@ class ActionStaticTests(PanelTestCase):
             ("Prepare the diff", "AI_REVIEW_INSTRUCTIONS", "inputs.review_instructions"),
             ("Review the pull request", "AI_REVIEW_BACKEND", "inputs.backend"),
             ("Remove the checkout", "AI_REVIEW_BACKEND", "inputs.backend"),
+            ("Prepare the diff", "AI_REVIEW_RECOMMEND_DEEP", "inputs.recommend_deep_review"),
+            ("Check for a review that should win", "AI_REVIEW_MODE", "inputs.mode"),
+            ("Check for a review that should win", "AI_REVIEW_DEEP_JOB", "inputs.deep_review_job"),
+            ("Post the review", "AI_REVIEW_MODE", "inputs.mode"),
+            ("Post the review", "AI_REVIEW_DEEP_JOB", "inputs.deep_review_job"),
+            ("Post the review", "AI_REVIEW_RECOMMEND_DEEP", "inputs.recommend_deep_review"),
             (
                 "Remove the checkout",
                 "AI_REVIEW_AGENTIC_CI_VERSION",
@@ -1345,7 +1392,7 @@ class PostTests(ScriptTestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         record = self.recorded()
         self.assertEqual(record["argv"][:3], ["post", "--platform", "github"])
-        copy = record["argv"][3]
+        copy = record["argv"][-1]
         self.assertNotEqual(copy, self.out)
         self.assertTrue(copy.startswith(self.runner_temp + os.sep), copy)
         self.assertEqual(record["output"], '{"summary": "ok"}')

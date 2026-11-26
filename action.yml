@@ -63,6 +63,22 @@ inputs:
       ignores review_instructions and reads REVIEW.md from the base branch.
     required: false
     default: 'standard'
+  deep_review_job:
+    description: >-
+      Display name of the job that runs this action with mode 'deep': its name
+      when it sets one, else its job key; under a reusable workflow, the
+      calling job's. A standard review stands down when that job has started or
+      succeeded for the same head. Needs 'actions: read' on private
+      repositories.
+    required: false
+    default: 'deep-review'
+  recommend_deep_review:
+    description: >-
+      In standard mode, triage the change on the runner before the review and
+      recommend a deep review in the summary when it touches high-risk paths
+      ('true' or 'false').
+    required: false
+    default: 'false'
 
 runs:
   using: composite
@@ -101,6 +117,7 @@ runs:
         AI_REVIEW_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         AI_REVIEW_INSTRUCTIONS: ${{ inputs.review_instructions }}
         AI_REVIEW_MODE: ${{ inputs.mode }}
+        AI_REVIEW_RECOMMEND_DEEP: ${{ inputs.recommend_deep_review }}
 
     - name: Set up uv
       if: steps.check.outputs.skip != 'true'
@@ -112,8 +129,21 @@ runs:
         # root can hold the PR's files, which could pick a uv that ignores UV_NO_CONFIG.
         working-directory: ${{ github.action_path }}
 
-    - name: Review the pull request
+    - name: Check for a review that should win
+      id: standdown
       if: steps.check.outputs.skip != 'true'
+      shell: bash
+      # Holds the token only to read the Actions API and the pull request: review.py makes no
+      # write call here. Runs before the agent, so a review that would be replaced costs nothing.
+      working-directory: .ai-review-head
+      run: '"$GITHUB_ACTION_PATH/action/review-pr.sh" standdown'
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+        AI_REVIEW_MODE: ${{ inputs.mode }}
+        AI_REVIEW_DEEP_JOB: ${{ inputs.deep_review_job }}
+
+    - name: Review the pull request
+      if: steps.check.outputs.skip != 'true' && steps.standdown.outputs.stand_down != 'true'
       shell: bash
       # Not the checkout: uvx must not read a uv.toml or pyproject.toml that arrives with the PR.
       working-directory: .ai-review
@@ -137,7 +167,7 @@ runs:
         ACTIONS_ID_TOKEN_REQUEST_URL: ''
 
     - name: Post the review
-      if: steps.check.outputs.skip != 'true'
+      if: steps.check.outputs.skip != 'true' && steps.standdown.outputs.stand_down != 'true'
       shell: bash
       working-directory: .ai-review-head
       run: '"$GITHUB_ACTION_PATH/action/review-pr.sh" post'
@@ -147,6 +177,9 @@ runs:
         INLINE_FIXES: ${{ inputs.inline_fixes }}
         AGENT_MODEL: ${{ inputs.model }}
         AI_REVIEW_HARNESS: ${{ inputs.harness }}
+        AI_REVIEW_MODE: ${{ inputs.mode }}
+        AI_REVIEW_DEEP_JOB: ${{ inputs.deep_review_job }}
+        AI_REVIEW_RECOMMEND_DEEP: ${{ inputs.recommend_deep_review }}
 
     # Composite actions have no post hook, so this step always runs.
     - name: Remove the checkout

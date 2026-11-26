@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Steps of the GitHub Action in ../action.yml, kept here so shellcheck covers them.
 #
-# Usage: review-pr.sh {check|prepare|review|post|cleanup}
+# Usage: review-pr.sh {check|prepare|standdown|review|post|cleanup}
 #
 # The agent step holds no write token. By default (backend openshell) the openshell image runs
 # as a privileged docker container, and agentic-ci inside it runs the agent in an OpenShell
@@ -10,6 +10,9 @@
 # The agent reads an export of the PR checkout with a git repository of its own, built without
 # the checkout's config, remotes or credentials, and writes one file. The post step holds the
 # token, validates that one file and posts a copy of it through the same review.py GitLab uses.
+# The standdown step also holds the token, only to read the Actions API: it skips the review when
+# a review that should win makes it redundant (a deep review of the same head for a standard
+# review, a newer head for a deep review). The post step checks again before it writes.
 #
 # Environment (set by action.yml):
 #   AI_REVIEW_EVENT               github.event_name (check)
@@ -17,7 +20,10 @@
 #   AI_REVIEW_ACTOR               github.actor (check)
 #   AI_REVIEW_TRIGGERING_ACTOR    github.triggering_actor (check)
 #   AI_REVIEW_HARNESS             harness input (check, review, post)
-#   AI_REVIEW_MODE                mode input: standard or deep (check, prepare, review)
+#   AI_REVIEW_MODE                mode input: standard or deep (check, prepare, standdown,
+#                                 review, post)
+#   AI_REVIEW_DEEP_JOB            deep_review_job input (standdown, post)
+#   AI_REVIEW_RECOMMEND_DEEP      recommend_deep_review input (prepare, post)
 #   AI_REVIEW_DRAFT               pull_request.draft (check)
 #   AI_REVIEW_BACKEND             backend input: openshell or podman (review, cleanup)
 #   AI_REVIEW_BASE_SHA            pull_request.base.sha (prepare, review)
@@ -30,7 +36,9 @@
 #   GITHUB_OUTPUT, GITHUB_REPOSITORY, GITHUB_WORKSPACE, GITHUB_ACTION_PATH, GITHUB_RUN_ID,
 #   GITHUB_RUN_ATTEMPT:           set by the runner
 #   RUNNER_TEMP                   set by the runner (review: parent of the agent's private TMPDIR,
-#                                 post: parent of the copy of the output)
+#                                 post: parent of the copy of the output, prepare and post: parent
+#                                 of the triage plan)
+#   GITHUB_TOKEN                  github.token (standdown, post); no other step gets it
 #
 # The agent's credentials are not action inputs: the job environment carries the keys
 # agentic-ci reads (ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN for claude-code,
@@ -46,8 +54,12 @@
 #   plugin/                       a copy of this action, loaded with --plugin-dir
 #   out/                          the only place the review writes
 #
-# prepare and post run in .ai-review-head. review runs in .ai-review, not in a checkout, so
-# uvx does not read a uv config that arrives with the PR. check and cleanup run anywhere.
+# The triage plan of the deep-review recommendation is $RUNNER_TEMP/ai-review-triage/plan.json,
+# outside the mount, written by prepare before any agent runs and read only by post.
+#
+# prepare, standdown and post run in .ai-review-head. review runs in .ai-review, not in a
+# checkout, so uvx does not read a uv config that arrives with the PR. check and cleanup run
+# anywhere.
 
 set -euo pipefail
 
@@ -95,6 +107,17 @@ MIN_GIT_MINOR=29
 # The largest review output the post step accepts, in bytes.
 MAX_OUTPUT_BYTES=1048576
 REVIEW_PY_REL="skills/gitlab-code-review/scripts/review.py"
+PANEL_PY_REL="skills/code-review-panel/scripts/panel.py"
+# The directory under RUNNER_TEMP that holds the triage plan, and the plan's largest size in bytes,
+# which is also what review.py reads.
+TRIAGE_DIR_NAME="ai-review-triage"
+MAX_PLAN_BYTES=1048576
+# The wall-clock limit of the triage, which reads only git metadata and the diff.
+TRIAGE_TIMEOUT=60s
+# The deep_review_job input's default, which review.py also uses.
+DEFAULT_DEEP_JOB="deep-review"
+# The exit status of review.py stand-down when a review that should win makes this one redundant.
+STANDDOWN_EXIT=10
 # The private TMPDIR of the review step, which the EXIT trap removes.
 REVIEW_TMP=""
 # The scratch directory of the prepare step's git calls, which the EXIT trap removes.
@@ -178,6 +201,20 @@ default_image() {
         codex:podman) echo "$CODEX_RUNNER_IMAGE" ;;
         claude-code:openshell) echo "$CLAUDE_SANDBOX_IMAGE" ;;
         codex:openshell) echo "$CODEX_SANDBOX_IMAGE" ;;
+        *) return 1 ;;
+    esac
+}
+
+# The display name of the deep review job. An empty one is the input's default.
+deep_job_name() {
+    echo "${AI_REVIEW_DEEP_JOB:-$DEFAULT_DEEP_JOB}"
+}
+
+# The directory of the triage plan. Fails when RUNNER_TEMP is not an absolute path, so no caller
+# removes or writes a directory at the filesystem root.
+triage_dir() {
+    case "${RUNNER_TEMP:-}" in
+        /?*) echo "$RUNNER_TEMP/$TRIAGE_DIR_NAME" ;;
         *) return 1 ;;
     esac
 }
@@ -289,6 +326,75 @@ build_container_repo() {
     rm -rf -- "$repo/.git/FETCH_HEAD" "$repo/.git/logs"
 }
 
+# Run panel.py triage on the container repo for the deep-review recommendation, before any agent
+# has touched that repo, and keep its plan outside the mount for the post step. The triage reads
+# the PR's content, so it gets no token and none of the runner's environment: env -i, an empty
+# HOME, no git config but the overrides, and an isolated Python. It only advises, so a failure
+# warns, leaves no plan and lets prepare go on.
+run_triage() {
+    local base="$1" head="$2" repo="$AI_DIR/repo" dir
+    local no_line="so the summary will not recommend a deep review."
+    if ! dir="$(triage_dir)"; then
+        warning "RUNNER_TEMP is not set, $no_line"
+        return 0
+    fi
+    local panel="$GITHUB_ACTION_PATH/$PANEL_PY_REL" work="$PREPARE_TMP/triage"
+    if [ ! -f "$panel" ]; then
+        warning "$panel is missing, $no_line"
+        return 0
+    fi
+    mkdir "$work" "$work/home"
+    local triage_env=(
+        "PATH=$PATH"
+        "HOME=$work/home"
+        "XDG_CONFIG_HOME=$work/home/.config"
+        GIT_CONFIG_GLOBAL=/dev/null
+        GIT_CONFIG_NOSYSTEM=1
+        # The keys harden_git sets, and the repo as safe: on a root runner it can belong to
+        # another user.
+        GIT_CONFIG_COUNT=3
+        GIT_CONFIG_KEY_0=core.fsmonitor GIT_CONFIG_VALUE_0=false
+        GIT_CONFIG_KEY_1=core.hooksPath GIT_CONFIG_VALUE_1=/dev/null
+        GIT_CONFIG_KEY_2=safe.directory "GIT_CONFIG_VALUE_2=$repo"
+        PYTHONNOUSERSITE=1
+    )
+    [ -z "${LANG:-}" ] || triage_env+=("LANG=$LANG")
+    [ -z "${TZ:-}" ] || triage_env+=("TZ=$TZ")
+
+    # head keeps one byte past the limit, so an oversized plan shows as one and is dropped.
+    local status=0 size tier
+    timeout "$TRIAGE_TIMEOUT" env -i "${triage_env[@]}" \
+        python3 -I "$panel" triage --repo "$repo" --base "$base" --head "$head" \
+        </dev/null 2>/dev/null | head -c "$((MAX_PLAN_BYTES + 1))" >"$work/plan.json" \
+        || status=$?
+    size="$(wc -c <"$work/plan.json")"
+    if [ "$size" -gt "$MAX_PLAN_BYTES" ]; then
+        warning "The triage plan is over $MAX_PLAN_BYTES bytes, $no_line"
+        return 0
+    elif [ "$status" -eq 124 ]; then
+        warning "The triage did not finish within $TRIAGE_TIMEOUT, $no_line"
+        return 0
+    elif [ "$status" -ne 0 ]; then
+        warning "The triage failed (exit $status), $no_line"
+        return 0
+    fi
+    # Only the tier name is logged: the rest of the plan names the PR's files.
+    tier="$(env -i "PATH=$PATH" python3 -I -c 'import json, sys
+plan = json.load(open(sys.argv[1], encoding="utf-8"))
+tier = plan.get("tier") if isinstance(plan, dict) else None
+name = tier.get("name") if isinstance(tier, dict) else None
+print(name if isinstance(name, str) else "")' "$work/plan.json" 2>/dev/null)" || tier=""
+    if [[ ! "$tier" =~ ^[a-z]{1,20}$ ]]; then
+        warning "The triage printed no plan with a tier, $no_line"
+        return 0
+    fi
+    if ! { mkdir -m 700 -- "$dir" && mv -- "$work/plan.json" "$dir/plan.json"; }; then
+        warning "Could not keep the triage plan in $dir, $no_line"
+        return 0
+    fi
+    echo "Triage tier for the deep-review recommendation: $tier"
+}
+
 cmd_prepare() {
     require_workspace
     refuse_redirected_workdirs
@@ -317,6 +423,11 @@ cmd_prepare() {
     mkdir -p -- "$AI_DIR"
     rm -rf -- "$OUT_DIR" "$PLUGIN_DIR" "$AI_DIR/repo"
     rm -f -- "$DIFF_FILE" "$INSTRUCTIONS_FILE"
+    # A plan from an earlier run must not reach this run's summary.
+    local dir
+    if dir="$(triage_dir)"; then
+        rm -rf -- "$dir"
+    fi
     mkdir -p "$OUT_DIR" "$PLUGIN_DIR" "$AI_DIR/repo"
     # --text: the PR's .gitattributes must not mark files binary and hide their changes.
     # The prefixes and color are fixed so no runner-wide git config changes the format.
@@ -328,6 +439,10 @@ cmd_prepare() {
     # the PR's export-ignore.
     tar -C . --exclude=./.git -cf - . | tar -C "$AI_DIR/repo" -xf -
     build_container_repo "$base" "$head"
+    # Deep mode is the deep review, so it recommends nothing.
+    if [ "$REVIEW_MODE" = "standard" ] && is_on "${AI_REVIEW_RECOMMEND_DEEP:-}"; then
+        run_triage "$base" "$head"
+    fi
 
     # Claude Code loads this copy, not the registry copy in the image, which lacks the skill.
     # Codex takes no plugin directory: it loads the skill installed in its runner image.
@@ -683,6 +798,7 @@ cmd_post() {
     [ -n "${RUNNER_TEMP:-}" ] || error "RUNNER_TEMP is not set"
     local review_py="$GITHUB_ACTION_PATH/$REVIEW_PY_REL"
     [ -x "$review_py" ] || error "$review_py is missing or not executable"
+    require_mode
 
     # The mount is the one place the agent could write, so its output is untrusted: a
     # symlink there could point review.py at any file the runner can read.
@@ -706,9 +822,61 @@ cmd_post() {
     # What agentic-ci exports inside its sandbox, for the footer.
     export AGENT_TOOL="${AI_REVIEW_HARNESS:-codex}" AGENT_REASONING_EFFORT="$AGENT_EFFORT"
 
+    # With --mode, review.py checks again for a review that should win before it deletes old
+    # threads and before the summary, since one can start while this review runs.
+    local args=(post --platform github --mode "$REVIEW_MODE")
+    if [ "$REVIEW_MODE" = "standard" ]; then
+        args+=(--deep-job "$(deep_job_name)")
+        local dir plan
+        # Only prepare writes the plan, outside the mount. A link or anything but a file there
+        # was not written by it.
+        if is_on "${AI_REVIEW_RECOMMEND_DEEP:-}" && dir="$(triage_dir)"; then
+            plan="$dir/plan.json"
+            if [ ! -L "$dir" ] && [ -d "$dir" ] && [ ! -L "$plan" ] && [ -f "$plan" ]; then
+                args+=(--deep-recommendation-plan "$plan")
+            fi
+        fi
+    fi
+
     # uv must ignore config and .python-version files that arrive with the PR.
     UV_NO_CONFIG=1 UV_PYTHON="$(command -v python3)" \
-        "$review_py" post --platform github "$copy_dir/ai-review-output.json"
+        "$review_py" "${args[@]}" "$copy_dir/ai-review-output.json"
+}
+
+# Ask review.py whether a review that should win makes this one redundant, before any agent
+# starts: a deep review job of the same head for a standard review, or a newer head for a deep
+# review. review.py only reads, and a lookup it cannot make lets the review go ahead with a
+# warning. Any exit but 0 and 10 means a bad context, which fails the step.
+cmd_standdown() {
+    require_workspace
+    refuse_redirected_workdirs
+    [ -n "${GITHUB_ACTION_PATH:-}" ] || error "GITHUB_ACTION_PATH is not set"
+    local review_py="$GITHUB_ACTION_PATH/$REVIEW_PY_REL"
+    [ -x "$review_py" ] || error "$review_py is missing or not executable"
+    require_mode
+
+    local args=(stand-down --platform github --mode "$REVIEW_MODE")
+    if [ "$REVIEW_MODE" = "standard" ]; then
+        args+=(--deep-job "$(deep_job_name)")
+    fi
+
+    # The step runs in the checkout, whose git config is the PR's.
+    harden_git
+    local status=0
+    # uv must ignore config and .python-version files that arrive with the PR.
+    UV_NO_CONFIG=1 UV_PYTHON="$(command -v python3)" "$review_py" "${args[@]}" || status=$?
+    case "$status" in
+        0)
+            echo "stand_down=false" >>"${GITHUB_OUTPUT:-/dev/null}"
+            ;;
+        "$STANDDOWN_EXIT")
+            notice "Skipping the AI review: a review that should win makes this one redundant."
+            echo "stand_down=true" >>"${GITHUB_OUTPUT:-/dev/null}"
+            ;;
+        *)
+            error "Could not check for a review that should win (review.py exit $status)"
+            ;;
+    esac
 }
 
 # agentic-ci stops its container only when it exits normally. A SIGKILL (the timeout's kill
@@ -783,6 +951,11 @@ cmd_cleanup() {
         rm -rf -- "$HEAD_DIR" || failed=1
     fi
 
+    # rm does not follow a link given as the path itself.
+    if dir="$(triage_dir)"; then
+        rm -rf -- "$dir" || failed=1
+    fi
+
     # A review step that was killed before its trap ran leaves its private TMPDIR behind.
     if [ -n "${RUNNER_TEMP:-}" ]; then
         for dir in "$RUNNER_TEMP"/ai-review-tmp.*; do
@@ -799,11 +972,12 @@ main() {
     case "${1:-}" in
         check) cmd_check ;;
         prepare) cmd_prepare ;;
+        standdown) cmd_standdown ;;
         review) cmd_review ;;
         post) cmd_post ;;
         cleanup) cmd_cleanup ;;
         *)
-            echo "Usage: $0 {check|prepare|review|post|cleanup}" >&2
+            echo "Usage: $0 {check|prepare|standdown|review|post|cleanup}" >&2
             exit 2
             ;;
     esac
