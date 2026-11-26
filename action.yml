@@ -104,7 +104,8 @@ inputs:
       Token to post with instead of a minted App token or the workflow token,
       such as one the caller minted or a fine-grained personal access token.
       It needs pull requests and issues write, contents read and actions read.
-      Only the post step reads it. Set bot_login with it.
+      Only the post step holds it, and no App token is minted when it is set.
+      Set bot_login with it.
     required: false
     default: ''
   bot_login:
@@ -130,6 +131,9 @@ runs:
         AI_REVIEW_HARNESS: ${{ inputs.harness }}
         AI_REVIEW_MODE: ${{ inputs.mode }}
         AI_REVIEW_DRAFT: ${{ github.event.pull_request.draft }}
+        # The bot_login the post step will use, checked before the agent spends on the review.
+        # Only whether github_token is set reaches this step, never the token.
+        AI_REVIEW_BOT_LOGIN: ${{ inputs.github_token != '' && inputs.bot_login || '' }}
 
     - name: Check out the pull request head
       if: steps.check.outputs.skip != 'true'
@@ -203,10 +207,11 @@ runs:
 
     - name: Mint the posting token
       id: app-token
-      if: steps.check.outputs.skip != 'true' && steps.standdown.outputs.stand_down != 'true' && inputs.app_id != ''
+      if: steps.check.outputs.skip != 'true' && steps.standdown.outputs.stand_down != 'true' && inputs.app_id != '' && inputs.github_token == ''
       # After the review, so the agent never runs while the token exists. The token is masked,
       # scoped to this repository, and revoked when the job ends. A failed mint fails the job
-      # rather than posting under the workflow token's identity.
+      # rather than posting under the workflow token's identity. A caller's token wins, so no
+      # App token is minted next to it, and a mint that would fail cannot stop that token.
       uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
       with:
         client-id: ${{ inputs.app_id }}
@@ -229,6 +234,8 @@ runs:
         GITHUB_TOKEN: ${{ inputs.github_token || steps.app-token.outputs.token || github.token }}
         # The account the token posts as. Empty means github-actions[bot].
         AI_REVIEW_BOT_LOGIN: ${{ inputs.github_token != '' && inputs.bot_login || inputs.github_token == '' && steps.app-token.outputs.app-slug && format('{0}[bot]', steps.app-token.outputs.app-slug) || '' }}
+        # Only whether a caller token is set, so the step can warn about an empty bot_login.
+        AI_REVIEW_CALLER_TOKEN: ${{ inputs.github_token != '' }}
         CHILL_MODE: ${{ inputs.chill_mode }}
         INLINE_FIXES: ${{ inputs.inline_fixes }}
         AGENT_MODEL: ${{ inputs.model }}

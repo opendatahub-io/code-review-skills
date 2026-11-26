@@ -129,8 +129,7 @@ jobs:
     # The standard review finds this job by its name: keep it equal to deep_review_job.
     name: deep-review
     # When the deep-review label is added, and on later pushes while it is set. Never for a draft:
-    # a deep job that skipped a draft would still succeed, and the standard review would stand
-    # down for it.
+    # the action fails a deep review of a draft, which would show as a failed job.
     if: >-
       contains(github.event.pull_request.labels.*.name, 'deep-review') &&
       !github.event.pull_request.draft &&
@@ -160,7 +159,8 @@ What each part is for:
 - **Triggers.** Without `types:`, GitHub runs a `pull_request` workflow only for `opened`, `synchronize` and `reopened`. `ready_for_review` is needed because draft pull requests are skipped with a notice: it reviews the pull request once it is marked ready. `labeled` starts the deep review. Every label change starts a run, which the standard job skips. A label added by a workflow with the `GITHUB_TOKEN` starts no run at all, so a person or a GitHub App token must add `deep-review`. GitHub also starts no `pull_request` run while the pull request has a merge conflict.
 - **Permissions.** `pull-requests: write` and `issues: write` post the inline comments, the summary and the reviewer suggestions. `contents: read` covers the checkout. `actions: read` lets the standard review find the deep job of the same commit and stand down for it. Without it, on a private repository, the standard review warns and posts anyway.
 - **Concurrency.** The groups are set on the jobs, not the workflow. A new push cancels the outdated review of the same kind, a standard and a deep review never cancel each other, and a run that a job skips gets a `noop` group of its own, so an unrelated label cannot cancel a review in flight. A workflow-level group would: every label change starts a run.
-- **The deep job's `if:`.** It skips drafts itself rather than leaving that to the action. The action would skip a draft too, but that run would end in success, and a later standard review of the same commit would take it for a finished deep review and stand down with nothing posted. A job skipped by `if:` never counts.
+- **The deep job's `if:`.** It skips drafts itself rather than leaving that to the action. In deep mode the action fails on a draft instead of skipping it: a skipped run would end in success, and a later standard review of the same commit would take it for a finished deep review and stand down with nothing posted. A failed deep job, or one skipped by `if:`, never counts, but the `if:` keeps a failed job off the pull request.
+- **The deep job's credentials.** Give the deep job the same model credentials as the standard job. A deep job without one fails with an error rather than skipping with a notice, for the same reason as a draft, so a missing secret shows as a failed job instead of passing silently. The standard review of that push can still stand down while the deep job is starting, so fix the secret and push again.
 - **The deep job's name.** The standard review finds the deep job by its display name, which the `deep_review_job` input gives (`deep-review` by default). Keep the job's `name:` and that input equal, and keep the label called `deep-review`: the deep review recommendation in the summary tells people to add exactly that label.
 - **Timeouts.** A composite action cannot bound itself, so the jobs do: 45 minutes for the standard review (20 agent minutes by default) and 120 for the deep one (75 agent minutes). The rest covers the image pulls, about a minute in practice and at most 15 minutes each, and the checkout. When you raise `timeout_minutes`, raise the job's `timeout-minutes` with it.
 - **No checkout step.** The action checks out the pull request head itself.
@@ -190,12 +190,12 @@ To run Claude Code instead of Codex, set the harness and its credential in both 
 For Vertex, set `GCP_SERVICE_ACCOUNT_KEY` (a service account key, inline JSON or base64) or `GCLOUD_CREDENTIALS`, plus `ANTHROPIC_VERTEX_PROJECT_ID` (or `GCP_PROJECT_ID`) and, when it is not `global`, `CLOUD_ML_REGION`. `CLAUDE_CODE_USE_VERTEX=1` on its own also works when application default credentials exist as a file: `GOOGLE_APPLICATION_CREDENTIALS`, or the well-known `application_default_credentials.json` that `gcloud auth application-default login` writes. How each backend gets the credentials:
 
 - `backend: openshell` passes each credential into the container as `-e NAME`, so no value is on a command line. A credential file is not in the container, so the review step reads it on the runner (`GCP_SERVICE_ACCOUNT_KEY` naming a file, `GOOGLE_APPLICATION_CREDENTIALS`, or the well-known file under `CLOUDSDK_CONFIG` or `~/.config/gcloud`, in that order) and passes its content as `GCLOUD_CREDENTIALS`. Service account keys and `gcloud` user credentials work. With `CLAUDE_CODE_USE_VERTEX=1` and no such file, the step fails before pulling anything.
-- `backend: podman` runs agentic-ci on the runner, which reads the variables and files itself.
+- `backend: podman` runs agentic-ci on the runner, which reads the variables and files itself. Its order differs for application default credentials: openshell gives `GOOGLE_APPLICATION_CREDENTIALS` precedence over the well-known file, while podman reads the well-known file under `~/.config/gcloud` first (it ignores `CLOUDSDK_CONFIG`) and falls back to `GOOGLE_APPLICATION_CREDENTIALS` when that file is missing. On a runner with both, the two backends can pick different credentials.
 - Neither backend supports Workload Identity Federation credentials (from `google-github-actions/auth`) or the GCE metadata server, so `GCP_SERVICE_ACCOUNT_KEY` and `GCLOUD_CREDENTIALS` are the portable options. Bedrock is not supported.
 
-A run without a credential for its harness exits 0 with a notice and posts nothing.
+A standard review without a credential for its harness exits 0 with a notice and posts nothing. A deep review without one fails, so that the standard review of the same commit does not stand down for it.
 
-Codex has no plugin flag, so it does not load the action's own copy of the skills: it loads `github-code-review` (and `code-review-panel` in deep mode) from the skills-registry copy installed in its image. The image must be a build that already includes `github-code-review`: the first agentic-ci release after 0.5.15, or a `:latest` built after 2026-11-25, when code-review-skills commit `ac21ab6` added it. An older image cannot find the skill, and the run fails with "produced no output". The image, not the action, then decides which skill revision runs, so pin the image by digest. Claude Code loads the skills from the action's own copy, so it does not depend on which skills its image ships.
+Codex has no plugin flag, so it does not load the action's own copy of the skills: it loads `github-code-review` (and `code-review-panel` in deep mode) from the skills-registry copy installed in its image. The image must be a build that already includes `github-code-review`: the first agentic-ci release after 0.5.15, or a `:latest` built after 2026-11-25, when code-review-skills commit `ac21ab6` added it. An older image cannot find the skill, and the run fails with "produced no output" and a hint that names the `image` input. The image, not the action, then decides which skill revision runs, so pin the image by digest. Claude Code loads the skills from the action's own copy, so it does not depend on which skills its image ships.
 
 ### Inputs
 
@@ -217,7 +217,7 @@ Codex has no plugin flag, so it does not load the action's own copy of the skill
 | `app_id` | -- | App ID or Client ID of a GitHub App to post as (see [Posting identity](#posting-identity)). Empty posts with the workflow token. |
 | `app_private_key` | -- | Private key of that App. Pass it from a secret. |
 | `github_token` | -- | A token to post with instead, such as one you minted or a fine-grained personal access token (see [Posting identity](#posting-identity)). |
-| `bot_login` | -- | The login `github_token` posts as: `<app-slug>[bot]` for an App token, or the user's login for a personal access token. Read only with `github_token`. |
+| `bot_login` | -- | The login `github_token` posts as: `<app-slug>[bot]` for an App token, or the user's login for a personal access token. Read only with `github_token`. A value that is neither fails the job before the review runs. |
 
 ### Backends
 
@@ -235,11 +235,11 @@ Codex has no plugin flag, so it does not load the action's own copy of the skill
 
 The repository that runs the workflow always provides the token the review posts with. The post step uses the first of these that is set:
 
-1. `github_token`: a token you minted yourself, or a fine-grained personal access token with pull requests and issues write, contents read and actions read. Set `bot_login` to the account it posts as. A personal access token is long-lived and acts as a person, and the action treats any comment by that user that ends with the review marker as its own, so use a dedicated machine account. The token is referenced only in the post step's environment.
+1. `github_token`: a token you minted yourself, or a fine-grained personal access token with pull requests and issues write, contents read and actions read. Set `bot_login` to the account it posts as. A personal access token is long-lived and acts as a person, and the action treats any comment by that user that ends with the review marker as its own, so use a dedicated machine account. Only the post step's environment holds the token. Without `bot_login` the post step warns: the review would take `github-actions[bot]` for its own account, so it could not find its summary to update or its old threads to clean up.
 2. `app_id` and `app_private_key`, from the repository's (or the organization's) secrets: after the review finishes, the action mints a token for this repository only, with pull requests and issues write, contents read and actions read, and the review appears as `<app-slug>[bot]`. Only the minting step reads the key, and the review step never sees the key or the token. A mint that fails (the App is not installed on the repository, or the key is wrong) fails the job instead of posting as `github-actions[bot]`.
 3. The job's `github.token`, the default: reviews appear as `github-actions[bot]`. Nothing to set up.
 
-Set either `github_token` or the App inputs, not both. Comments that `github-actions[bot]` posted before a switch still count as the review's own. The check for a deep review before the agent starts always uses `github.token`, so the job still needs `actions: read`. See [docs/github-app.md](docs/github-app.md) for creating the App, storing its key, and the identity change.
+Set either `github_token` or the App inputs, not both. With both, `github_token` wins and no App token is minted. Comments that `github-actions[bot]` posted before a switch still count as the review's own. The check for a deep review before the agent starts always uses `github.token`, so the job still needs `actions: read`. See [docs/github-app.md](docs/github-app.md) for creating the App, storing its key, and the identity change.
 
 ### Many repositories
 
@@ -338,7 +338,7 @@ The panel writes the same review JSON, and the post step validates and posts it 
 
 On a push while the label is set, both jobs run in the same workflow run: the standard review sees the deep job queued and stands down before its agent starts.
 
-The checks fail open. The standard review finds the deep job through the Actions API, so its job needs `actions: read`. When the API refuses the call (for example on a private repository without `actions: read`) or cannot answer, the review warns once, names the permission, and goes ahead as if there were no deep review, so it may then replace a deep review's comments. The deep review's own check reads only the pull request.
+The checks fail open. The standard review finds the deep job through the Actions API, so its job needs `actions: read`. When the API refuses the call (for example on a private repository without `actions: read`) or cannot answer, the review warns, names the permission, and goes ahead as if there were no deep review, so it may then replace a deep review's comments. The warning repeats each time the check runs, so a standard review can log it up to three times: before the agent starts, before it deletes old threads and before it writes the summary. The deep review's own check reads only the pull request.
 
 `deep_review_job` is the deep job's display name as GitHub shows it: its `name:` when it sets one, otherwise its job key (`deep-review` in the [Setup](#setup) workflow). With `name: Deep review`, set `deep_review_job: Deep review` in the standard job's `with:`. When the deep job calls a reusable workflow, use the calling job's name: GitHub lists the called jobs as `<caller> / <job>`. A matrix job matches as `<name> (<values>)`. The match is exact and case sensitive, so a name that is only a prefix or a suffix of another job's name does not match it. A wrong name means the standard review never finds the deep one: both post, and whichever finishes last replaces the other.
 
@@ -356,7 +356,7 @@ To act on it, add the `deep-review` label. The deep job starts from that `labele
 
 ### Reviewer suggestions
 
-With `suggest_reviewers: 'true'`, a standard review that posted then comments once on the pull request with up to five reviewers, @mentioned so they are notified. They are the most frequent authors in the base branch's history of the files the pull request changes, leaving out the pull request's author, bots and accounts not linked to a GitHub user. A run that finds that comment already posted adds none, so each pull request gets one. A suggestion that fails only warns and never fails the step. It reads the history through the GraphQL API, which needs `contents: read`.
+With `suggest_reviewers: 'true'`, a standard review that posted then comments once on the pull request with up to five reviewers, @mentioned so they are notified. They are the most frequent authors in the base branch's history of the files the pull request changes, leaving out the pull request's author, bots and accounts not linked to a GitHub user. A review that stands down or finds that the pull request moved to a newer commit posts nothing, so it suggests nobody either. A run that finds that comment already posted adds none, so each pull request gets one. A suggestion that fails only warns and never fails the step. It reads the history through the GraphQL API, which needs `contents: read`.
 
 ### What the agent sees
 
@@ -374,7 +374,7 @@ Changes that existing workflows notice:
 - **Codex is the default harness.** A workflow that sets only `ANTHROPIC_API_KEY` (or another Claude Code credential) now gets a notice that `OPENAI_API_KEY` is not set and posts nothing, until it sets `harness: claude-code`.
 - **OpenShell is the default backend.** It needs docker with privileged containers. Runners without it set `backend: podman`.
 - **Codex needs a newer image.** Until the first agentic-ci release after 0.5.15, the codex images ship `github-code-review` only in `:latest` builds after 2026-11-25 (see [Credentials](#credentials)).
-- **Draft pull requests are skipped.** Add `ready_for_review` to `types:`, or a draft is never reviewed once it is marked ready.
+- **Draft pull requests are skipped.** Add `ready_for_review` to `types:`, or a draft is never reviewed once it is marked ready. In deep mode a draft, or a missing model credential, fails the job instead: keep drafts out with the deep job's `if:`.
 - **Stand-down needs `actions: read`.** Without it, on a private repository, a standard review warns and posts even while a deep review runs.
 - **The agent sees git history.** Its copy of the repository now has a credential-free `.git` with the history of the base and the head. The skill contract and the review JSON are unchanged.
 - **Default images** are the `*-sandbox` images with `backend: openshell` and the `*-runner` images with `backend: podman`.

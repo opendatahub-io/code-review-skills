@@ -40,7 +40,8 @@ Environment variables (for 'post --platform github', which is never auto-detecte
   GITHUB_SERVER_URL             Server URL, for the run link in the footer (optional)
   GITHUB_RUN_ID                 Run ID, for the run link in the footer (optional)
   RUNNER_NAME                   Runner of this job; with GITHUB_RUN_ID, keeps the
-                                stand-down check from matching its own job (optional)
+                                stand-down check from matching its own running job
+                                (optional)
   AI_REVIEW_BOT_LOGIN           Account GITHUB_TOKEN posts as, when it is not
                                 github-actions[bot]: a GitHub App's <slug>[bot], or
                                 the user login behind a personal access token
@@ -53,6 +54,7 @@ Usage:
   review.py post review.json [--chill|--no-chill] [--inline-fixes|--no-inline-fixes] [--verbose]
   review.py post review.json --platform github [--deep-recommendation-plan PATH]
                                [--mode standard|deep] [--deep-job NAME]
+                               [--posted-flag PATH]
   review.py stand-down --platform github --mode standard|deep [--deep-job NAME]
   review.py display review.json [--chill|--no-chill] [--inline-fixes|--no-inline-fixes]
   review.py suggest-reviewers [--verbose]
@@ -1222,8 +1224,9 @@ def _github_paginated_get(
 
     Follows ``Link: rel="next"`` only when it stays on the API host over
     https, so the token never goes anywhere else. Raises requests.HTTPError
-    when the first page fails, or any page when ``strict`` is set: a caller
-    that looks for the newest item cannot work from a truncated list.
+    when the first page fails or is not a JSON list, or any page when
+    ``strict`` is set: a caller that looks for the newest item cannot work
+    from a truncated list.
     """
     api_netloc = urlparse(ctx.api_url).netloc
     results: list[Any] = []
@@ -1238,7 +1241,14 @@ def _github_paginated_get(
                 raise requests.exceptions.HTTPError(f"GitHub API returned HTTP {resp.status_code}")
             _warning(f"GitHub API returned HTTP {resp.status_code} during pagination")
             break
-        results.extend(resp.json())
+        page = resp.json()
+        if not isinstance(page, list):
+            # extend() would raise on null or a number, and walk the keys of an object.
+            if first_page or strict:
+                raise requests.exceptions.HTTPError("GitHub API returned a page that is not a list")
+            _warning("GitHub API returned a page that is not a list during pagination")
+            break
+        results.extend(page)
         first_page = False
         m = _GITHUB_NEXT_LINK_RE.search(resp.headers.get("Link", ""))
         if not m:
@@ -1278,23 +1288,29 @@ def _github_find_summary(
 
     Lists sort ascending, so the last match is the newest. A comment is ours
     only when one of our accounts wrote it and its body ends with the marker.
-    The SHA comes from our newest summary, whichever account wrote it. The id
-    is that of the newest summary the current account wrote: editing one of
-    another account would keep that account as its author.
+    The id is that of the newest summary the current account wrote: editing
+    one of another account would keep that account as its author. The SHA
+    comes from that same summary, since every later run updates it, else from
+    our newest summary of either account. Taking it from a newer summary of
+    the other account would pin dedup to that summary's SHA for good.
     """
     current, known = _github_identities()
     comment_id: int | None = None
-    sha: str | None = None
+    current_sha: str | None = None
+    newest_sha: str | None = None
     url = f"{ctx.repo_url}/issues/{ctx.number}/comments"
     for comment in _github_paginated_get(session, ctx, url, strict=True):
+        if not isinstance(comment, dict):
+            continue
         marker = _github_trailing_marker(comment.get("body"))
         user = comment.get("user")
         if not marker or not any(identity.wrote_rest(user) for identity in known):
             continue
-        sha = marker.group(1)
+        newest_sha = marker.group(1)
         if current.wrote_rest(user):
             comment_id = comment["id"]
-    return comment_id, sha
+            current_sha = marker.group(1)
+    return comment_id, current_sha or newest_sha
 
 
 def _github_thread_covers_dropped(thread: dict[str, Any], dropped: set[tuple[str, int]]) -> bool:
@@ -1581,8 +1597,10 @@ def _github_find_deep_review(
     """Return a deep review job for this head that started or succeeded, else None.
 
     The current run counts, since a push can start both reviews in one run.
-    Only the job running this check is skipped: same run and same runner, so a
-    deep job name that also matches the standard job cannot block it forever.
+    Only the job running this check is skipped: same run, same runner and still
+    in progress, so a deep job name that also matches the standard job cannot
+    block it forever. A self-hosted runner keeps its name from job to job, so a
+    deep job that already finished on it in this run still counts.
     """
     budget = _GitHubBudget(_STANDDOWN_MAX_CALLS)
     own_run = os.environ.get("GITHUB_RUN_ID", "")
@@ -1620,13 +1638,20 @@ def _github_find_deep_review(
             for job in items:
                 if not isinstance(job, dict):
                     continue
-                if own and job.get("runner_name") == own_runner:
+                if (
+                    own
+                    and job.get("runner_name") == own_runner
+                    and job.get("status") == "in_progress"
+                ):
                     continue
                 if not _github_deep_job_matches(job.get("name"), deep_job):
                     continue
                 if job.get("head_sha") and job.get("head_sha") != ctx.head_sha:
                     continue
                 status = job.get("status")
+                if status is not None and not isinstance(status, str):
+                    # A list or object is not hashable, so the set lookup would raise.
+                    raise _GitHubLookupError("unexpected job status")
                 if status in _GITHUB_JOB_STARTED or (
                     status == "completed" and job.get("conclusion") == "success"
                 ):
@@ -1689,10 +1714,15 @@ def _github_stands_down(
     try:
         job = _github_find_deep_review(session, ctx, deep_job)
     except _GitHubLookupError as e:
+        # Only a refused lookup points at the permission.
+        hint = (
+            "grant the job 'actions: read' so the standard review can stand down for one"
+            if str(e) in ("HTTP 403", "HTTP 404")
+            else "the lookup failed"
+        )
         _github_annotation(
             "warning",
-            f"Could not check for a deep review ({e}); grant the job 'actions: read' "
-            "so the standard review can stand down for one. Continuing without the check.",
+            f"Could not check for a deep review ({e}); {hint}. Continuing without the check.",
         )
         return False
     except _GitHubBudgetError:
@@ -1880,7 +1910,8 @@ def _github_read_plan(path: str) -> dict[str, Any] | None:
             else:
                 try:
                     # json.loads would also take UTF-16 and UTF-32 bytes; panel.py writes UTF-8.
-                    plan = json.loads(raw.decode("utf-8"))
+                    # utf-8-sig still accepts a UTF-8 plan that starts with a BOM.
+                    plan = json.loads(raw.decode("utf-8-sig"))
                 except (ValueError, RecursionError):
                     reason = "is not valid JSON"
                 else:
@@ -2150,12 +2181,23 @@ def _github_upsert_summary(
     return False
 
 
+def _github_mark_posted(path: str) -> None:
+    """Create the --posted-flag file. A failure only warns: the review itself is posted."""
+    try:
+        Path(path).write_text("posted\n", encoding="utf-8")
+    except OSError as e:
+        _warning(f"Could not write the posted flag ({type(e).__name__})")
+
+
 def _github_post(args: argparse.Namespace) -> None:
     """Post review results to the GitHub pull request named by the Actions event."""
     ctx = _github_load_context()
     # Without --mode nothing checks for a review that should win, as before.
     mode = getattr(args, "mode", None)
     deep_job = _github_deep_job(getattr(args, "deep_job", None))
+    # Written only once the summary is up, so a caller can tell a review that posted from
+    # one that stood down or found the head moved, which both exit 0.
+    posted_flag = getattr(args, "posted_flag", None)
     verbose = _resolve_verbose(args)
     chill = _resolve_chill(args)
     inline_fixes = _resolve_inline_fixes(args)
@@ -2266,6 +2308,8 @@ def _github_post(args: argparse.Namespace) -> None:
             return
         if _github_upsert_summary(session, ctx, summary_body, summary_id, verbose=verbose):
             _success(f"Summary posted to pull request #{ctx.number}")
+            if posted_flag is not None:
+                _github_mark_posted(posted_flag)
         else:
             _error("Failed to post summary comment")
             sys.exit(1)
@@ -2941,6 +2985,14 @@ def main() -> None:
             "needs --platform github)"
         ),
     )
+    post_parser.add_argument(
+        "--posted-flag",
+        metavar="PATH",
+        help=(
+            "create this file once the summary is posted, and not when the review stands "
+            "down or the head moved (needs --platform github)"
+        ),
+    )
     post_parser.add_argument("--verbose", action="store_true", help="Verbose output")
     post_parser.set_defaults(func=cmd_post)
 
@@ -2985,6 +3037,7 @@ def main() -> None:
             ("--deep-recommendation-plan", args.deep_recommendation_plan),
             ("--mode", args.mode),
             ("--deep-job", args.deep_job),
+            ("--posted-flag", args.posted_flag),
         ):
             if value is not None:
                 post_parser.error(f"{flag} needs --platform github")

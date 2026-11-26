@@ -3,6 +3,8 @@
 The pull request lives in a throwaway git repository; the GitHub API is a recording fake.
 """
 
+import contextlib
+import io
 import json
 import os
 import re
@@ -394,6 +396,23 @@ class FailureTests(SuggestTestCase):
                 code, out, err = self.suggest(fake)
                 self.assert_skipped_with_warning(code, out, err, fake)
 
+    def test_a_comments_page_that_is_not_a_list_warns_and_exits_0(self):
+        # An object page must not count as a list of its keys, or a second comment could post.
+        link = f'<{COMMENTS}?page=2>; rel="next"'
+        cases = {
+            "null": [(None, "")],
+            "number": [(3, "")],
+            "object": [({"body": MARKER, "user": OURS_REST}, "")],
+            "object on page 2": [([], link), ({"id": 1}, "")],
+        }
+        for name, pages in cases.items():
+            with self.subTest(name):
+                fake = HistoryGitHub({"keep.py": many(carol=1)}, comment_pages=pages)
+                code, out, err = self.suggest(fake)
+                self.assert_skipped_with_warning(code, out, err, fake)
+                self.assertIn("not a list", out)
+                self.assertEqual(fake.history_calls(), [])
+
     def test_failed_comment_post_warns_and_exits_0(self):
         for status in (403, 422, 500, 302):
             with self.subTest(status):
@@ -443,6 +462,29 @@ class FailureTests(SuggestTestCase):
                 self.assertEqual(code, 1)
                 self.assertEqual(fake.calls, [])
                 self.assertNotIn(TOKEN, out + err)
+
+
+class PageShapeTests(GitHubTestCase):
+    def test_a_later_page_that_is_not_a_list_ends_a_lenient_read(self):
+        url = f"{REPO_URL}/issues/7/comments"
+        link = f'<{url}?page=2>; rel="next"'
+        fake = FakeGitHub(comment_pages=[([comment(1, "a")], link), ({"id": 2}, "")])
+        with patch.dict(os.environ, self.env(), clear=True):
+            ctx = review._github_load_context()
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            results = review._github_paginated_get(fake, ctx, url)
+        self.assertEqual([c["id"] for c in results], [1])
+        self.assertIn("not a list", err.getvalue())
+
+    def test_a_first_page_that_is_not_a_list_raises(self):
+        url = f"{REPO_URL}/issues/7/comments"
+        with patch.dict(os.environ, self.env(), clear=True):
+            ctx = review._github_load_context()
+        for data in (None, 3, {"id": 1}, "text"):
+            with self.subTest(data=data):
+                fake = FakeGitHub(comment_pages=[(data, "")])
+                with self.assertRaises(requests_stub.exceptions.HTTPError):
+                    review._github_paginated_get(fake, ctx, url)
 
 
 class CliTests(SuggestTestCase):

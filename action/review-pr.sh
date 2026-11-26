@@ -26,7 +26,9 @@
 #   AI_REVIEW_RECOMMEND_DEEP      recommend_deep_review input (prepare, post)
 #   AI_REVIEW_SUGGEST_REVIEWERS   suggest_reviewers input (post)
 #   AI_REVIEW_BOT_LOGIN           account the post token belongs to, empty for
-#                                 github-actions[bot] (post, read by review.py)
+#                                 github-actions[bot] (check validates the bot_login input,
+#                                 post passes it to review.py); never the token
+#   AI_REVIEW_CALLER_TOKEN        whether the github_token input is set, never the token (post)
 #   AI_REVIEW_DRAFT               pull_request.draft (check)
 #   AI_REVIEW_BACKEND             backend input: openshell or podman (review, cleanup)
 #   AI_REVIEW_BASE_SHA            pull_request.base.sha (prepare, review)
@@ -39,8 +41,8 @@
 #   GITHUB_OUTPUT, GITHUB_REPOSITORY, GITHUB_WORKSPACE, GITHUB_ACTION_PATH, GITHUB_RUN_ID,
 #   GITHUB_RUN_ATTEMPT:           set by the runner
 #   RUNNER_TEMP                   set by the runner (review: parent of the agent's private TMPDIR,
-#                                 post: parent of the copy of the output, prepare and post: parent
-#                                 of the triage plan)
+#                                 post: parent of the copy of the output and of the flag that the
+#                                 summary was posted, prepare and post: parent of the triage plan)
 #   GITHUB_TOKEN                  github.token (standdown); the github_token input, else a
 #                                 minted App token, else github.token (post); no other step
 #                                 gets one
@@ -237,6 +239,26 @@ require_git_version() {
     fi
 }
 
+# Fail on a bot_login that review.py would reject in the post step, before any agent spends on
+# the review. The patterns are review.py's _GITHUB_APP_LOGIN_RE and _GITHUB_USER_LOGIN_RE: an
+# App's <slug>[bot], or a user login of 1 to 39 alphanumerics and single inner hyphens.
+require_bot_login() {
+    # Plain ASCII ranges, whatever the runner's locale.
+    local LC_ALL=C
+    local login="${AI_REVIEW_BOT_LOGIN:-}"
+    [ -n "$login" ] || return 0
+    if [[ "$login" =~ ^[a-z0-9][a-z0-9_-]{0,62}\[bot\]$ ]]; then
+        return 0
+    fi
+    if [ "${#login}" -le 39 ] && [[ "$login" =~ ^[A-Za-z0-9](-?[A-Za-z0-9])*$ ]]; then
+        return 0
+    fi
+    # Only printable characters are shown, so the value cannot start a workflow command.
+    local shown="${login:0:80}"
+    shown="${shown//[^[:alnum:][:punct:] ]/?}"
+    error "bot_login must be a GitHub App bot login like my-app[bot] or a GitHub user login, got: '$shown'"
+}
+
 # Whether the job environment carries a credential agentic-ci can use for the harness.
 # The keys are agentic-ci's, not the action's: it reads them from the environment.
 has_harness_credentials() {
@@ -264,14 +286,19 @@ cmd_check() {
         error "This action only supports the pull_request event, got '${AI_REVIEW_EVENT:-}'. Do not use pull_request_target: it runs with write access on code from forks."
     fi
     require_mode
+    require_bot_login
 
-    if [ "${AI_REVIEW_DRAFT:-}" = "true" ]; then
-        skip_reason="the pull request is a draft. Marking it ready for review runs the review"
-    elif [ -z "${AI_REVIEW_HEAD_REPO:-}" ] || [ "${AI_REVIEW_HEAD_REPO}" != "${GITHUB_REPOSITORY:-}" ]; then
+    # Forks and Dependabot come first: their runs get no secrets, so they skip in every mode.
+    local fail_in_deep=""
+    if [ -z "${AI_REVIEW_HEAD_REPO:-}" ] || [ "${AI_REVIEW_HEAD_REPO}" != "${GITHUB_REPOSITORY:-}" ]; then
         skip_reason="the pull request comes from a fork, where the workflow has no secrets and a read-only token"
     elif [ "$actor" = "dependabot[bot]" ] || [ "$triggering" = "dependabot[bot]" ]; then
         skip_reason="the run was triggered by Dependabot, which gets no secrets and a read-only token"
+    elif [ "${AI_REVIEW_DRAFT:-}" = "true" ]; then
+        skip_reason="the pull request is a draft. Marking it ready for review runs the review"
+        fail_in_deep=1
     elif ! has_harness_credentials "$harness"; then
+        fail_in_deep=1
         case "$harness" in
             codex)
                 skip_reason="OPENAI_API_KEY is not set, which the codex harness needs"
@@ -280,6 +307,13 @@ cmd_check() {
                 skip_reason="none of ANTHROPIC_API_KEY, CLAUDE_CODE_OAUTH_TOKEN, CLAUDE_CODE_USE_VERTEX, GCLOUD_CREDENTIALS or GCP_SERVICE_ACCOUNT_KEY is set, which the claude-code harness needs"
                 ;;
         esac
+    fi
+
+    # A deep job that skips still succeeds, and a standard review of the same head takes a
+    # successful deep job for a posted deep review and stands down: nothing would be posted.
+    # A failed deep job does not count, so these fail instead.
+    if [ -n "$fail_in_deep" ] && [ "$REVIEW_MODE" = "deep" ]; then
+        error "The deep review cannot run: $skip_reason. Failing rather than skipping, so the standard review of this commit does not stand down for a deep review that posted nothing."
     fi
 
     if [ -n "$skip_reason" ]; then
@@ -758,8 +792,17 @@ cmd_review() {
     fi
     [ "$AGENT_STATUS" -eq 0 ] || exit "$AGENT_STATUS"
 
-    # The run can exit 0 when the agent wrote nothing.
-    [ -s "$OUT" ] || error "The review produced no output at $OUT"
+    # The run can exit 0 when the agent wrote nothing. Codex loads its skills from the image,
+    # so an image without them is the usual cause.
+    if [ ! -s "$OUT" ]; then
+        local hint=""
+        if [ "$harness" = "codex" ]; then
+            local skills="github-code-review"
+            [ "$REVIEW_MODE" != "deep" ] || skills="github-code-review and code-review-panel"
+            hint=". The codex harness loads its skills from the image, which must ship $skills: set the image input to a build that does (see Credentials in the README)"
+        fi
+        error "The review produced no output at $OUT$hint"
+    fi
 }
 
 # Run the agent with the podman backend: agentic-ci runs on the runner through uvx and starts the
@@ -805,6 +848,12 @@ cmd_post() {
     [ -x "$review_py" ] || error "$review_py is missing or not executable"
     require_mode
 
+    # review.py would take github-actions[bot] for its own account, while the token posts as
+    # another one: the summary is not found to update in place and old threads are not its own.
+    if is_on "${AI_REVIEW_CALLER_TOKEN:-}" && [ -z "${AI_REVIEW_BOT_LOGIN:-}" ]; then
+        warning "github_token is set but bot_login is empty, so the review cannot recognize its own earlier comments. Set bot_login to the login the token posts as."
+    fi
+
     # The mount is the one place the agent could write, so its output is untrusted: a
     # symlink there could point review.py at any file the runner can read.
     [ ! -L "$OUT_DIR" ] || error "$OUT_DIR is a symlink, so nothing was posted"
@@ -830,8 +879,17 @@ cmd_post() {
     # With --mode, review.py checks again for a review that should win before it deletes old
     # threads and before the summary, since one can start while this review runs.
     local args=(post --platform github --mode "$REVIEW_MODE")
+    # review.py exits 0 without posting when the head moved or the review stood down. It creates
+    # this file only once the summary is up, outside the mount, and suggestions follow only then.
+    local suggest="" posted_flag="$copy_dir/posted"
+    if [ "$REVIEW_MODE" = "standard" ] && is_on "${AI_REVIEW_SUGGEST_REVIEWERS:-}"; then
+        suggest=1
+        rm -f -- "$posted_flag"
+        args+=(--posted-flag "$posted_flag")
+    fi
     if [ "$REVIEW_MODE" = "standard" ]; then
-        args+=(--deep-job "$(deep_job_name)")
+        # One argument, so argparse never takes a job name that starts with '-' for a flag.
+        args+=("--deep-job=$(deep_job_name)")
         local dir plan
         # Only prepare writes the plan, outside the mount. A link or anything but a file there
         # was not written by it.
@@ -850,7 +908,7 @@ cmd_post() {
     [ "$status" -eq 0 ] || exit "$status"
 
     # Suggestions only follow a review that posted, and never decide the step's status.
-    if [ "$REVIEW_MODE" = "standard" ] && is_on "${AI_REVIEW_SUGGEST_REVIEWERS:-}"; then
+    if [ -n "$suggest" ] && [ ! -L "$posted_flag" ] && [ -f "$posted_flag" ]; then
         UV_NO_CONFIG=1 UV_PYTHON="$(command -v python3)" \
             "$review_py" suggest-reviewers --platform github || status=$?
         [ "$status" -eq 0 ] || warning "Could not suggest reviewers (review.py exit $status)"
@@ -871,7 +929,8 @@ cmd_standdown() {
 
     local args=(stand-down --platform github --mode "$REVIEW_MODE")
     if [ "$REVIEW_MODE" = "standard" ]; then
-        args+=(--deep-job "$(deep_job_name)")
+        # One argument, so argparse never takes a job name that starts with '-' for a flag.
+        args+=("--deep-job=$(deep_job_name)")
     fi
 
     # The step runs in the checkout, whose git config is the PR's.
@@ -911,9 +970,27 @@ remove_review_containers() {
     return "$failed"
 }
 
-# Whether this run used the openshell backend and docker is there to clean up after it.
+# Whether this run used the openshell backend and docker is there to clean up after it. A docker
+# CLI whose daemon cannot be reached (none running, or a user outside the docker group) ran no
+# container of this run, so there is nothing to clean: skipped runs must not fail on it.
+# Asked once per cleanup and cached: a hung daemon would otherwise cost the bound twice.
+OPENSHELL_DOCKER=""
 uses_openshell_docker() {
-    [ "${AI_REVIEW_BACKEND:-openshell}" != "podman" ] && command -v docker >/dev/null 2>&1
+    if [ -z "$OPENSHELL_DOCKER" ]; then
+        OPENSHELL_DOCKER=no
+        if [ "${AI_REVIEW_BACKEND:-openshell}" != "podman" ] && command -v docker >/dev/null 2>&1; then
+            local status=0
+            timeout 1m docker info >/dev/null 2>&1 || status=$?
+            if [ "$status" -eq 0 ]; then
+                OPENSHELL_DOCKER=yes
+            elif [ "$status" -eq 124 ]; then
+                # A daemon that refuses the connection ran nothing, but one that hangs may still run
+                # a container from a killed review, with the model credentials in its config.
+                warning "The docker daemon did not answer within a minute, so a review container left by a killed run may still be running. Check the runner."
+            fi
+        fi
+    fi
+    [ "$OPENSHELL_DOCKER" = yes ]
 }
 
 # The openshell backend's containers and its storage volume carry this workdir's label. After a
@@ -936,7 +1013,9 @@ remove_docker_leftovers() {
 }
 
 # A review step killed before its own chown leaves root's files in AI_DIR, which the runner user
-# cannot remove. The openshell image gives them back, when the run pulled it.
+# cannot remove. The openshell image gives them back, when the run pulled it. There is no sudo
+# fallback for a missing image: only containers of that image write root's files here, so a run
+# that left them has it, and a root chown over a tree the agent wrote is not worth the risk.
 give_back_workdir() {
     uses_openshell_docker || return 1
     local version="${AI_REVIEW_AGENTIC_CI_VERSION:-}"

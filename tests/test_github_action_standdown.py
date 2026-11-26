@@ -185,8 +185,7 @@ class StanddownTests(FakeReviewPyMixin, ScriptTestCase):
                 "github",
                 "--mode",
                 "standard",
-                "--deep-job",
-                "Deep review / panel",
+                "--deep-job=Deep review / panel",
             ],
         )
 
@@ -200,8 +199,7 @@ class StanddownTests(FakeReviewPyMixin, ScriptTestCase):
                 "github",
                 "--mode",
                 "standard",
-                "--deep-job",
-                "deep-review",
+                "--deep-job=deep-review",
             ],
         )
 
@@ -505,8 +503,7 @@ class PostFlagTests(FakeReviewPyMixin, ScriptTestCase):
                 "github",
                 "--mode",
                 "standard",
-                "--deep-job",
-                "deep-review",
+                "--deep-job=deep-review",
                 "--deep-recommendation-plan",
                 self.plan,
             ],
@@ -514,13 +511,17 @@ class PostFlagTests(FakeReviewPyMixin, ScriptTestCase):
 
     def test_standard_mode_passes_the_deep_job_name(self):
         argv = self.argv(AI_REVIEW_DEEP_JOB="Deep review (codex)")
-        self.assertEqual(argv[argv.index("--deep-job") + 1], "Deep review (codex)")
+        self.assertIn("--deep-job=Deep review (codex)", argv)
+
+    def test_a_deep_job_name_that_starts_with_a_dash_stays_one_argument(self):
+        argv = self.argv(AI_REVIEW_DEEP_JOB="-deep review")
+        self.assertIn("--deep-job=-deep review", argv)
 
     def test_unset_inputs_mean_standard_mode_and_no_plan(self):
         self.write_plan()
         self.assertEqual(
             self.argv(),
-            ["post", "--platform", "github", "--mode", "standard", "--deep-job", "deep-review"],
+            ["post", "--platform", "github", "--mode", "standard", "--deep-job=deep-review"],
         )
 
     def test_recommend_off_omits_the_plan(self):
@@ -612,8 +613,9 @@ class ReviewPyParserTests(FakeReviewPyMixin, ScriptTestCase):
         write(self.out_dir, "ai-review-output.json", '{"summary": "ok"}')
         write(self.runner_temp, "ai-review-triage/plan.json", "{}")
 
-    def recorded_argvs(self) -> list[list[str]]:
+    def recorded_argvs(self, deep_job: str = "Deep review / panel") -> list[list[str]]:
         common = dict(GITHUB_ACTION_PATH=self.action_path, FAKE_LOG=self.log, GITHUB_TOKEN=TOKEN)
+        start = len(self.calls())
         for mode in ("standard", "deep"):
             for command in ("standdown", "post"):
                 proc = self.run_script(
@@ -621,11 +623,11 @@ class ReviewPyParserTests(FakeReviewPyMixin, ScriptTestCase):
                     self.repo,
                     AI_REVIEW_MODE=mode,
                     AI_REVIEW_RECOMMEND_DEEP="true",
-                    AI_REVIEW_DEEP_JOB="Deep review / panel",
+                    AI_REVIEW_DEEP_JOB=deep_job,
                     **common,
                 )
                 self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        return [call["argv"] for call in self.calls()]
+        return [call["argv"] for call in self.calls()[start:]]
 
     def parse(self, argv: list[str]):
         parsed = []
@@ -647,7 +649,7 @@ class ReviewPyParserTests(FakeReviewPyMixin, ScriptTestCase):
                 args = self.parse(argv)
                 self.assertEqual(args.platform, "github")
                 self.assertIn(args.mode, ("standard", "deep"))
-                flags.update(a for a in argv if a.startswith("--"))
+                flags.update(a.split("=", 1)[0] for a in argv if a.startswith("--"))
         self.assertEqual(
             flags, {"--platform", "--mode", "--deep-job", "--deep-recommendation-plan"}
         )
@@ -655,6 +657,24 @@ class ReviewPyParserTests(FakeReviewPyMixin, ScriptTestCase):
         self.assertEqual(post.deep_job, "Deep review / panel")
         self.assertTrue(post.deep_recommendation_plan.endswith("ai-review-triage/plan.json"))
         self.assertEqual(post.review_file, argvs[1][-1])
+
+    def test_the_deep_job_name_round_trips_whatever_it_looks_like(self):
+        names = (
+            "deep-review",
+            "Deep review / panel",
+            "-deep",
+            "--deep-review",
+            "-",
+            "deep=review",
+            "Deep review (codex, -x)",
+        )
+        for name in names:
+            with self.subTest(name=name):
+                standdown, post = self.recorded_argvs(name)[:2]
+                self.assertEqual(self.parse(standdown).deep_job, name)
+                parsed = self.parse(post)
+                self.assertEqual(parsed.deep_job, name)
+                self.assertEqual(parsed.review_file, post[-1])
 
 
 class StanddownConstantTests(PanelTestCase):

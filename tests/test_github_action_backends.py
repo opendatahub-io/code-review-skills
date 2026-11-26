@@ -8,7 +8,9 @@ import hashlib
 import json
 import os
 import re
+import shutil
 from pathlib import Path
+from unittest.mock import patch
 
 from tests.helpers import PanelTestCase, write
 from tests.test_github_action import (
@@ -211,6 +213,55 @@ class OpenShellReviewTests(OpenShellReviewTestCase):
                     )
                     self.assertFalse(os.path.exists(self.log), "uvx ran with openshell")
                     self.assertEqual(self.podman_calls(), [])
+
+    def test_credentials_of_the_machine_running_the_tests_do_not_reach_the_container(self):
+        # A developer set up for Claude Code on Vertex exports these. The script must only see
+        # what each test passes it.
+        adc_dir = os.path.join(self.tmp, "gcloud")
+        key = os.path.join(adc_dir, "application_default_credentials.json")
+        write(adc_dir, "application_default_credentials.json", '{"type": "service_account"}')
+        host = {
+            "CLOUD_ML_REGION": "us-east5",
+            "VERTEX_LOCATION": "us-east5",
+            "GOOGLE_CLOUD_PROJECT": "host-project",
+            "GOOGLE_APPLICATION_CREDENTIALS": key,
+            "CLOUDSDK_CONFIG": adc_dir,
+            "ANTHROPIC_VERTEX_PROJECT_ID": "host-project",
+            "GCP_PROJECT_ID": "host-project",
+            "CLAUDE_CODE_MAX_RETRIES": "9",
+            "GCLOUD_CREDENTIALS": "host-credentials",
+        }
+        credentials = {
+            "codex": ({"OPENAI_API_KEY": "sk-oai"}, ("OPENAI_API_KEY",)),
+            "claude-code": ({"ANTHROPIC_API_KEY": "sk-ant"}, ("ANTHROPIC_API_KEY",)),
+        }
+        with patch.dict(os.environ, host):
+            for harness, (env, names) in credentials.items():
+                with self.subTest(harness=harness):
+                    Path(self.docker_log).unlink(missing_ok=True)
+                    proc = self.openshell_review(AI_REVIEW_HARNESS=harness, **env)
+                    self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                    self.assertEqual(
+                        self.agent_run(),
+                        self.expected_agent_run(harness=harness, env_names=names),
+                    )
+                    # Names only, so a failure never prints the environment.
+                    agent_env = self.agent_record()["env"]
+                    leaked = sorted(n for n, v in host.items() if agent_env.get(n) == v)
+                    self.assertEqual(leaked, [])
+                    self.assertNotIn("GCLOUD_CREDENTIALS", sorted(agent_env))
+            # The host's key file is never read in place of a credential the test passes.
+            with self.subTest("vertex without a credential"):
+                Path(self.docker_log).unlink(missing_ok=True)
+                proc = self.openshell_review(
+                    AI_REVIEW_HARNESS="claude-code",
+                    OPENAI_API_KEY="",
+                    CLAUDE_CODE_USE_VERTEX="1",
+                    ANTHROPIC_VERTEX_PROJECT_ID="proj",
+                )
+                self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+                self.assertIn("there is no Google credential", proc.stdout)
+                self.assertEqual(self.docker_calls(), [])
 
     def test_explicit_openshell_matches_the_default(self):
         proc = self.openshell_review(AI_REVIEW_BACKEND="openshell")
@@ -716,6 +767,51 @@ class OpenShellCleanupTests(ScriptTestCase):
         )
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual(self.docker_calls(), [])
+
+    def test_an_unreachable_docker_daemon_is_nothing_to_clean(self):
+        # A docker CLI without daemon access, as on a self-hosted runner outside the docker
+        # group, after a run that skipped itself before any container.
+        proc = self.cleanup(
+            FAKE_DOCKER_INFO_STATUS="1",
+            FAKE_DOCKER_CONTAINERS=json.dumps({"c1": self.ai_dir}),
+            FAKE_DOCKER_VOLUMES=json.dumps({"v1": self.ai_dir}),
+            FAKE_DOCKER_RM_STATUS="1",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertNotIn("::error::", proc.stdout)
+        self.assertEqual(self.docker_calls(), [["info"]])
+        self.assertFalse(os.path.exists(self.ai_dir))
+        self.assertFalse(os.path.exists(self.head_dir))
+
+    def test_a_skipped_run_with_an_unreachable_daemon_cleans_up_quietly(self):
+        shutil.rmtree(self.ai_dir)
+        shutil.rmtree(self.head_dir)
+        proc = self.cleanup(FAKE_DOCKER_INFO_STATUS="1")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(proc.stdout, "")
+        self.assertEqual(self.docker_calls(), [["info"]])
+
+    def test_leftovers_with_an_unreachable_daemon_fail_at_the_end(self):
+        self.lock_a_directory()
+        proc = self.cleanup(FAKE_DOCKER_INFO_STATUS="1", FAKE_DOCKER_IMAGE_PRESENT="1")
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("::error::", proc.stdout)
+        self.assertEqual([a for a in self.docker_calls() if a != ["info"]], [])
+        self.assertFalse(os.path.exists(self.head_dir))
+
+    def test_the_daemon_check_is_bounded(self):
+        self.assertIn("timeout 1m docker info", script_function("uses_openshell_docker"))
+
+    def test_a_hung_docker_daemon_is_reported(self):
+        proc = self.cleanup(FAKE_DOCKER_INFO_STATUS="124")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("::warning::The docker daemon did not answer", proc.stdout)
+        self.assertEqual(self.docker_calls(), [["info"]])
+
+    def test_the_daemon_is_asked_once_per_cleanup(self):
+        self.lock_a_directory()
+        self.cleanup(FAKE_DOCKER_INFO_STATUS="1", FAKE_DOCKER_IMAGE_PRESENT="1")
+        self.assertEqual(self.docker_calls().count(["info"]), 1)
 
     def test_a_failed_removal_still_removes_the_workdirs_and_fails_at_the_end(self):
         proc = self.cleanup(

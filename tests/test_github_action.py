@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 from tests.helpers import (
     REPO_ROOT,
@@ -24,6 +25,7 @@ from tests.helpers import (
     run,
     write,
 )
+from tests.test_github_review import review
 
 ACTION_YML = REPO_ROOT / "action.yml"
 SCRIPT = REPO_ROOT / "action/review-pr.sh"
@@ -95,7 +97,8 @@ def skill_frontmatter_value(key: str) -> str:
 
 
 def script_constant(name: str) -> str:
-    m = re.search(rf"(?m)^{name}=(\S+)$", SCRIPT.read_text(encoding="utf-8"))
+    """A review-pr.sh constant as written: a double-quoted value keeps its quotes."""
+    m = re.search(rf'(?m)^{name}=("[^"]*"|\S+)$', SCRIPT.read_text(encoding="utf-8"))
     assert m, f"constant {name} not found in review-pr.sh"
     return m.group(1)
 
@@ -262,47 +265,68 @@ class ActionStaticTests(PanelTestCase):
         )
 
     def test_the_post_identity_for_each_token_source(self):
+        # Past the skip and stand-down gates, the mint runs when this part of its if: holds.
+        mint_if = re.search(
+            r"(?m)^\s*if: steps\.check\.outputs\.skip != 'true' && "
+            r"steps\.standdown\.outputs\.stand_down != 'true' && (.+?)\s*$",
+            find_step("Mint the posting token"),
+        ).group(1)
+        mint = f"${{{{ {mint_if} }}}}"
         token = step_env_value("Post the review", "GITHUB_TOKEN")
         login = step_env_value("Post the review", "AI_REVIEW_BOT_LOGIN")
+        caller_flag = step_env_value("Post the review", "AI_REVIEW_CALLER_TOKEN")
         minted = {"token": "ghs_app", "app-slug": "my-app"}
         caller = {"github_token": "github_pat_caller", "bot_login": "review-bot"}
+        pat_only = {"github_token": "github_pat_caller"}
+        # name, inputs, whether the mint runs, post token, bot login, caller token flag
         cases = (
-            ("workflow token", {}, {}, "ghs_workflow", ""),
-            ("App", {"app_id": "123"}, minted, "ghs_app", "my-app[bot]"),
-            ("caller token", caller, {}, "github_pat_caller", "review-bot"),
-            (
-                "caller token without a login",
-                {"github_token": "github_pat_caller"},
-                {},
-                "github_pat_caller",
-                "",
-            ),
+            ("workflow token", {}, False, "ghs_workflow", "", "false"),
+            ("App", {"app_id": "123"}, True, "ghs_app", "my-app[bot]", "false"),
+            ("caller token", caller, False, "github_pat_caller", "review-bot", "true"),
+            ("caller token without a login", pat_only, False, "github_pat_caller", "", "true"),
             (
                 "caller token and App",
                 {**caller, "app_id": "123"},
-                minted,
+                False,
                 "github_pat_caller",
                 "review-bot",
+                "true",
             ),
             (
                 "caller token without a login and App",
-                {"github_token": "github_pat_caller", "app_id": "123"},
-                minted,
+                {**pat_only, "app_id": "123"},
+                False,
                 "github_pat_caller",
                 "",
+                "true",
             ),
             (
                 "bot_login without a caller token",
                 {"bot_login": "review-bot"},
-                {},
+                False,
                 "ghs_workflow",
                 "",
+                "false",
+            ),
+            (
+                "bot_login with an App",
+                {"bot_login": "review-bot", "app_id": "123"},
+                True,
+                "ghs_app",
+                "my-app[bot]",
+                "false",
             ),
         )
-        for name, inputs, outputs, want_token, want_login in cases:
+        for name, inputs, want_mint, want_token, want_login, want_flag in cases:
             with self.subTest(name):
+                mints = bool(evaluate_expression(mint, inputs, {}))
+                self.assertEqual(mints, want_mint)
+                outputs = minted if mints else {}
                 self.assertEqual(evaluate_expression(token, inputs, outputs), want_token)
                 self.assertEqual(evaluate_expression(login, inputs, outputs), want_login)
+                flag = str(evaluate_expression(caller_flag, inputs, outputs)).lower()
+                self.assertEqual(flag, want_flag)
+                self.assertNotIn("github_pat", flag)
 
     def test_the_app_token_step_is_pinned_and_runs_directly_before_post(self):
         names = step_names()
@@ -319,7 +343,8 @@ class ActionStaticTests(PanelTestCase):
         self.assertRegex(
             block,
             r"(?m)^\s*if: steps\.check\.outputs\.skip != 'true' && "
-            r"steps\.standdown\.outputs\.stand_down != 'true' && inputs\.app_id != ''\s*$",
+            r"steps\.standdown\.outputs\.stand_down != 'true' && "
+            r"inputs\.app_id != '' && inputs\.github_token == ''\s*$",
         )
         # A failed mint must fail the job, not post under another identity.
         self.assertNotIn("continue-on-error", block)
@@ -363,18 +388,55 @@ class ActionStaticTests(PanelTestCase):
                 self.assertEqual(readers, ["Mint the posting token"])
 
     def test_only_the_post_step_reads_the_caller_token_and_its_login(self):
-        for var in ("inputs.github_token", "inputs.bot_login", "steps.app-token"):
+        # The check step also reads bot_login, which is not secret, to validate it early.
+        for var, expected in (
+            ("inputs.bot_login", ["Check the event and credentials", "Post the review"]),
+            ("steps.app-token", ["Post the review"]),
+        ):
             readers = [
                 re.search(r"(?m)^name:\s*(.+)$", block).group(1).strip()
                 for block in action_steps()
                 if var in block
             ]
             with self.subTest(var):
-                self.assertEqual(readers, ["Post the review"])
+                self.assertEqual(readers, expected)
         post = find_step("Post the review")
         env = post[post.index("\n      env:\n") :]
         self.assertIn("inputs.github_token", env)
         self.assertNotIn("inputs.github_token", post[: post.index("\n      env:\n")])
+
+    def test_the_caller_token_value_reaches_only_the_post_steps_env(self):
+        # Every mention outside the post step only compares it with '', in an if: or as a flag.
+        mentions = {}
+        for block in action_steps():
+            name = re.search(r"(?m)^name:\s*(.+)$", block).group(1).strip()
+            for line in block.splitlines():
+                if "inputs.github_token" in line:
+                    mentions.setdefault(name, []).append(line.strip())
+        self.assertEqual(
+            sorted(mentions),
+            ["Check the event and credentials", "Mint the posting token", "Post the review"],
+        )
+        (mint_line,) = mentions["Mint the posting token"]
+        self.assertTrue(mint_line.startswith("if: "), mint_line)
+        self.assertNotRegex(mint_line, r"inputs\.github_token(?! == '')")
+        # The check step only compares it with '' to pick the bot_login to validate.
+        (check_line,) = mentions["Check the event and credentials"]
+        self.assertTrue(check_line.startswith("AI_REVIEW_BOT_LOGIN: "), check_line)
+        self.assertNotRegex(check_line, r"inputs\.github_token(?! != '')")
+        post_vars = sorted(line.split(":", 1)[0] for line in mentions["Post the review"])
+        self.assertEqual(
+            post_vars, ["AI_REVIEW_BOT_LOGIN", "AI_REVIEW_CALLER_TOKEN", "GITHUB_TOKEN"]
+        )
+        # Only GITHUB_TOKEN carries the value: the others compare it with ''.
+        for var in ("AI_REVIEW_BOT_LOGIN", "AI_REVIEW_CALLER_TOKEN"):
+            with self.subTest(var):
+                value = step_env_value("Post the review", var)
+                self.assertNotRegex(value, r"inputs\.github_token(?! [!=]= '')")
+        self.assertEqual(
+            step_env_value("Post the review", "AI_REVIEW_CALLER_TOKEN"),
+            "${{ inputs.github_token != '' }}",
+        )
 
     def test_the_review_step_holds_no_app_input_or_token(self):
         block = find_step("Review the pull request")
@@ -659,16 +721,25 @@ class ActionStaticTests(PanelTestCase):
                 )
 
 
+# Every credential the script passes to the openshell container, and the variables its
+# application default credentials lookup reads, so a developer's own setup never leaks in.
+SCRIPT_CREDENTIAL_VARS = frozenset(
+    script_constant("CODEX_CREDENTIAL_VARS").strip('"').split()
+    + script_constant("CLAUDE_CREDENTIAL_VARS").strip('"').split()
+    + ["GOOGLE_APPLICATION_CREDENTIALS", "CLOUDSDK_CONFIG"]
+)
+
+
 def script_env(**overrides: str) -> dict[str, str]:
     """hermetic_env without anything the script reads, plus overrides."""
     env = hermetic_env()
     for key in list(env):
-        if key.startswith(
-            ("ANTHROPIC_", "CLAUDE_CODE_", "AI_REVIEW_", "AGENT_", "OPENAI_", "GCLOUD_", "GCP_")
-        ) or key in (
-            "GH_TOKEN",
-            "UV_NO_CONFIG",
-            "UV_PYTHON",
+        if (
+            key.startswith(
+                ("ANTHROPIC_", "CLAUDE_CODE_", "AI_REVIEW_", "AGENT_", "OPENAI_", "GCLOUD_", "GCP_")
+            )
+            or key in ("GH_TOKEN", "UV_NO_CONFIG", "UV_PYTHON")
+            or key in SCRIPT_CREDENTIAL_VARS
         ):
             del env[key]
     env.update(overrides)
@@ -708,7 +779,8 @@ sys.exit(int(os.environ.get("FAKE_PODMAN_STATUS", "0")))
 # environment to FAKE_DOCKER_LOG as one JSON line.
 # FAKE_DOCKER_CONTAINERS and FAKE_DOCKER_VOLUMES map names to their ai-review.workdir label, for
 # `ps` and `volume ls` with a label filter. A `run` of agentic-ci writes the review output when
-# FAKE_WRITE is 1, and a `run` of chown makes the workdir removable again.
+# FAKE_WRITE is 1, and a `run` of chown makes the workdir removable again. `info` exits
+# FAKE_DOCKER_INFO_STATUS, as when the daemon cannot be reached.
 FAKE_DOCKER = """
 import json
 import os
@@ -731,7 +803,9 @@ def labelled(var):
     print("\\n".join(k for k, v in items.items() if wanted == f"label=ai-review.workdir={v}"))
 
 
-if args[:1] == ["ps"]:
+if args[:1] == ["info"]:
+    status("FAKE_DOCKER_INFO_STATUS")
+elif args[:1] == ["ps"]:
     labelled("FAKE_DOCKER_CONTAINERS")
 elif args[:2] == ["volume", "ls"]:
     labelled("FAKE_DOCKER_VOLUMES")
@@ -936,6 +1010,99 @@ class CheckTests(CheckTestCase):
                 self.assertEqual(proc.returncode, 1, proc.stdout)
                 self.assertIn("::error::", proc.stdout)
                 self.assertEqual(self.github_output(), {})
+
+    def test_a_bot_login_review_py_accepts_passes(self):
+        for login in (
+            "",
+            "my-app[bot]",
+            "github-actions[bot]",
+            "review-bot",
+            "a",
+            "A1-b2",
+            "x" * 39,
+        ):
+            with self.subTest(login=login):
+                Path(self.output).unlink(missing_ok=True)
+                proc = self.check(AI_REVIEW_BOT_LOGIN=login)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual(self.github_output(), {"skip": "false"})
+
+    def test_a_malformed_bot_login_fails_before_any_output(self):
+        for login in (
+            "@ci-bot",
+            "my app[bot]",
+            "My-App[bot]",
+            "-bot",
+            "bot-",
+            "a--b",
+            "x" * 40,
+            "caf\u00e9",
+            "app[bot]x",
+            "a\nb",
+        ):
+            with self.subTest(login=login):
+                Path(self.output).unlink(missing_ok=True)
+                proc = self.check(AI_REVIEW_BOT_LOGIN=login)
+                self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+                self.assertIn("::error::bot_login must be", proc.stdout)
+                self.assertEqual(self.github_output(), {})
+                # One line: the value cannot start a workflow command of its own.
+                self.assertEqual(len(proc.stdout.splitlines()), 1, proc.stdout)
+
+    def test_bot_login_is_checked_even_when_the_run_skips(self):
+        proc = self.check(AI_REVIEW_BOT_LOGIN="@ci-bot", OPENAI_API_KEY="")
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertEqual(self.github_output(), {})
+
+    def test_the_check_accepts_exactly_the_logins_review_py_accepts(self):
+        logins = (
+            "my-app[bot]",
+            "my_app[bot]",
+            "-app[bot]",
+            "a" * 63 + "[bot]",
+            "a" * 64 + "[bot]",
+            "MyApp[bot]",
+            "octocat",
+            "Octo-Cat-1",
+            "octo--cat",
+            "octocat-",
+            "a" * 39,
+            "a" * 40,
+            "octo.cat",
+            "octo_cat",
+            "\u00e9",
+            "[bot]",
+        )
+        for login in logins:
+            with self.subTest(login=login):
+                try:
+                    with patch.dict(os.environ, {"AI_REVIEW_BOT_LOGIN": login}):
+                        review._github_configured_identity()
+                    accepted = True
+                except ValueError:
+                    accepted = False
+                Path(self.output).unlink(missing_ok=True)
+                proc = self.check(AI_REVIEW_BOT_LOGIN=login)
+                self.assertEqual(proc.returncode == 0, accepted, proc.stdout + proc.stderr)
+
+    def test_the_check_validates_what_action_yml_passes_it(self):
+        expression = step_env_value("Check the event and credentials", "AI_REVIEW_BOT_LOGIN")
+        post = step_env_value("Post the review", "AI_REVIEW_BOT_LOGIN")
+        # The caller's bot_login is what the post step uses when github_token is set.
+        cases = (
+            ({"github_token": "github_pat_x", "bot_login": "@ci-bot"}, "@ci-bot"),
+            ({"github_token": "github_pat_x", "bot_login": "review-bot"}, "review-bot"),
+            ({"bot_login": "@ci-bot"}, ""),
+            ({"bot_login": "@ci-bot", "app_id": "1"}, ""),
+            ({}, ""),
+        )
+        for inputs, want in cases:
+            with self.subTest(inputs=inputs):
+                login = evaluate_expression(expression, inputs, {})
+                self.assertEqual(login, want)
+                if inputs.get("github_token"):
+                    self.assertEqual(evaluate_expression(post, inputs, {}), login)
+                self.assertNotIn("github_pat", login)
 
     def test_an_unknown_harness_is_not_skipped_here(self):
         # The check step does not validate the harness: the review step rejects it loudly.
@@ -1359,6 +1526,24 @@ class ReviewTests(ReviewTestCase):
         self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
         self.assertIn("::error::", proc.stdout)
         self.assertIn("produced no output", proc.stdout)
+
+    def test_a_codex_run_without_output_points_at_the_image(self):
+        for harness in ({}, {"AI_REVIEW_HARNESS": "codex"}):
+            with self.subTest(harness=harness):
+                proc = self.review(write_output=False, **harness)
+                self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+                (line,) = [x for x in proc.stdout.splitlines() if x.startswith("::error::")]
+                self.assertIn("produced no output", line)
+                self.assertIn("must ship github-code-review:", line)
+                self.assertNotIn("code-review-panel", line)
+                self.assertIn("image input", line)
+                self.assertIn("README", line)
+
+    def test_a_claude_code_run_without_output_gets_no_image_hint(self):
+        proc = self.review(write_output=False, AI_REVIEW_HARNESS="claude-code")
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("produced no output", proc.stdout)
+        self.assertNotIn("must ship", proc.stdout)
 
     def test_an_empty_output_file_fails(self):
         write(self.out_dir, "ai-review-output.json", "")

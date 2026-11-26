@@ -111,15 +111,55 @@ class ModeStaticTests(PanelTestCase):
 
 
 class DraftAndModeCheckTests(CheckTestCase):
-    def test_a_draft_is_skipped_in_both_modes(self):
-        for mode in ("standard", "deep"):
-            with self.subTest(mode):
+    def test_a_draft_is_skipped_in_standard_mode(self):
+        for mode in ("standard", ""):
+            with self.subTest(mode=mode):
                 Path(self.output).unlink(missing_ok=True)
                 proc = self.check(AI_REVIEW_DRAFT="true", AI_REVIEW_MODE=mode)
                 self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
                 self.assertEqual(self.github_output(), {"skip": "true"})
                 self.assertIn("::notice::", proc.stdout)
                 self.assertIn("draft", proc.stdout)
+
+    def test_a_draft_or_a_missing_credential_fails_the_deep_job(self):
+        # A deep job that skips succeeds, and the standard review stands down for it.
+        cases = {
+            "draft": dict(AI_REVIEW_DRAFT="true"),
+            "no codex key": dict(OPENAI_API_KEY=""),
+            "no claude-code credential": dict(AI_REVIEW_HARNESS="claude-code"),
+        }
+        for name, overrides in cases.items():
+            with self.subTest(name):
+                Path(self.output).unlink(missing_ok=True)
+                proc = self.check(AI_REVIEW_MODE="deep", **overrides)
+                self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+                self.assertIn("::error::The deep review cannot run", proc.stdout)
+                self.assertNotIn("::notice::", proc.stdout)
+                self.assertEqual(self.github_output(), {})
+
+    def test_forks_and_dependabot_still_skip_the_deep_job(self):
+        # Their runs get no secrets, so a draft or a missing key there is expected.
+        cases = {
+            "fork": dict(AI_REVIEW_HEAD_REPO="fork/r", OPENAI_API_KEY=""),
+            "draft fork": dict(AI_REVIEW_HEAD_REPO="fork/r", AI_REVIEW_DRAFT="true"),
+            "dependabot": dict(AI_REVIEW_ACTOR="dependabot[bot]", OPENAI_API_KEY=""),
+            "dependabot draft": dict(
+                AI_REVIEW_TRIGGERING_ACTOR="dependabot[bot]", AI_REVIEW_DRAFT="true"
+            ),
+        }
+        for name, overrides in cases.items():
+            with self.subTest(name):
+                Path(self.output).unlink(missing_ok=True)
+                proc = self.check(AI_REVIEW_MODE="deep", **overrides)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual(self.github_output(), {"skip": "true"})
+                self.assertIn("::notice::", proc.stdout)
+                self.assertNotIn("::error::", proc.stdout)
+
+    def test_a_missing_credential_still_skips_the_standard_job(self):
+        proc = self.check(AI_REVIEW_MODE="standard", OPENAI_API_KEY="")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(self.github_output(), {"skip": "true"})
 
     def test_a_ready_pull_request_proceeds_in_both_modes(self):
         for mode in ("standard", "deep", ""):
@@ -227,6 +267,13 @@ class DeepReviewTests(ReviewTestCase):
                 )
                 self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
                 self.assertEqual(self.record()["argv"], self.expected_argv(harness=harness))
+
+    def test_a_codex_deep_run_without_output_names_both_skills(self):
+        proc = self.review(write_output=False, AI_REVIEW_MODE="deep")
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("produced no output", proc.stdout)
+        self.assertIn("must ship github-code-review and code-review-panel", proc.stdout)
+        self.assertIn("image input", proc.stdout)
 
     def test_timeout_defaults_follow_the_mode(self):
         log = os.path.join(self.tmp, "timeout.log")

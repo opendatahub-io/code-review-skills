@@ -21,13 +21,13 @@ The action posts with one of three tokens. The first one that is set wins:
 | App credentials | `app_id`, `app_private_key` | `<app-slug>[bot]` | You want a dedicated review identity. This guide is about this option. |
 | The workflow token | none | `github-actions[bot]` | The default. Nothing to set up. |
 
-Set only one of `github_token` and the App inputs. With neither set, the action uses the job's `github.token`, as it always has.
+Set only one of `github_token` and the App inputs. With both set, the action posts with `github_token` and mints no App token. With neither set, the action uses the job's `github.token`, as it always has.
 
 Caveats for a personal access token in `github_token`:
 
 - It is long-lived. A leaked token works until someone revokes it, while an App token expires within an hour and the action revokes it at the end of the job.
 - It acts as a person. Review comments, notifications and audit log entries show that user, and the review stops working when the user leaves.
-- Set `bot_login` to that user's login. The action then treats any comment by that user that ends with the review marker as its own, so it can edit or delete it. Use a dedicated machine account, not someone's personal account.
+- Set `bot_login` to that user's login. The action then treats any comment by that user that ends with the review marker as its own, so it can edit or delete it. Without `bot_login` the post step warns, because the review cannot recognize its earlier comments. Use a dedicated machine account, not someone's personal account.
 - Give a fine-grained token access to the reviewed repositories only, with Pull requests read and write, Issues read and write, Contents read and Actions read.
 
 In the reusable workflow setup, a token minted by an earlier job in the caller cannot be handed to the central workflow (a job output that holds a secret is dropped), so prefer the App inputs there and let the action mint the token.
@@ -229,7 +229,7 @@ Remove any older per-repository review workflow when you add the caller. Two cop
 
 ### Passing the secrets
 
-The caller passes its own secrets in one of two ways:
+The caller passes its own secrets in one of two ways. Pass the same model credentials to both jobs: a deep job without them fails with an error. It does not skip, because a skipped deep job would end in success and the standard review of the same head would stand down for it. The failure makes the missing secret visible, though the standard review of that push may already have stood down while the deep job was starting.
 
 - `secrets: inherit` passes every secret the calling repository can read (repository and organization secrets) to the central workflow. It works only when the caller and the central repository are in the same organization or enterprise. It is the least work, but the central workflow could then read any of those secrets, which is one more reason to pin it by SHA.
 - Explicit secrets name each one, and work across organizations:
@@ -279,8 +279,8 @@ The suggested-reviewers comment follows the same rules: it is posted once, and a
 A deep review costs many times a standard one. The setup above keeps it opt-in:
 
 - **Label only.** The deep job runs only on pull requests carrying the `deep-review` label: when the label is added, and on later pushes while it stays. A label added by a workflow with `GITHUB_TOKEN` starts no run at all, so a person or an App token has to add it.
-- **Drafts.** The standard review skips draft pull requests with a notice and runs on `ready_for_review`. The deep job has the draft condition in its `if:` on purpose: a deep review that ran and skipped a draft would count as a successful deep review, and a later standard review of the same head would stand down with nothing posted. Skipped by `if:`, it never counts.
-- **Stand-down.** When a push runs both jobs, the standard review sees the deep one and stops before the agent starts. It checks again right before posting, so a deep review that starts mid-review still wins. A deep review whose pull request gets a new commit stops without posting. These checks fail open: if the Actions API cannot be read (for example without Actions read), the run warns and goes on. Spend already made by a review that then stands down is not recovered.
+- **Drafts.** The standard review skips draft pull requests with a notice and runs on `ready_for_review`. In deep mode the action fails a draft instead of skipping it, so a draft never counts as a deep review that posted and a later standard review of the same head does not stand down. The deep job keeps the draft condition in its `if:` so the pull request does not show a failed job.
+- **Stand-down.** When a push runs both jobs, the standard review sees the deep one and stops before the agent starts. It checks again right before posting, so a deep review that starts mid-review still wins. A deep review whose pull request gets a new commit stops without posting. These checks fail open: if the Actions API cannot be read (for example without Actions read), the run warns and goes on. The warning repeats each time the check runs, up to three times per standard review. Spend already made by a review that then stands down is not recovered.
 - **Concurrency.** Each job has its own job-level group with `cancel-in-progress`, so a new push cancels the outdated review of the same kind, and an unrelated label never cancels anything. Do not use a workflow-level group: every label change starts a run, and it would cancel a review in flight.
 - **Timeouts.** The central job bounds the whole run, 45 minutes for a standard review and 120 for a deep one.
 - **Recommendation.** With `recommend_deep_review` on, the standard summary says when the change looks risky enough for a deep review, so the label goes where it is worth it.

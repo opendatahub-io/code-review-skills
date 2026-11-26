@@ -229,10 +229,11 @@ class StandDownTestCase(GitHubTestCase):
     def with_second(self, second):
         return ActionsGitHub(jobs=jobs_fixture(second))
 
-    def post_mode(self, data=None, mode="standard", deep_job=None, fake=None):
+    def post_mode(self, data=None, mode="standard", deep_job=None, fake=None, posted_flag=None):
         args = self.args(data or review_data([finding()]))
         args.mode = mode
         args.deep_job = deep_job
+        args.posted_flag = posted_flag
         code, out, err = self.call(review._github_post, args, fake=fake)
         self.assertNotIn(TOKEN, out + err)
         return code, out, err
@@ -414,6 +415,135 @@ class SelfExclusionTests(StandDownTestCase):
                 self.assertEqual(code, 10)
 
 
+class FinishedJobOnTheSameRunnerTests(StandDownTestCase):
+    """A self-hosted runner keeps its name, so it can run the deep job and then this one."""
+
+    def same_runner(self, status="completed", conclusion="success"):
+        return self.with_second(deep(status, conclusion, runner=OWN_RUNNER))
+
+    def test_a_deep_job_that_finished_on_this_runner_in_this_run_blocks(self):
+        code, out, _ = self.stand_down(fake=self.same_runner())
+        self.assertEqual(code, 10)
+        self.assertIn("deep-review (completed)", out)
+
+    def test_only_an_in_progress_job_on_this_runner_counts_as_ourselves(self):
+        for status, conclusion in BLOCKING:
+            with self.subTest(status=status):
+                code, _, _ = self.stand_down(fake=self.same_runner(status, conclusion))
+                self.assertEqual(code, 0 if status == "in_progress" else 10)
+
+    def test_it_stops_the_post_before_any_write(self):
+        fake = self.setup_pr(self.same_runner())
+        code, out, _ = self.post_mode(fake=fake)
+        self.assertEqual(code, 0)
+        self.assertEqual(fake.writes(), [])
+        self.assertIn("the standard review stands down", out)
+
+    def test_it_stops_the_summary_when_it_finishes_after_the_cleanup(self):
+        fake = self.setup_pr(ActionsGitHub())
+        fake.on_write = lambda: fake.jobs[5001][0].append(
+            deep("completed", "success", runner=OWN_RUNNER)
+        )
+        code, out, _ = self.post_mode(fake=fake)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(fake.of("DELETE")), 1)
+        self.assertEqual(fake.summary_writes(), [])
+        self.assertIn("the standard review stands down", out)
+
+
+class PostedFlagTests(StandDownTestCase):
+    """post --posted-flag creates the file only once the summary is up."""
+
+    def setUp(self):
+        super().setUp()
+        self.flag = Path(self.tmp, "posted")
+
+    def test_a_post_that_writes_its_summary_creates_the_flag(self):
+        for mode in ("standard", "deep", None):
+            with self.subTest(mode=mode):
+                self.flag.unlink(missing_ok=True)
+                fake = self.setup_pr(ActionsGitHub())
+                code, _, _ = self.post_mode(mode=mode, fake=fake, posted_flag=str(self.flag))
+                self.assertEqual(code, 0)
+                self.assertEqual(len(fake.summary_writes()), 1)
+                self.assertTrue(self.flag.is_file())
+
+    def test_a_moved_head_leaves_no_flag(self):
+        for mode in ("standard", None):
+            with self.subTest(mode=mode):
+                fake = self.setup_pr(ActionsGitHub())
+                fake.heads = [NEWER]
+                code, out, _ = self.post_mode(mode=mode, fake=fake, posted_flag=str(self.flag))
+                self.assertEqual(code, 0)
+                self.assertEqual(fake.writes(), [])
+                self.assertIn("nothing was posted", out)
+                self.assertFalse(self.flag.exists())
+
+    def test_a_stand_down_before_the_cleanup_leaves_no_flag(self):
+        cases = (
+            ("standard", self.with_second(deep("in_progress")), []),
+            ("deep", ActionsGitHub(), [HEAD, NEWER]),
+        )
+        for mode, fake, heads in cases:
+            with self.subTest(mode=mode):
+                fake = self.setup_pr(fake)
+                fake.heads = heads
+                code, _, _ = self.post_mode(mode=mode, fake=fake, posted_flag=str(self.flag))
+                self.assertEqual(code, 0)
+                self.assertEqual(fake.writes(), [])
+                self.assertFalse(self.flag.exists())
+
+    def test_a_stand_down_before_the_summary_leaves_no_flag(self):
+        standard = self.setup_pr(ActionsGitHub())
+        standard.on_write = lambda: standard.jobs[5001][0].append(deep("in_progress"))
+        deep_mode = self.setup_pr(ActionsGitHub())
+        deep_mode.heads = [HEAD, HEAD, NEWER]
+        for mode, fake in (("standard", standard), ("deep", deep_mode)):
+            with self.subTest(mode=mode):
+                code, _, _ = self.post_mode(mode=mode, fake=fake, posted_flag=str(self.flag))
+                self.assertEqual(code, 0)
+                self.assertEqual(len(fake.of("DELETE")), 1)
+                self.assertEqual(fake.summary_writes(), [])
+                self.assertFalse(self.flag.exists())
+
+    def test_a_failed_summary_leaves_no_flag(self):
+        class SummaryFails(ActionsGitHub):
+            def patch(self, url, json=None, **kwargs):
+                super().patch(url, json=json, **kwargs)
+                return FakeResponse(500, {})
+
+        fake = self.setup_pr(SummaryFails())
+        code, _, _ = self.post_mode(fake=fake, posted_flag=str(self.flag))
+        self.assertEqual(code, 1)
+        self.assertFalse(self.flag.exists())
+
+    def test_a_flag_that_cannot_be_written_only_warns(self):
+        missing = Path(self.tmp, "missing", "posted")
+        fake = self.setup_pr(ActionsGitHub())
+        code, out, err = self.post_mode(fake=fake, posted_flag=str(missing))
+        self.assertEqual(code, 0)
+        self.assertEqual(len(fake.summary_writes()), 1)
+        self.assertIn("Could not write the posted flag", out + err)
+        self.assertFalse(missing.exists())
+
+    def test_the_parser_takes_the_flag_only_with_platform_github(self):
+        path = self.args(review_data([finding()])).review_file
+        fake = ActionsGitHub()
+        with patch.object(sys, "argv", ["review.py", "post", path, "--posted-flag", "x"]):
+            code, _, err = self.call(review.main, fake=fake)
+        self.assertEqual(code, 2)
+        self.assertIn("--posted-flag needs --platform github", err)
+        self.assertEqual(fake.calls, [])
+
+        fake = self.setup_pr(ActionsGitHub())
+        argv = ["review.py", "post", path, "--platform", "github", "--mode", "standard"]
+        argv += ["--posted-flag", str(self.flag)]
+        with patch.object(sys, "argv", argv):
+            code, _, _ = self.call(review.main, fake=fake)
+        self.assertEqual(code, 0)
+        self.assertTrue(self.flag.is_file())
+
+
 class PaginationTests(StandDownTestCase):
     def test_a_second_jobs_page_on_the_repository_id_path_is_read(self):
         fake = ActionsGitHub(jobs={**jobs_fixture(), 5001: [[own_job()], [deep("in_progress")]]})
@@ -500,13 +630,37 @@ class FailOpenTests(StandDownTestCase):
                 code, out, _ = self.stand_down(fake=fake)
                 self.assertEqual(code, 0)
                 self.assertEqual(len(warnings(out)), 1)
-                self.assertIn("actions: read", out)
+                # The permission hint is only for a refused lookup.
+                self.assertNotIn("actions: read", out)
+                self.assertIn("the lookup failed", out)
+        fake = self.with_second(deep("in_progress"))
+        fake.actions_response = FakeResponse(404, {})
+        code, out, _ = self.stand_down(fake=fake)
+        self.assertEqual(code, 0)
+        self.assertIn("actions: read", out)
         fake = self.with_second(deep("in_progress"))
         fake.actions = raises
         code, out, _ = self.stand_down(fake=fake)
         self.assertEqual(code, 0)
         self.assertIn("ConnectionError", out)
         self.assertNotIn("detail of the failure", out)
+
+    def test_a_job_status_that_is_not_a_string_warns_once_and_proceeds(self):
+        for status in (["in_progress"], {"name": "queued"}, 3):
+            with self.subTest(status=status):
+                fake = self.with_second(deep(status))
+                code, out, err = self.stand_down(fake=fake)
+                self.assertEqual(code, 0)
+                self.assertEqual(len(warnings(out)), 1)
+                self.assertIn("unexpected job status", out)
+                self.assertNotIn("Traceback", err)
+
+    def test_a_job_status_that_is_not_a_string_still_lets_the_post_go_ahead(self):
+        fake = self.setup_pr(self.with_second(deep(["in_progress"])))
+        code, out, _ = self.post_mode(fake=fake)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(fake.summary_writes()), 1)
+        self.assertEqual(len(warnings(out)), 2)
 
     def test_a_failing_jobs_list_after_the_runs_list_still_proceeds(self):
         fake = self.with_second(deep("in_progress"))

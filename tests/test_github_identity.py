@@ -163,14 +163,46 @@ class AppIdentityTests(IdentityTestCase):
         self.assertEqual(comments, rest)
         self.assertEqual(graphql, [False] * len(graphql_look_alikes))
 
-    def test_dedup_reads_the_newest_summary_of_either_account(self):
+    def test_dedup_reads_the_summary_we_patch_else_the_newest_of_either_account(self):
         legacy = comment(1, f"legacy\n\n{marker(OLD)}")
         app = comment(2, f"app\n\n{marker(NEWER)}", APP_REST)
         newer_legacy = comment(3, f"legacy\n\n{marker(HEAD)}")
+        older_legacy = comment(4, f"legacy\n\n{marker(NEWER)}")
         self.assertEqual(self.find(APP_LOGIN, [legacy]), (None, OLD))
+        self.assertEqual(self.find(APP_LOGIN, [legacy, older_legacy]), (None, NEWER))
         self.assertEqual(self.find(APP_LOGIN, [legacy, app]), (2, NEWER))
-        self.assertEqual(self.find(APP_LOGIN, [app, newer_legacy]), (2, HEAD))
+        self.assertEqual(self.find(APP_LOGIN, [app, newer_legacy]), (2, NEWER))
         self.assertEqual(self.find(None, [legacy, app]), (1, OLD))
+
+    def test_a_newer_legacy_summary_does_not_pin_dedup_to_its_sha(self):
+        # Each run patches the app summary, so its SHA moves on while the legacy one stays.
+        legacy = comment(6, f"legacy\n\n{marker(OLD)}")
+        for app_sha in (NEWER, HEAD):
+            with self.subTest(app_sha=app_sha):
+                app = comment(5, f"app\n\n{marker(app_sha)}", APP_REST)
+                self.assertEqual(self.find(APP_LOGIN, [app, legacy]), (5, app_sha))
+
+    def test_post_dedups_against_the_summary_it_patches(self):
+        comments = [
+            comment(5, f"app\n\n{marker(NEWER)}", APP_REST),
+            comment(6, f"legacy\n\n{marker(OLD)}"),
+        ]
+        fake = StatusGitHub(comment_pages=[(comments, "")])
+        seen = []
+
+        def dedup(data, prev, head):
+            seen.append((prev, head))
+            return data
+
+        with patch.object(review, "filter_already_reviewed", side_effect=dedup):
+            code, _, _ = self.post_as(APP_LOGIN, fake=fake)
+        self.assertEqual(code, 0)
+        self.assertEqual(seen, [(NEWER, HEAD)])
+        self.assertEqual(self.summary_writes(fake), [("PATCH", ["comments", "5"])])
+
+    def test_entries_that_are_not_objects_are_skipped(self):
+        comments = ["text", None, 3, comment(2, f"app\n\n{marker(OLD)}", APP_REST)]
+        self.assertEqual(self.find(APP_LOGIN, comments), (2, OLD))
 
     def test_legacy_summary_is_not_patched_and_still_drives_dedup(self):
         fake = StatusGitHub(
@@ -357,6 +389,13 @@ class PlanEncodingTests(RecommendationTestCase):
                 self.assertEqual(code, 0)
                 self.assertEqual(out.count("::warning::"), 1, out)
                 self.assertIn("the triage plan is not valid JSON", out)
+
+    def test_utf8_plan_with_a_bom_yields_the_line(self):
+        path = self.plan_file(json.dumps(plan()).encode("utf-8-sig"))
+        code, out, _ = self.post_with_plan(review_data(), path)
+        self.assertEqual(code, 0)
+        self.assertNotIn("::warning::", out)
+        self.assertEqual(len(self.recommendation_lines(self.fake.summary_body())), 1)
 
     def test_utf8_plan_still_yields_the_line(self):
         path = self.plan_file(json.dumps(plan()).encode("utf-8"))

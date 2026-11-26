@@ -25,11 +25,17 @@ TOKEN = "ghs_POSTEXTRASSECRET"
 
 # Stands in for review.py: appends its argv, the environment it reads and its working directory
 # to FAKE_LOG as one JSON line, then exits FAKE_POST_STATUS for post and FAKE_SUGGEST_STATUS for
-# suggest-reviewers.
+# suggest-reviewers. A post given --posted-flag creates that file unless FAKE_POSTED is 0, as
+# review.py does only once the summary is up.
 FAKE_REVIEW_PY = """
 import json
 import os
 import sys
+
+args = sys.argv[1:]
+if args[:1] == ["post"] and "--posted-flag" in args and os.environ.get("FAKE_POSTED") != "0":
+    with open(args[args.index("--posted-flag") + 1], "w", encoding="utf-8") as f:
+        f.write("posted\\n")
 
 keys = ["UV_NO_CONFIG", "UV_PYTHON", "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0",
         "GIT_CONFIG_VALUE_0", "GIT_CONFIG_KEY_1", "GIT_CONFIG_VALUE_1", "GITHUB_TOKEN",
@@ -70,6 +76,11 @@ class PostExtrasTestCase(ScriptTestCase):
 
     def commands(self) -> list[str]:
         return [call["argv"][0] for call in self.calls()]
+
+    def posted_flag(self) -> str | None:
+        """The --posted-flag path the post call got, or None."""
+        argv = self.calls()[0]["argv"]
+        return argv[argv.index("--posted-flag") + 1] if "--posted-flag" in argv else None
 
 
 class SuggestReviewersTests(PostExtrasTestCase):
@@ -119,6 +130,35 @@ class SuggestReviewersTests(PostExtrasTestCase):
         proc = self.post(AI_REVIEW_SUGGEST_REVIEWERS="true", AI_REVIEW_MODE="deep")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual(self.commands(), ["post"])
+
+    def test_a_post_that_did_not_post_suggests_nothing(self):
+        # review.py exits 0 without the flag when the head moved or the review stood down
+        # before deleting old threads or before the summary.
+        proc = self.post(AI_REVIEW_SUGGEST_REVIEWERS="true", FAKE_POSTED="0")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(self.commands(), ["post"])
+        self.assertNotIn("::warning::", proc.stdout)
+
+    def test_the_posted_flag_is_private_to_the_runner_and_outside_the_mount(self):
+        proc = self.post(AI_REVIEW_SUGGEST_REVIEWERS="true")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        flag = self.posted_flag()
+        self.assertIsNotNone(flag)
+        self.assertTrue(flag.startswith(self.runner_temp + os.sep), flag)
+        self.assertFalse(flag.startswith(self.workspace + os.sep), flag)
+        # Next to the copy of the output, in the directory the step made for this post.
+        self.assertEqual(os.path.dirname(flag), os.path.dirname(self.calls()[0]["argv"][-1]))
+
+    def test_the_posted_flag_is_passed_only_when_suggestions_follow(self):
+        for name, env in (
+            ("suggestions off", {}),
+            ("deep mode", {"AI_REVIEW_SUGGEST_REVIEWERS": "true", "AI_REVIEW_MODE": "deep"}),
+        ):
+            with self.subTest(name):
+                Path(self.log).unlink(missing_ok=True)
+                proc = self.post(**env)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertIsNone(self.posted_flag())
 
     def test_a_failed_post_fails_the_step_with_its_status_and_suggests_nothing(self):
         proc = self.post(AI_REVIEW_SUGGEST_REVIEWERS="true", FAKE_POST_STATUS="3")
@@ -175,6 +215,46 @@ class BotLoginTests(PostExtrasTestCase):
         self.assertEqual(self.calls()[0]["env"]["AI_REVIEW_BOT_LOGIN"], "review-bot")
 
 
+class CallerTokenWarningTests(PostExtrasTestCase):
+    WARNING = "::warning::github_token is set but bot_login is empty"
+
+    def test_a_caller_token_without_a_login_warns_and_still_posts(self):
+        proc = self.post(AI_REVIEW_CALLER_TOKEN="true", AI_REVIEW_BOT_LOGIN="")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn(self.WARNING, proc.stdout)
+        self.assertEqual(self.commands(), ["post"])
+        self.assertNotIn(TOKEN, proc.stdout + proc.stderr)
+
+    def test_no_warning_with_a_login_or_without_a_caller_token(self):
+        cases = (
+            (
+                "caller token with a login",
+                {"AI_REVIEW_CALLER_TOKEN": "true", "AI_REVIEW_BOT_LOGIN": "review-bot"},
+            ),
+            ("App", {"AI_REVIEW_CALLER_TOKEN": "false", "AI_REVIEW_BOT_LOGIN": "my-app[bot]"}),
+            ("workflow token", {"AI_REVIEW_CALLER_TOKEN": "false", "AI_REVIEW_BOT_LOGIN": ""}),
+            ("flag unset", {}),
+        )
+        for name, env in cases:
+            with self.subTest(name):
+                proc = self.post(**env)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertNotIn(self.WARNING, proc.stdout)
+
+    def test_the_flag_from_action_yml_drives_the_warning(self):
+        flag = step_env_value("Post the review", "AI_REVIEW_CALLER_TOKEN")
+        login = step_env_value("Post the review", "AI_REVIEW_BOT_LOGIN")
+        inputs = {"github_token": "github_pat_x"}
+        env = {
+            "AI_REVIEW_CALLER_TOKEN": str(evaluate_expression(flag, inputs, {})).lower(),
+            "AI_REVIEW_BOT_LOGIN": evaluate_expression(login, inputs, {}),
+        }
+        self.assertEqual(env, {"AI_REVIEW_CALLER_TOKEN": "true", "AI_REVIEW_BOT_LOGIN": ""})
+        proc = self.post(**env)
+        self.assertIn(self.WARNING, proc.stdout)
+        self.assertNotIn("github_pat_x", proc.stdout + proc.stderr)
+
+
 class SuggestParserTests(PostExtrasTestCase):
     """The real review.py parser accepts the suggest-reviewers call the script makes."""
 
@@ -191,3 +271,17 @@ class SuggestParserTests(PostExtrasTestCase):
         self.assertEqual(len(parsed), 1)
         self.assertEqual(parsed[0].command, "suggest-reviewers")
         self.assertEqual(parsed[0].platform, "github")
+
+    def test_the_post_call_with_the_posted_flag_parses(self):
+        proc = self.post(AI_REVIEW_SUGGEST_REVIEWERS="true")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        argv = self.calls()[0]["argv"]
+        parsed = []
+        with (
+            patch.object(sys, "argv", ["review.py", *argv]),
+            patch.object(review, "cmd_post", side_effect=parsed.append),
+        ):
+            review.main()
+        self.assertEqual(len(parsed), 1)
+        self.assertEqual(parsed[0].posted_flag, self.posted_flag())
+        self.assertEqual(parsed[0].review_file, argv[-1])
