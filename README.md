@@ -137,6 +137,11 @@ To run Claude Code instead, set `harness: claude-code` and put its credential in
 | `inline_fixes` | `true` | Post `fix` objects as applicable suggestions. |
 | `recommend_deep_review` | `false` | Standard mode only. Before the agent starts, run the panel's triage on the runner and, when it picks the deep tier, add a line to the summary that recommends adding the `deep-review` label and names what triggered it (see [Deep review](#deep-review)). |
 | `deep_review_job` | `deep-review` | Display name of the job that runs the action with `mode: deep`, which a standard review stands down for (see [Deep review](#deep-review)). |
+| `suggest_reviewers` | `false` | Standard mode only. After the review posts, comment once on the pull request with up to five reviewers, @mentioned, picked from the authors of the base branch's history of the files it changes (not the pull request's author). A run that finds that comment already posted adds none. A failed suggestion only warns and never fails the step. |
+| `app_id` | -- | App ID or Client ID of a GitHub App to post as (see [Posting identity](#posting-identity)). Empty posts with the workflow token. |
+| `app_private_key` | -- | Private key of that App. Pass it from a secret. |
+| `github_token` | -- | A token to post with instead, such as one you minted or a fine-grained personal access token (see [Posting identity](#posting-identity)). |
+| `bot_login` | -- | The login `github_token` posts as: `<app-slug>[bot]` for an App token, or the user's login for a personal access token. Read only with `github_token`. |
 
 ### Backends
 
@@ -154,7 +159,7 @@ To run Claude Code instead, set `harness: claude-code` and put its credential in
 Limitations:
 
 - Only the `pull_request` event is supported. Runs for pull requests from forks and runs triggered by Dependabot exit 0 with a notice, because they get no secrets and a read-only token. A run without a credential for the harness in the job environment, or for a draft pull request, does the same.
-- The action posts as `github-actions[bot]` with the workflow token, and recognizes its own comments by that login and a marker. Run one standard and at most one deep copy of the action per pull request: two of the same mode would fight over the same comments.
+- The action recognizes its own comments by the login it posts as (see [Posting identity](#posting-identity)) and a marker. Run one standard and at most one deep copy of the action per pull request: two of the same mode would fight over the same comments.
 - The action fetches the full history of the PR head (`fetch-depth: 0`) on every run, to find the merge base reliably, and copies the history of the base and the head into the agent's repository. On a very large repo that costs time and disk on every push.
 - A very large diff can exceed what the agent reads in one run. The review then says in its summary that it covered only part of the diff.
 - The agent runs in a sandbox (OpenShell, or a Podman container with `backend: podman`) with every tool the harness provides enabled, so the sandbox is the boundary, not a tool allowlist. It reads an export of the PR's working tree in `.ai-review/repo` under the workspace, with a git repository of its own: HEAD detached at the PR head and the full history of the base and the head, fetched from the checkout's objects without its config, remotes, hooks or credentials. The checkout itself, with its `.git`, sits in `.ai-review-head` and is never mounted, so the container never sees it or the write token. The action never runs git in `.ai-review` once the agent starts. The post step reads one file from the mount, refuses a symlink or anything over 1 MiB, and posts a copy of it. Both directories are removed at the end.
@@ -163,6 +168,14 @@ Limitations:
 - The default `image` tag floats (it is rebuilt daily), so a new image can change the review between runs: pin a digest with the `image` input to freeze it.
 - agentic-ci is pinned by version, not by hash, and its dependencies float.
 - Do not use `pull_request_target` with a checkout of the PR head: that runs code from the PR with write access and secrets. The action refuses that event.
+
+### Posting identity
+
+By default the post step uses the job's `github.token`, so reviews appear as `github-actions[bot]`. To post as your own GitHub App, pass its `app_id` and `app_private_key` from secrets: after the review finishes, the action mints a token for this repository only, with pull requests and issues write, contents read and actions read, and the review appears as `<app-slug>[bot]`. Only the minting step reads the key, and the review step never sees the key or the token. A mint that fails (the App is not installed on the repository, or the key is wrong) fails the job instead of posting as `github-actions[bot]`. Comments that `github-actions[bot]` posted before the switch still count as the review's own.
+
+`github_token` takes precedence over both: a token you minted yourself, or a fine-grained personal access token with the same four permissions. Set `bot_login` to the account it posts as. A personal access token is long-lived and acts as a person, and the action treats any comment by that user that ends with the review marker as its own, so use a dedicated machine account. Set either `github_token` or the App inputs, not both. The check for a deep review before the agent starts always uses `github.token`, so the job still needs `actions: read`.
+
+See [docs/github-app.md](docs/github-app.md) for creating the App, storing its key, and running reviews for many repositories from one reusable workflow.
 
 ### Deep review
 

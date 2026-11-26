@@ -79,6 +79,41 @@ inputs:
       ('true' or 'false').
     required: false
     default: 'false'
+  suggest_reviewers:
+    description: >-
+      In standard mode, after the review is posted, comment once with up to five
+      reviewers picked from the history of the changed files ('true' or
+      'false'). A failed suggestion only warns.
+    required: false
+    default: 'false'
+  app_id:
+    description: >-
+      App ID or Client ID of a GitHub App to post as. When set, the action
+      mints a token for this repository right before it posts, and the review
+      appears as <app-slug>[bot]. Empty posts with the workflow token.
+    required: false
+    default: ''
+  app_private_key:
+    description: >-
+      Private key of the GitHub App named by app_id. Pass it from a secret. Only
+      the step that mints the token reads it.
+    required: false
+    default: ''
+  github_token:
+    description: >-
+      Token to post with instead of a minted App token or the workflow token,
+      such as one the caller minted or a fine-grained personal access token.
+      It needs pull requests and issues write, contents read and actions read.
+      Only the post step reads it. Set bot_login with it.
+    required: false
+    default: ''
+  bot_login:
+    description: >-
+      Login of the account github_token belongs to: <app-slug>[bot] for a
+      GitHub App, or the user login behind a personal access token. Read only
+      when github_token is set.
+    required: false
+    default: ''
 
 runs:
   using: composite
@@ -166,13 +201,34 @@ runs:
         ACTIONS_ID_TOKEN_REQUEST_TOKEN: ''
         ACTIONS_ID_TOKEN_REQUEST_URL: ''
 
+    - name: Mint the posting token
+      id: app-token
+      if: steps.check.outputs.skip != 'true' && steps.standdown.outputs.stand_down != 'true' && inputs.app_id != ''
+      # After the review, so the agent never runs while the token exists. The token is masked,
+      # scoped to this repository, and revoked when the job ends. A failed mint fails the job
+      # rather than posting under the workflow token's identity.
+      uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
+      with:
+        client-id: ${{ inputs.app_id }}
+        private-key: ${{ inputs.app_private_key }}
+        repositories: ${{ github.event.repository.name }}
+        permission-pull-requests: write
+        permission-issues: write
+        # The history query of the reviewer suggestions.
+        permission-contents: read
+        # The check for a review that should win, right before posting.
+        permission-actions: read
+
     - name: Post the review
       if: steps.check.outputs.skip != 'true' && steps.standdown.outputs.stand_down != 'true'
       shell: bash
       working-directory: .ai-review-head
       run: '"$GITHUB_ACTION_PATH/action/review-pr.sh" post'
       env:
-        GITHUB_TOKEN: ${{ github.token }}
+        # The first that is set: the caller's token, the minted App token, the workflow token.
+        GITHUB_TOKEN: ${{ inputs.github_token || steps.app-token.outputs.token || github.token }}
+        # The account the token posts as. Empty means github-actions[bot].
+        AI_REVIEW_BOT_LOGIN: ${{ inputs.github_token != '' && inputs.bot_login || inputs.github_token == '' && steps.app-token.outputs.app-slug && format('{0}[bot]', steps.app-token.outputs.app-slug) || '' }}
         CHILL_MODE: ${{ inputs.chill_mode }}
         INLINE_FIXES: ${{ inputs.inline_fixes }}
         AGENT_MODEL: ${{ inputs.model }}
@@ -180,6 +236,7 @@ runs:
         AI_REVIEW_MODE: ${{ inputs.mode }}
         AI_REVIEW_DEEP_JOB: ${{ inputs.deep_review_job }}
         AI_REVIEW_RECOMMEND_DEEP: ${{ inputs.recommend_deep_review }}
+        AI_REVIEW_SUGGEST_REVIEWERS: ${{ inputs.suggest_reviewers }}
 
     # Composite actions have no post hook, so this step always runs.
     - name: Remove the checkout

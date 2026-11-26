@@ -24,6 +24,9 @@
 #                                 review, post)
 #   AI_REVIEW_DEEP_JOB            deep_review_job input (standdown, post)
 #   AI_REVIEW_RECOMMEND_DEEP      recommend_deep_review input (prepare, post)
+#   AI_REVIEW_SUGGEST_REVIEWERS   suggest_reviewers input (post)
+#   AI_REVIEW_BOT_LOGIN           account the post token belongs to, empty for
+#                                 github-actions[bot] (post, read by review.py)
 #   AI_REVIEW_DRAFT               pull_request.draft (check)
 #   AI_REVIEW_BACKEND             backend input: openshell or podman (review, cleanup)
 #   AI_REVIEW_BASE_SHA            pull_request.base.sha (prepare, review)
@@ -38,7 +41,9 @@
 #   RUNNER_TEMP                   set by the runner (review: parent of the agent's private TMPDIR,
 #                                 post: parent of the copy of the output, prepare and post: parent
 #                                 of the triage plan)
-#   GITHUB_TOKEN                  github.token (standdown, post); no other step gets it
+#   GITHUB_TOKEN                  github.token (standdown); the github_token input, else a
+#                                 minted App token, else github.token (post); no other step
+#                                 gets one
 #
 # The agent's credentials are not action inputs: the job environment carries the keys
 # agentic-ci reads (ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN for claude-code,
@@ -839,8 +844,17 @@ cmd_post() {
     fi
 
     # uv must ignore config and .python-version files that arrive with the PR.
+    local status=0
     UV_NO_CONFIG=1 UV_PYTHON="$(command -v python3)" \
-        "$review_py" "${args[@]}" "$copy_dir/ai-review-output.json"
+        "$review_py" "${args[@]}" "$copy_dir/ai-review-output.json" || status=$?
+    [ "$status" -eq 0 ] || exit "$status"
+
+    # Suggestions only follow a review that posted, and never decide the step's status.
+    if [ "$REVIEW_MODE" = "standard" ] && is_on "${AI_REVIEW_SUGGEST_REVIEWERS:-}"; then
+        UV_NO_CONFIG=1 UV_PYTHON="$(command -v python3)" \
+            "$review_py" suggest-reviewers --platform github || status=$?
+        [ "$status" -eq 0 ] || warning "Could not suggest reviewers (review.py exit $status)"
+    fi
 }
 
 # Ask review.py whether a review that should win makes this one redundant, before any agent

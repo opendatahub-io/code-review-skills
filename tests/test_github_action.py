@@ -127,6 +127,66 @@ def input_default(name: str) -> str:
     return m.group(1)
 
 
+def step_names() -> list[str]:
+    return [re.search(r"(?m)^name:\s*(.+)$", block).group(1).strip() for block in action_steps()]
+
+
+def step_env_value(step: str, var: str) -> str:
+    """The value of one env: entry of a step, as written in action.yml."""
+    m = re.search(rf"(?m)^\s*{var}:\s*(.+?)\s*$", find_step(step))
+    assert m, f"no {var} in step {step!r}"
+    return m.group(1)
+
+
+def with_block(block: str) -> str:
+    """The lines under a step's with: key."""
+    lines = block.splitlines()
+    for i, line in enumerate(lines):
+        m = re.match(r"^(\s*)with:\s*$", line)
+        if not m:
+            continue
+        indent = len(m.group(1))
+        body = []
+        for follow in lines[i + 1 :]:
+            if follow.strip() and len(follow) - len(follow.lstrip()) <= indent:
+                break
+            body.append(follow)
+        return "\n".join(body)
+    raise AssertionError(f"no with: in {block!r}")
+
+
+def evaluate_expression(
+    expression: str,
+    inputs: dict[str, str],
+    app_token: dict[str, str],
+    github_token: str = "ghs_workflow",
+) -> str:
+    """Evaluate one ${{ }} expression of action.yml the way the runner does.
+
+    Covers only what the post step's env uses: inputs, the app-token step's outputs,
+    github.token, string literals, == and !=, && and || (which return an operand, like
+    Python's and and or) and format(). An unset input or output is the empty string.
+    """
+    m = re.fullmatch(r"\$\{\{ (.+) \}\}", expression)
+    assert m, f"not a single expression: {expression!r}"
+    source = re.sub(
+        r"steps\.app-token\.outputs\.([a-z-]+)", lambda o: f"app_token({o.group(1)!r})", m.group(1)
+    )
+    source = re.sub(r"inputs\.([a-z_]+)", lambda i: f"inputs({i.group(1)!r})", source)
+    source = source.replace("github.token", "workflow_token")
+    source = source.replace("&&", " and ").replace("||", " or ")
+    assert "." not in re.sub(r"'[^']*'", "", source), f"unsupported expression: {expression!r}"
+    namespace = {
+        "__builtins__": {},
+        "inputs": lambda name: inputs.get(name, ""),
+        "app_token": lambda name: app_token.get(name, ""),
+        "workflow_token": github_token,
+        "format": lambda template, *args: template.format(*args),
+    }
+    # The source is action.yml's own text, limited to the forms above.
+    return eval(source, namespace)
+
+
 class ActionStaticTests(PanelTestCase):
     def test_composite_action(self):
         text = ACTION_YML.read_text(encoding="utf-8")
@@ -181,11 +241,152 @@ class ActionStaticTests(PanelTestCase):
         self.assertEqual(holders, ["Check for a review that should win", "Post the review"])
         self.assertIn('review-pr.sh" standdown', run_text(find_step(holders[0])))
         self.assertIn('review-pr.sh" post', run_text(find_step(holders[1])))
-        for holder in holders:
-            with self.subTest(holder):
-                self.assertRegex(
-                    find_step(holder), r"(?m)^\s*GITHUB_TOKEN:\s*\$\{\{ github\.token \}\}\s*$"
-                )
+        # The standdown step only reads, so it keeps the workflow token even with an App.
+        self.assertEqual(
+            step_env_value("Check for a review that should win", "GITHUB_TOKEN"),
+            "${{ github.token }}",
+        )
+
+    def test_the_post_token_is_the_callers_then_the_apps_then_the_workflows(self):
+        self.assertEqual(
+            step_env_value("Post the review", "GITHUB_TOKEN"),
+            "${{ inputs.github_token || steps.app-token.outputs.token || github.token }}",
+        )
+
+    def test_the_bot_login_derives_from_the_app_slug_or_the_bot_login_input(self):
+        self.assertEqual(
+            step_env_value("Post the review", "AI_REVIEW_BOT_LOGIN"),
+            "${{ inputs.github_token != '' && inputs.bot_login || inputs.github_token == '' && "
+            "steps.app-token.outputs.app-slug && "
+            "format('{0}[bot]', steps.app-token.outputs.app-slug) || '' }}",
+        )
+
+    def test_the_post_identity_for_each_token_source(self):
+        token = step_env_value("Post the review", "GITHUB_TOKEN")
+        login = step_env_value("Post the review", "AI_REVIEW_BOT_LOGIN")
+        minted = {"token": "ghs_app", "app-slug": "my-app"}
+        caller = {"github_token": "github_pat_caller", "bot_login": "review-bot"}
+        cases = (
+            ("workflow token", {}, {}, "ghs_workflow", ""),
+            ("App", {"app_id": "123"}, minted, "ghs_app", "my-app[bot]"),
+            ("caller token", caller, {}, "github_pat_caller", "review-bot"),
+            (
+                "caller token without a login",
+                {"github_token": "github_pat_caller"},
+                {},
+                "github_pat_caller",
+                "",
+            ),
+            (
+                "caller token and App",
+                {**caller, "app_id": "123"},
+                minted,
+                "github_pat_caller",
+                "review-bot",
+            ),
+            (
+                "caller token without a login and App",
+                {"github_token": "github_pat_caller", "app_id": "123"},
+                minted,
+                "github_pat_caller",
+                "",
+            ),
+            (
+                "bot_login without a caller token",
+                {"bot_login": "review-bot"},
+                {},
+                "ghs_workflow",
+                "",
+            ),
+        )
+        for name, inputs, outputs, want_token, want_login in cases:
+            with self.subTest(name):
+                self.assertEqual(evaluate_expression(token, inputs, outputs), want_token)
+                self.assertEqual(evaluate_expression(login, inputs, outputs), want_login)
+
+    def test_the_app_token_step_is_pinned_and_runs_directly_before_post(self):
+        names = step_names()
+        mint = names.index("Mint the posting token")
+        self.assertEqual(names[mint - 1], "Review the pull request")
+        self.assertEqual(names[mint + 1], "Post the review")
+        block = find_step("Mint the posting token")
+        self.assertRegex(block, r"(?m)^\s*id:\s*app-token\s*$")
+        self.assertRegex(
+            block,
+            r"(?m)^\s*uses:\s*actions/create-github-app-token@"
+            r"f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3\.4\.0\s*$",
+        )
+        self.assertRegex(
+            block,
+            r"(?m)^\s*if: steps\.check\.outputs\.skip != 'true' && "
+            r"steps\.standdown\.outputs\.stand_down != 'true' && inputs\.app_id != ''\s*$",
+        )
+        # A failed mint must fail the job, not post under another identity.
+        self.assertNotIn("continue-on-error", block)
+        self.assertIsNone(run_text(block))
+
+    def test_the_minted_token_is_scoped_to_this_repository_and_minimal_permissions(self):
+        options = dict(
+            re.findall(
+                r"(?m)^\s*([a-z-]+):\s*(.+?)\s*$", with_block(find_step("Mint the posting token"))
+            )
+        )
+        self.assertEqual(
+            options,
+            {
+                "client-id": "${{ inputs.app_id }}",
+                "private-key": "${{ inputs.app_private_key }}",
+                "repositories": "${{ github.event.repository.name }}",
+                "permission-pull-requests": "write",
+                "permission-issues": "write",
+                "permission-contents": "read",
+                "permission-actions": "read",
+            },
+        )
+
+    def test_the_private_key_appears_only_in_the_mint_steps_with(self):
+        text = ACTION_YML.read_text(encoding="utf-8")
+        self.assertEqual(text.count("inputs.app_private_key"), 1)
+        mint = find_step("Mint the posting token")
+        self.assertRegex(
+            with_block(mint), r"(?m)^\s*private-key:\s*\$\{\{ inputs\.app_private_key \}\}\s*$"
+        )
+
+    def test_only_the_mint_step_reads_the_app_inputs(self):
+        for var in ("inputs.app_id", "inputs.app_private_key"):
+            readers = [
+                re.search(r"(?m)^name:\s*(.+)$", block).group(1).strip()
+                for block in action_steps()
+                if var in block
+            ]
+            with self.subTest(var):
+                self.assertEqual(readers, ["Mint the posting token"])
+
+    def test_only_the_post_step_reads_the_caller_token_and_its_login(self):
+        for var in ("inputs.github_token", "inputs.bot_login", "steps.app-token"):
+            readers = [
+                re.search(r"(?m)^name:\s*(.+)$", block).group(1).strip()
+                for block in action_steps()
+                if var in block
+            ]
+            with self.subTest(var):
+                self.assertEqual(readers, ["Post the review"])
+        post = find_step("Post the review")
+        env = post[post.index("\n      env:\n") :]
+        self.assertIn("inputs.github_token", env)
+        self.assertNotIn("inputs.github_token", post[: post.index("\n      env:\n")])
+
+    def test_the_review_step_holds_no_app_input_or_token(self):
+        block = find_step("Review the pull request")
+        for needle in ("app_id", "app_private_key", "app-token", "github_token", "bot_login"):
+            with self.subTest(needle):
+                self.assertNotIn(needle, block)
+
+    def test_the_new_identity_inputs_default_to_empty(self):
+        for name in ("app_id", "app_private_key", "github_token", "bot_login"):
+            with self.subTest(name):
+                self.assertEqual(input_default(name), "")
+        self.assertEqual(input_default("suggest_reviewers"), "false")
 
     def test_post_step_pins_uv_and_the_platform(self):
         self.assertIn('review-pr.sh" post', run_text(find_step("Post the review")))
@@ -202,14 +403,17 @@ class ActionStaticTests(PanelTestCase):
                 continue
             self.assertIn("steps.check.outputs.skip != 'true'", block)
 
-    def test_only_review_and_post_honor_stand_down(self):
+    def test_only_review_the_mint_and_post_honor_stand_down(self):
         gated = [
             re.search(r"(?m)^name:\s*(.+)$", block).group(1).strip()
             for block in action_steps()
             if "steps.standdown.outputs.stand_down" in block
         ]
-        self.assertEqual(gated, ["Review the pull request", "Post the review"])
-        for step in gated:
+        self.assertEqual(
+            gated, ["Review the pull request", "Mint the posting token", "Post the review"]
+        )
+        # The mint adds its own app_id condition, checked with its other options.
+        for step in ("Review the pull request", "Post the review"):
             with self.subTest(step):
                 self.assertRegex(
                     find_step(step),
@@ -441,6 +645,7 @@ class ActionStaticTests(PanelTestCase):
             ("Post the review", "AI_REVIEW_MODE", "inputs.mode"),
             ("Post the review", "AI_REVIEW_DEEP_JOB", "inputs.deep_review_job"),
             ("Post the review", "AI_REVIEW_RECOMMEND_DEEP", "inputs.recommend_deep_review"),
+            ("Post the review", "AI_REVIEW_SUGGEST_REVIEWERS", "inputs.suggest_reviewers"),
             (
                 "Remove the checkout",
                 "AI_REVIEW_AGENTIC_CI_VERSION",
