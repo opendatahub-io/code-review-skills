@@ -1,6 +1,6 @@
 # Running reviews centrally with a GitHub App
 
-This guide is for an organization that wants one place to maintain the AI review setup for many repositories, and wants the reviews to post under its own GitHub App instead of `github-actions[bot]`. It builds on the [GitHub Action](../README.md#github-action) section of the README, which covers the action itself, its inputs and its limitations.
+This guide is for an organization that wants one place to maintain the AI review setup for many repositories, and wants the reviews to post under its own GitHub App instead of `github-actions[bot]`. It builds on the [GitHub Action](../README.md#github-action) section of the README, which covers the action itself, its [inputs](../README.md#inputs) and its limitations, and starts from the single-repository [setup](../README.md#setup).
 
 The recommended setup is an organization reusable workflow with a thin caller in each repository:
 
@@ -162,7 +162,7 @@ Add any other credential the harness needs (for example `CLAUDE_CODE_OAUTH_TOKEN
 Notes:
 
 - A called workflow sees the caller's event, so `github.event_name` is still `pull_request` and the action works unchanged.
-- `runs-on: ubuntu-latest` suits the default `openshell` backend, which starts a privileged Docker container. On a self-hosted runner that container is root on the host. See the README for the backend choice and the `podman` fallback.
+- `runs-on: ubuntu-latest` suits the default `openshell` backend, which starts a privileged Docker container. On a self-hosted runner that container is root on the host. See [Backends](../README.md#backends) in the README for the backend choice and the `podman` fallback.
 - Pin the action by full commit SHA here, and have callers pin this workflow by full commit SHA too. A branch reference would let anyone who can push to the central repository run new code with every caller's secrets.
 
 ## The caller in each repository
@@ -185,9 +185,13 @@ jobs:
   review:
     # Every label change starts a run; the standard review ignores them.
     if: github.event.action != 'labeled'
-    # Job-level groups, so the standard and the deep review never cancel each other.
+    # Job-level groups, so the standard and the deep review never cancel each other. Label
+    # events get a group of their own, so they can never cancel a standard review in flight.
     concurrency:
-      group: ai-review-${{ github.event.pull_request.number }}
+      group: >-
+        ${{ github.event.action != 'labeled'
+            && format('ai-review-{0}', github.event.pull_request.number)
+            || format('ai-review-noop-{0}', github.run_id) }}
       cancel-in-progress: true
     uses: my-org/ai-review-workflows/.github/workflows/ai-review.yml@1111111111111111111111111111111111111111
     with:

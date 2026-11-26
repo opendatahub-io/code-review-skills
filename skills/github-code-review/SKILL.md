@@ -13,7 +13,7 @@ description: >
 allowed-tools: Read Grep Glob
 user-invocable: true
 argument-hint: "<repo-dir> <diff-file> <base-sha> <head-sha> <output-path> [instructions-file]"
-compatibility: Reads files and writes one JSON file, nothing else. Run by the repo's GitHub Action, which posts the JSON with review.py. Works under Claude Code and Codex. Codex loads the skill from its runner image, which needs a build that includes this skill.
+compatibility: Reads files and writes one JSON file, nothing else. Run by the repo's GitHub Action, which posts the JSON with review.py. Works under Claude Code and Codex. Codex loads the skill from its agentic-ci image (codex-sandbox, or codex-runner with Podman), which must ship this skill (an agentic-ci release after 0.5.15, or a :latest image built after 2026-11-25).
 metadata:
   author: ODH
   version: "1.0"
