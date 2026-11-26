@@ -33,7 +33,8 @@ jobs:
       issues: write
       actions: read
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # Two image pulls of up to 15 minutes each, 20 agent minutes, then the post.
+    timeout-minutes: 60
     env:
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
     steps:
@@ -50,8 +51,9 @@ jobs:
         uses: ./
         with:
           recommend_deep_review: 'true'
-          # The deep job below also runs on Renovate pull requests. A name no job has keeps this
-          # review from standing down for it, so both paths are tested on the same commit.
+          # The deep job below also runs on Renovate pull requests, after this one. A name no job
+          # has keeps this review from standing down for it, so both paths are tested on the
+          # same commit.
           deep_review_job: e2e-no-stand-down
 
       - name: Check that the review was posted
@@ -66,8 +68,13 @@ jobs:
   deep-review:
     # The name the standard job's deep_review_job would have to match: it does not, on purpose.
     name: deep-review
-    # Renovate's image bumps, and any pull request while the deep-review label is set.
+    # Renovate's image bumps, and any pull request while the deep-review label is set. Both jobs
+    # post as the same bot and replace each other's summary and threads, so the deep review
+    # waits for the standard one to post and pass its check, or to be skipped.
+    needs: review
     if: >-
+      !cancelled() &&
+      (needs.review.result == 'success' || needs.review.result == 'skipped') &&
       github.event.pull_request.head.repo.full_name == github.repository &&
       !github.event.pull_request.draft &&
       (
