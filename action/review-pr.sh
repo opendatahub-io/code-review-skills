@@ -194,7 +194,10 @@ cmd_prepare() {
     rm -rf -- "$OUT_DIR" "$PLUGIN_DIR" "$AI_DIR/repo"
     rm -f -- "$DIFF_FILE" "$INSTRUCTIONS_FILE"
     mkdir -p "$OUT_DIR" "$PLUGIN_DIR" "$AI_DIR/repo"
-    git diff --no-ext-diff --no-textconv "$merge_base" "$head" >"$DIFF_FILE"
+    # --text: the PR's .gitattributes must not mark files binary and hide their changes.
+    # The prefixes and color are fixed so no runner-wide git config changes the format.
+    git diff --no-ext-diff --no-textconv --text --no-color --src-prefix=a/ --dst-prefix=b/ \
+        "$merge_base" "$head" >"$DIFF_FILE"
 
     # The agent gets the working tree without .git, so it cannot reach the config, the object
     # store or anything git would run later. Not git archive: it honors the PR's export-ignore.
@@ -352,11 +355,30 @@ cmd_post() {
         "$review_py" post --platform github "$copy_dir/ai-review-output.json"
 }
 
+# agentic-ci stops its container only when it exits normally. A SIGKILL (the timeout's kill
+# after the grace period, or a cancelled run) leaves the container running with the model
+# credentials, so remove any agentic-ci container that mounts this run's workdir.
+remove_review_containers() {
+    command -v podman >/dev/null 2>&1 || return 0
+    local id source failed=0
+    while IFS= read -r id; do
+        [ -n "$id" ] || continue
+        while IFS= read -r source; do
+            if [ "$source" = "$AI_DIR" ]; then
+                podman rm -f "$id" >/dev/null || failed=1
+                break
+            fi
+        done < <(podman inspect --format '{{range .Mounts}}{{println .Source}}{{end}}' "$id" 2>/dev/null)
+    done < <(podman ps -a --filter 'name=^agentic-ci-' --format '{{.ID}}' 2>/dev/null)
+    return "$failed"
+}
+
 cmd_cleanup() {
     [ -n "${GITHUB_WORKSPACE:-}" ] || error "GITHUB_WORKSPACE is not set"
 
     # Attempt every removal: one that fails must not leave the credential directory behind.
     local dir failed=0
+    remove_review_containers || failed=1
     for dir in "$AI_DIR" "$HEAD_DIR"; do
         if [ -d "$dir" ] && [ ! -L "$dir" ]; then
             rm -rf -- "$dir" || failed=1

@@ -64,7 +64,7 @@ The plugin provides four skills and one GitHub Action. Each SKILL.md orchestrate
 
 - `allowed-tools` has no Bash and no Write or Edit, so a local user gets a normal permission prompt. In the action, agentic-ci runs the agent with every tool enabled inside the container, so the container, the checkout kept out of the mount and the post step's validation of the one output file are what hold
 - The action never calls `claude` directly: it runs `agentic-ci` through `uvx`, pinned by `agentic_ci_version`
-- The output path is an argument. The skill never posts and never runs commands
+- The output path is an argument. The skill never posts, and in the action it runs no commands
 - Posting is `review.py` by absolute path with `UV_NO_CONFIG=1`, run only by the action's post step, never by the agent
 - Every `uses:` in `action.yml` is a full commit SHA
 

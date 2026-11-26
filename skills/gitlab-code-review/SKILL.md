@@ -176,7 +176,7 @@ Execute it directly (not via `python`) to invoke uv via the shebang:
 ./scripts/review.py post /tmp/ai-review-output.json
 ```
 
-The script auto-detects the platform (GitLab CI or local). GitHub pull requests go through the `github-code-review` GitHub Action instead, not this skill. The script handles:
+The script auto-detects the platform (GitLab CI or local). GitHub pull requests go through the repo's GitHub Action (which runs the `github-code-review` skill) instead, not this skill. The script handles:
 
 - JSON validation and chill-mode filtering (controlled by `$CHILL_MODE` env var)
 - Rendering `fix` objects as applicable GitLab suggestions (disabled when

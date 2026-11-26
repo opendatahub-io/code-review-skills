@@ -955,10 +955,8 @@ _GITHUB_SHA_RE = re.compile(r"^[0-9a-f]{40,64}$")
 _GITHUB_NEXT_LINK_RE = re.compile(r'<([^>]+)>\s*;\s*rel="next"')
 
 # A backtick fence's info string may not contain a backtick.
-_FENCE_OPEN_RE = re.compile(r"^ {0,3}(`{3,}(?=[^`]*$)|~{3,})")
+_FENCE_OPEN_RE = re.compile(r"^( {0,3})(`{3,}(?=[^`]*$)|~{3,})")
 _FENCE_CLOSE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})[ \t]*$")
-# A backslash pair is consumed first, so an escaped backtick opens no span.
-_CODE_SPAN_RE = re.compile(r"\\.|(?<!`)(`+)(?!`)(.+?)(?<!`)\1(?!`)")
 _MENTION_RE = re.compile(r"(?<![A-Za-z0-9])(@|&#0*64;|&#[xX]0*40;|&commat;)(?=[A-Za-z0-9])")
 
 _GITHUB_THREADS_QUERY = """
@@ -1318,58 +1316,53 @@ def _github_delete_previous_threads(
 def _scan_fences(text: str) -> tuple[list[tuple[str, bool]], str | None]:
     """Split ``text`` into lines flagged as inside a fenced block (fences included).
 
-    Also returns the opening fence still unclosed at the end, if any.
+    Also returns a closer for the fence still open at the end, if any. The
+    closer keeps the opener's indentation, so a fence opened inside a list
+    item closes there instead of opening a new top-level fence.
     """
     lines: list[tuple[str, bool]] = []
     fence: str | None = None
+    indent = ""
     for line in text.split("\n"):
         if fence is None:
             opened = _FENCE_OPEN_RE.match(line)
             if opened:
-                fence = opened.group(1)
+                indent, fence = opened.group(1), opened.group(2)
             lines.append((line, bool(opened)))
             continue
         lines.append((line, True))
         closed = _FENCE_CLOSE_RE.match(line)
         if closed and closed.group(1)[0] == fence[0] and len(closed.group(1)) >= len(fence):
             fence = None
-    return lines, fence
+    return lines, (f"{indent}{fence}" if fence else None)
 
 
-def _neutralize_mentions(line: str) -> str:
-    """Put a zero-width space after each @ (or its HTML entity) outside inline code spans."""
+def _github_defuse(text: str) -> str:
+    """Put a zero-width space after each ``<!--`` and each @ (or its HTML entity).
 
-    def defuse(chunk: str) -> str:
-        return _MENTION_RE.sub(lambda m: m.group(1) + _ZWSP, chunk)
-
-    parts: list[str] = []
-    pos = 0
-    for span in _CODE_SPAN_RE.finditer(line):
-        if span.group(1) is None:
-            continue
-        parts.append(defuse(line[pos : span.start()]))
-        parts.append(span.group(0))
-        pos = span.end()
-    parts.append(defuse(line[pos:]))
-    return "".join(parts)
-
-
-def _github_text(text: str, *, mentions: bool = True) -> str:
-    """Make model-written text safe to post as a GitHub comment.
-
-    ``<!--`` gets a zero-width space everywhere, fences and code spans
-    included, because the ownership marker is matched on the raw text.
-    Mentions (``@user``, ``@org/team``) are defused outside code spans and
-    fenced blocks, so code such as ``@property`` stays copy-pasteable. Pass
-    ``mentions=False`` for text that goes inside a fenced block anyway.
+    Applies everywhere in model text, code spans and fences included. Finding
+    code by regex is not reliable (HTML blocks, spans across lines, list
+    indentation), and a missed span leaves a live mention. A zero-width space
+    in a code sample costs only copy-paste fidelity.
     """
     text = text.replace("<!--", f"<{_ZWSP}!--")
-    if not mentions:
-        return text
-    lines, open_fence = _scan_fences(text)
-    safe = "\n".join(line if in_code else _neutralize_mentions(line) for line, in_code in lines)
-    # A fence left open would swallow the next fragment of the body and hide its mentions.
-    return f"{safe}\n{open_fence}" if open_fence else safe
+    return _MENTION_RE.sub(lambda m: m.group(1) + _ZWSP, text)
+
+
+def _github_text(text: str) -> str:
+    """Make model-written text safe to post as one fragment of a GitHub comment.
+
+    ``<!--`` is defused because the ownership marker is matched on the raw
+    text, and mentions (``@user``, ``@org/team``) so model text cannot ping
+    anyone. A fence left open is closed, so it cannot swallow the next fragment.
+    """
+    return _github_close_fence(_github_defuse(text))
+
+
+def _github_close_fence(text: str) -> str:
+    """Close a fence left open at the end of ``text``."""
+    _, open_fence = _scan_fences(text)
+    return f"{text}\n{open_fence}" if open_fence else text
 
 
 def _longest_backtick_run(text: str) -> int:
@@ -1550,7 +1543,11 @@ def _github_build_summary_body(
                 comment = c["comment"]
                 if max_chars is not None and len(comment) > max_chars:
                     comment = comment[: max_chars - 1] + "\u2026"
-                text = _github_text(f"- {where} ({c['severity']}): {comment}")
+                # The path sits in a code span built here, so only the comment is defused.
+                # The fence check runs on the whole line: the prefix can make an opener prose.
+                text = _github_close_fence(
+                    f"- {where} ({c['severity']}): {_github_defuse(comment)}"
+                )
                 lines.append(text.replace("\n", "\n  "))
             if len(ranked) > _GITHUB_LISTED_FINDINGS:
                 lines.append(f"- ... and {len(ranked) - _GITHUB_LISTED_FINDINGS} more not listed")
@@ -1561,7 +1558,7 @@ def _github_build_summary_body(
             lines.append(
                 "\n**Copy-paste this into a prompt to automatically fix the issues found:**"
             )
-            lines.append(f"\n{fence}\n{_github_text(fix_prompt, mentions=False)}\n{fence}")
+            lines.append(f"\n{fence}\n{_github_defuse(fix_prompt)}\n{fence}")
         return "\n".join(lines) + footer
 
     text = assemble(None)

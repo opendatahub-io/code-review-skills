@@ -83,6 +83,9 @@ runs:
       with:
         # uvx runs agentic-ci and uv runs review.py. The default cache would hash the PR's whole tree.
         enable-cache: false
+        # setup-uv reads required-version from a uv.toml or pyproject.toml here. The workspace
+        # root can hold the PR's files, which could pick a uv that ignores UV_NO_CONFIG.
+        working-directory: ${{ github.action_path }}
 
     - name: Review the pull request
       if: steps.check.outputs.skip != 'true'

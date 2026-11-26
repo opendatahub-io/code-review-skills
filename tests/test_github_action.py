@@ -231,6 +231,10 @@ class ActionStaticTests(PanelTestCase):
         block = find_step("Set up uv")
         self.assertRegex(block, r"(?m)^\s*enable-cache:\s*false\s*$")
 
+    def test_setup_uv_reads_its_version_from_the_action_not_the_workspace(self):
+        block = find_step("Set up uv")
+        self.assertRegex(block, r"(?m)^\s*working-directory:\s*\$\{\{ github\.action_path \}\}\s*$")
+
     def test_readme_example_job_sets_a_timeout(self):
         self.assertRegex(README.read_text(encoding="utf-8"), r"(?m)^    timeout-minutes:\s*\d+\s*$")
 
@@ -284,12 +288,6 @@ class ActionStaticTests(PanelTestCase):
         self.assertNotIn("checkout_state_sha", script)
         for doc in ("README.md", "AGENTS.md"):
             self.assertNotIn("checkout changed", (REPO_ROOT / doc).read_text(encoding="utf-8"))
-
-    def test_the_script_leaves_container_teardown_to_agentic_ci(self):
-        script = without_comments(SCRIPT.read_text(encoding="utf-8"))
-        self.assertNotIn("podman rm", script)
-        self.assertNotIn("CONTAINER_NAME", script)
-        self.assertNotIn("remove_container", script)
 
     def test_agent_runs_under_an_interrupting_timeout_with_a_margin(self):
         review = script_function("cmd_review")
@@ -358,6 +356,7 @@ def write_executable(path: Path, body: str) -> Path:
 
 # Stands in for podman, so no test touches a real container: records each call.
 FAKE_PODMAN = """
+import json
 import os
 import sys
 
@@ -365,6 +364,14 @@ with open(os.environ["FAKE_PODMAN_LOG"], "a", encoding="utf-8") as f:
     f.write(" ".join(sys.argv[1:]) + "\\n")
 with open(os.environ["FAKE_PODMAN_LOG"] + ".tmpdir", "a", encoding="utf-8") as f:
     f.write(os.environ.get("TMPDIR", "") + "\\n")
+# FAKE_PODMAN_CONTAINERS maps container IDs to their mount sources, for ps and inspect.
+containers = json.loads(os.environ.get("FAKE_PODMAN_CONTAINERS", "{}"))
+if sys.argv[1:2] == ["ps"]:
+    print("\\n".join(containers))
+elif sys.argv[1:2] == ["inspect"]:
+    print("\\n".join(containers.get(sys.argv[-1], [])))
+elif sys.argv[1:3] == ["rm", "-f"]:
+    sys.exit(int(os.environ.get("FAKE_PODMAN_RM_STATUS", "0")))
 sys.exit(int(os.environ.get("FAKE_PODMAN_STATUS", "0")))
 """
 
@@ -585,6 +592,25 @@ class PrepareTests(ScriptTestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual(Path(self.repo_dir, "secret.txt").read_text(encoding="utf-8"), "s\n")
         self.assertTrue(Path(self.repo_dir, ".gitattributes").is_file())
+
+    def test_diff_shows_files_the_pr_marks_binary(self):
+        repo, base, head = self.make_pr()
+        head = commit(repo, {".gitattributes": "* -diff\n", "hidden.py": "evil()\n"})
+        proc = self.prepare(repo, base, head)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        diff = Path(self.ai_dir, "pr.diff").read_text(encoding="utf-8")
+        self.assertIn("+evil()", diff)
+        self.assertNotIn("Binary files", diff)
+
+    def test_diff_format_ignores_the_runner_git_config(self):
+        repo, base, head = self.make_pr()
+        git(repo, "config", "diff.noprefix", "true")
+        git(repo, "config", "color.ui", "always")
+        proc = self.prepare(repo, base, head)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        diff = Path(self.ai_dir, "pr.diff").read_text(encoding="utf-8")
+        self.assertIn("+++ b/feature.txt", diff)
+        self.assertNotIn("\x1b[", diff)
 
     def test_stale_export_is_replaced(self):
         repo, base, head = self.make_pr()
@@ -1315,9 +1341,34 @@ class CleanupTests(ScriptTestCase):
         shutil.rmtree(self.ai_dir)
         self.assertEqual(self.cleanup().returncode, 0)
 
-    def test_cleanup_does_not_call_podman(self):
-        self.cleanup()
-        self.assertEqual(self.podman_calls(), [])
+    def test_cleanup_removes_only_containers_that_mount_the_workdir(self):
+        containers = {"c1": [self.ai_dir], "c2": ["/elsewhere"], "c3": ["/x", self.ai_dir]}
+        proc = self.cleanup(FAKE_PODMAN_CONTAINERS=json.dumps(containers))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        removed = [c for c in self.podman_calls() if c.startswith("rm ")]
+        self.assertEqual(removed, ["rm -f c1", "rm -f c3"])
+
+    def test_cleanup_without_containers_only_lists_them(self):
+        proc = self.cleanup()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual([c.split()[0] for c in self.podman_calls()], ["ps"])
+
+    def test_a_failed_container_removal_still_removes_the_workdirs_and_fails(self):
+        proc = self.cleanup(
+            FAKE_PODMAN_CONTAINERS=json.dumps({"c1": [self.ai_dir]}), FAKE_PODMAN_RM_STATUS="1"
+        )
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertFalse(os.path.exists(self.ai_dir))
+
+    def test_cleanup_without_podman_still_removes_the_workdirs(self):
+        # Only the tools cleanup needs, so a podman installed on the host stays out of reach.
+        tools = os.path.join(self.tmp, "tools")
+        os.makedirs(tools)
+        for tool in ("bash", "rm"):
+            os.symlink(shutil.which(tool), os.path.join(tools, tool))
+        proc = self.cleanup(PATH=tools)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertFalse(os.path.exists(self.ai_dir))
 
     def test_a_symlink_is_not_followed(self):
         for path in (self.ai_dir, self.head_dir):
