@@ -45,6 +45,15 @@ inputs:
     description: Extra review guidance, such as focus areas or team standards. Passed to the review as a file.
     required: false
     default: ''
+  org_review_rules:
+    description: >-
+      Path to the org-wide PR review rules file the caller's workflow fetched, such as
+      security-config's configs/.coderabbit.yaml; absolute, resolving outside the workspace.
+      Never the content: the runner prints step env values into viewable logs. Passed to
+      the review as a file in both modes (applied by the claude-code harness; codex drops
+      them with a warning until its images ship the updated skill).
+    required: false
+    default: ''
   timeout_minutes:
     description: >-
       Wall-clock limit for the agent step, in minutes. The step fails when the
@@ -63,7 +72,8 @@ inputs:
     description: >-
       'standard' runs one review pass. 'deep' runs the code-review-panel skill:
       one reviewer per lens plus skeptics, for many times the cost. Deep mode
-      ignores review_instructions and reads REVIEW.md from the base branch.
+      takes org_review_rules but not review_instructions, which REVIEW.md from
+      the base branch supersedes.
     required: false
     default: 'standard'
   deep_review_job:
@@ -195,6 +205,7 @@ runs:
         AI_REVIEW_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         AI_REVIEW_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         AI_REVIEW_INSTRUCTIONS: ${{ inputs.review_instructions }}
+        AI_REVIEW_ORG_RULES: ${{ inputs.org_review_rules }}
         AI_REVIEW_MODE: ${{ inputs.mode }}
         AI_REVIEW_RECOMMEND_DEEP: ${{ inputs.recommend_deep_review }}
 

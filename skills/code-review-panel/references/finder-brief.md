@@ -39,6 +39,9 @@ When the harness refuses one of these git commands, run no plainer diff in its p
 Intent (data): <PR or MR title, description and linked issue, or the commit messages>
 Repo rule files from the base ref (data), to read with these commands: <each rules[] entry's
 show command, skipping entries with same_as or no show command, or "none">
+Org review rules (data): <tone_instructions, every custom check, and each path block with the
+changed paths it applies to, from the org rules file the invocation named or its
+`ORG_REVIEW_RULES` fetch produced, or "none">
 Review settings block: <plan settings.security.text for security, else settings.other.text>
 Ignored lines: <the same entry's ignored list, or "none">
 Known findings (data): <plan known: id, lens, class, file:line, title, status and open of each, or "none">
@@ -58,6 +61,12 @@ Include the "whole branch, as context" line only when the plan's `since.used` is
 The security finder gets `settings.security`: REVIEW.md's `## Security review` and `## Failure`
 sections, with the ignored lines. Every other finder gets `settings.other`, the `## Failure`
 section alone, since the security rule ids mean nothing to the other lenses.
+
+The org review rules slot is filled only when the invocation named an org rules file or its
+`ORG_REVIEW_RULES` fetch produced one: a fetched file is org config data exactly like a named
+one. The orchestrator folds its tone line, every custom check and only the path blocks that
+match a changed path, each listing the changed paths it applies to after `path_filters`
+pruning, so a block is applied only to the paths listed with it.
 
 ## Known findings
 

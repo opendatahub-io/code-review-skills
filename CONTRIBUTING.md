@@ -140,7 +140,7 @@ Example: `feat: add GitHub PR posting support`
 - Put personas and prompt text in Markdown under `references/`, since Codex ignores `agents/`
 - Use regular files only: flat installs skip symlinks, and they register every `SKILL.md` they find, so keep one per skill root
 - Use `text` fences, not `python`, for Python snippets and prompt text in Markdown, because ruff formats `python` blocks; shell commands may use `bash`
-- Bump the version in `.claude-plugin/plugin.json` on every skill change, so Claude Code and Codex refresh their cached copy
+- Do not bump the version in `.claude-plugin/plugin.json` in a feature PR: it is bumped together with the skills-registry entry when a release is cut
 - [CLAUDE.md](CLAUDE.md) lists the files that change together across skills
 
 ## Code of Conduct

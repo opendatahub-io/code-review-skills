@@ -35,6 +35,8 @@
 #   AI_REVIEW_BASE_SHA            pull_request.base.sha (prepare, review)
 #   AI_REVIEW_HEAD_SHA            pull_request.head.sha (prepare, review)
 #   AI_REVIEW_INSTRUCTIONS        review_instructions input (prepare, review)
+#   AI_REVIEW_ORG_RULES           org_review_rules input: a path to the caller-fetched rules
+#                                 file (prepare)
 #   AI_REVIEW_MODEL               model input (review)
 #   AI_REVIEW_TIMEOUT_MINUTES     timeout_minutes input (review)
 #   AI_REVIEW_AGENTIC_CI_VERSION  agentic_ci_version input (review, cleanup): a PyPI version for
@@ -62,6 +64,7 @@
 #   repo/                         the checkout's working tree, exported without its .git, plus
 #                                 a fresh .git with the history of the base and the head
 #   pr.diff, instructions.md      inputs of the review
+#   org-rules.yaml                the org review rules, in both modes
 #   plugin/                       a copy of this action, loaded with --plugin-dir
 #   out/                          the only place the review writes
 #
@@ -78,6 +81,7 @@ AI_DIR="${GITHUB_WORKSPACE:-}/.ai-review"
 HEAD_DIR="${GITHUB_WORKSPACE:-}/.ai-review-head"
 DIFF_FILE="$AI_DIR/pr.diff"
 INSTRUCTIONS_FILE="$AI_DIR/instructions.md"
+ORG_RULES_FILE="$AI_DIR/org-rules.yaml"
 PLUGIN_DIR="$AI_DIR/plugin"
 OUT_DIR="$AI_DIR/out"
 OUT="$OUT_DIR/ai-review-output.json"
@@ -125,6 +129,9 @@ MIN_GIT_MAJOR=2
 MIN_GIT_MINOR=29
 # The largest review output the post step accepts, in bytes.
 MAX_OUTPUT_BYTES=1048576
+# The largest org review rules file prepare copies, in bytes. The real security-config file
+# is about 63 KB; a bigger input means the caller pointed org_review_rules at the wrong file.
+MAX_RULES_BYTES=102400
 REVIEW_PY_REL="skills/gitlab-code-review/scripts/review.py"
 PANEL_PY_REL="skills/code-review-panel/scripts/panel.py"
 # The directory under RUNNER_TEMP that holds the triage plan, and the plan's largest size in bytes,
@@ -513,7 +520,7 @@ cmd_prepare() {
 
     mkdir -p -- "$AI_DIR"
     rm -rf -- "$OUT_DIR" "$PLUGIN_DIR" "$AI_DIR/repo"
-    rm -f -- "$DIFF_FILE" "$INSTRUCTIONS_FILE"
+    rm -f -- "$DIFF_FILE" "$INSTRUCTIONS_FILE" "$ORG_RULES_FILE"
     # A plan from an earlier run must not reach this run's summary.
     local dir
     if dir="$(triage_dir)"; then
@@ -541,9 +548,37 @@ cmd_prepare() {
     # where earlier steps can leave credentials, and the workdirs themselves.
     tar -C "$GITHUB_ACTION_PATH" -cf - .claude-plugin skills | tar -C "$PLUGIN_DIR" -xf -
 
-    # Deep mode never passes the instructions, so they stay off the mount.
+    # Per-repo instructions stay off the mount in deep mode, where REVIEW.md supersedes them.
     if [ "$REVIEW_MODE" = "standard" ] && [ -n "${AI_REVIEW_INSTRUCTIONS:-}" ]; then
         printf '%s' "$AI_REVIEW_INSTRUCTIONS" >"$INSTRUCTIONS_FILE"
+    fi
+    # Org-wide policy rules mount in both modes, unlike the per-repo instructions. The input
+    # is a path to a file the caller fetched, never the content: the runner prints each step
+    # env value into the log, which would publish the internal rules in viewable logs.
+    if [ -n "${AI_REVIEW_ORG_RULES:-}" ]; then
+        local rules_src="${AI_REVIEW_ORG_RULES}"
+        case "$rules_src" in
+            /*) ;;
+            *) error "org_review_rules must be an absolute path outside the workspace: $AI_REVIEW_ORG_RULES" ;;
+        esac
+        [ -f "$rules_src" ] && [ ! -L "$rules_src" ] \
+            || error "org_review_rules is not a regular file: $AI_REVIEW_ORG_RULES"
+        # Resolved on both sides, so a symlinked workspace or a symlinked path component
+        # cannot point into the workspace: the PR checkout lives there, and a PR must not
+        # supply its own org rules through the caller's input.
+        local rules_real workspace_real
+        rules_real="$(realpath -- "$rules_src")"
+        workspace_real="$(realpath -- "$GITHUB_WORKSPACE")"
+        case "$rules_real" in
+            "$GITHUB_WORKSPACE"|"$GITHUB_WORKSPACE"/*|"$workspace_real"|"$workspace_real"/*)
+                error "org_review_rules must point outside the workspace: $AI_REVIEW_ORG_RULES"
+                ;;
+        esac
+        local rules_bytes
+        rules_bytes="$(wc -c <"$rules_src")"
+        [ "$rules_bytes" -le "$MAX_RULES_BYTES" ] \
+            || error "org_review_rules is $rules_bytes bytes, over the $MAX_RULES_BYTES limit: the input must name the org rules file, not some other content"
+        cp -- "$rules_src" "$ORG_RULES_FILE"
     fi
 }
 
@@ -784,20 +819,29 @@ cmd_review() {
     local prompt
     if [ "$REVIEW_MODE" = "deep" ]; then
         # The panel writes gitlab-code-review's JSON, which the post step validates and posts like
-        # a standard review. It takes the repo's guidance from REVIEW.md at the base ref, so a PR
-        # cannot loosen its own review, and free-form instructions are not passed. One line: the
+        # a standard review. Its guidance comes from REVIEW.md at the base ref, so a PR cannot
+        # loosen its own review, and the per-repo instructions are not passed. The caller-supplied
+        # org policy rules are passed in both modes: they share the caller's workflow file's trust
+        # level, and the cannot-loosen guarantee covers only the base-ref guidance. One line: the
         # prompt is a single argument.
         # On a root runner the agent runs as another user than the owner of the mounted repo, so
         # git refuses it as dubious ownership. A global safe.directory reaches the triage's own
         # git calls and every subagent, where a -c on one command would not.
         local task="the committed changes in $cdir/repo from base $base to head $head. First run git config --global --add safe.directory $cdir/repo, because the repository can belong to another user. Run its triage from inside $cdir/repo with --base $base --head $head, pass --gitlab-json $cdir/out/ai-review-output.json to its final report command, and do not post anything."
+        if [ -f "$ORG_RULES_FILE" ]; then
+            if [ "$harness" = "claude-code" ]; then
+                task="$task Apply the org review rules at $cdir/org-rules.yaml."
+            else
+                warning "org_review_rules is not passed to the codex harness in deep mode yet: its image ships a code-review-panel skill without the org-rules section, so the rules are dropped until that gate is removed."
+            fi
+        fi
         if [ "$harness" = "claude-code" ]; then
             prompt="/code-review-skills:code-review-panel Review $task"
         else
             prompt="Invoke the /code-review-skills:code-review-panel skill to review $task"
         fi
         if [ -n "${AI_REVIEW_INSTRUCTIONS:-}" ]; then
-            warning "review_instructions is ignored in deep mode: the panel reads REVIEW.md from the base branch instead."
+            warning "review_instructions is ignored in deep mode: the panel reads REVIEW.md from the base branch instead. Org-wide policy is the separate org_review_rules input, passed in both modes."
         fi
     else
         if [ "$harness" = "claude-code" ]; then
@@ -807,6 +851,13 @@ cmd_review() {
         fi
         if [ -f "$INSTRUCTIONS_FILE" ]; then
             prompt="$prompt $cdir/instructions.md"
+        fi
+        if [ -f "$ORG_RULES_FILE" ]; then
+            if [ "$harness" = "claude-code" ]; then
+                prompt="$prompt $cdir/org-rules.yaml"
+            else
+                warning "org_review_rules is not passed to the codex harness yet: its image ships a github-code-review skill that takes no org-rules argument, so the rules are dropped until that gate is removed."
+            fi
         fi
     fi
 

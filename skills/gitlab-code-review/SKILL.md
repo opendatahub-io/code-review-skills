@@ -21,10 +21,21 @@ metadata:
 Perform a structured code review of the current branch's changes and post
 results to a GitLab merge request (in CI) or display them locally for preview.
 
-## Step 1: Review Code Changes
+## Step 1: Fetch Org Review Rules
+
+Fetch the org-wide PR review rules before reviewing: run the fetch block in
+[references/org-rules.md](references/org-rules.md), which runs only when
+`ORG_REVIEW_RULES` is `true`, and apply the fetched file by that file's
+contract. With the flag off, the default, there is nothing to do. With it on,
+a missing `gh` or `timeout`, a failed `mktemp`, or a failed fetch degrades as
+designed: append to the eventual `summary` "Org review rules from
+security-config were unavailable: <reason>", citing the captured stderr.
+
+## Step 2: Review Code Changes
 
 Review ALL commits in the branch since the base branch. Use git commands to
-inspect the changes — do NOT access remote APIs (e.g., `glab` commands).
+inspect the changes — do NOT access remote APIs (e.g., `glab` commands), except
+the org-rules fetch in Step 1.
 
 **IMPORTANT**: In CI, always use `$CI_MERGE_REQUEST_DIFF_BASE_SHA` and
 `$CI_COMMIT_SHA` to define the diff range. Never use `origin/main..HEAD` in
@@ -72,7 +83,7 @@ When referencing coding standards, security norms, best practices, or
 component-specific behavior, search for and cite the authoritative source
 (official documentation, RFCs, upstream references) to back up the claim.
 
-## Step 2: Produce Review JSON
+## Step 3: Produce Review JSON
 
 Write your review output as a JSON file at `/tmp/ai-review-output.json`.
 
@@ -167,7 +178,7 @@ wheel is absent from the target set.
 
 - Omit this field entirely if there are no actionable fixes.
 
-## Step 3: Post Results
+## Step 4: Post Results
 
 Run the `review.py` script from this skill's `scripts/` directory.
 Execute it directly (not via `python`) to invoke uv via the shebang:
@@ -189,7 +200,7 @@ The script auto-detects the platform (GitLab CI or local). GitHub pull requests 
 If the script reports a JSON parse error, fix the JSON in
 `/tmp/ai-review-output.json` and re-run the command.
 
-## Step 3.5: Suggest Reviewers (Optional)
+## Step 4.5: Suggest Reviewers (Optional)
 
 If the `$SUGGEST_REVIEWERS` environment variable is set to `"true"`, run:
 
@@ -205,9 +216,9 @@ If a `.git-blame-ignore-revs` file exists at the repo root, commits listed in
 it are excluded from authorship counts, the same way `git blame
 --ignore-revs-file` would treat them.
 
-If the script fails, report the error but continue to Step 4.
+If the script fails, report the error but continue to Step 5.
 
-## Step 4: Report Results
+## Step 5: Report Results
 
 After the script completes successfully:
 
@@ -251,3 +262,5 @@ set automatically — no manual configuration needed.
 | `INLINE_FIXES` | — | `true` | Render `fix` objects as applicable GitLab suggestions |
 | `VERBOSE` | — | `false` | Show detailed API error responses |
 | `SUGGEST_REVIEWERS` | — | `false` | Suggest reviewers based on git history |
+| `ORG_REVIEW_RULES` | Org rules | `false` | Opt in to the org-wide PR review rules: `true` fetches and applies them |
+| `GH_TOKEN` | Org rules fetch | — | Fine-grained read-only token scoped to security-config; local runs use your authenticated `gh` |

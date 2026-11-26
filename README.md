@@ -44,7 +44,7 @@ mkdir -p "${CODEX_HOME:-$HOME/.codex}/skills"
 cp -r /path/to/code-review-skills/skills/* "${CODEX_HOME:-$HOME/.codex}/skills/"
 ```
 
-Copy them all: the panel reads the security review's references and stops when they are missing.
+Copy them all: the panel reads the security review's references and the GitLab review's org-rules reference, and stops when they are missing.
 
 ## Usage
 
@@ -76,6 +76,10 @@ The panel and the security review find the base on their own: GitLab CI merge re
 | `CI_COMMIT_SHA` | GitLab CI | -- | Head commit SHA |
 | `CHILL_MODE` | -- | `true` | Filter out suggestion-level comments |
 | `VERBOSE` | -- | `false` | Show detailed API error responses |
+| `ORG_REVIEW_RULES` | Org rules | `false` | Opt in to the org-wide PR review rules: `true` fetches and applies them |
+| `GH_TOKEN` | Org rules | -- | Fine-grained read-only token scoped to security-config; local runs use your authenticated `gh` |
+
+The GitLab review can apply the org-wide PR review rules from `opendatahub-io/security-config` (`configs/.coderabbit.yaml`, at `main`). It is opt-in: set `ORG_REVIEW_RULES` to `true` and the skill fetches the file itself with `gh api`, bounded by `timeout 30`, before reviewing, so the source (repo, path and ref) stays fixed in the skill instead of in per-repo CI text. The runner needs `gh` in its image, a `GH_TOKEN` that can read the internal security-config repo, and egress to github.com. Give the job a fine-grained, read-only token scoped to security-config alone: the review agent reads MR text, so the fetch token should hold nothing else. Until agentic-ci forwards `ORG_REVIEW_RULES` and `GH_TOKEN` into the review sandbox, the opt-in works in local runs and in CI jobs whose image passes both through. With the flag on and the fetch unavailable, or when the blob exceeds the 1 MiB guard, the review continues without the org rules and says so in its summary; with the flag off, the default, nothing is fetched and no note is added.
 
 ### REVIEW.md
 
@@ -214,6 +218,7 @@ The steps that run on the runner always use the action's own copy: `review.py` p
 | `mode` | `standard` | `standard` runs one review pass with `github-code-review`. `deep` runs `code-review-panel`, which ignores `review_instructions` (see [Deep review](#deep-review)). |
 | `timeout_minutes` | `20` standard, `75` deep | Wall-clock limit for the agent step. The step fails when the review takes longer. Empty picks the default for the mode. Keep the job's `timeout-minutes` above it. |
 | `review_instructions` | -- | Extra guidance such as focus areas or team standards, passed to the review as a file. Standard mode only. |
+| `org_review_rules` | -- | Path to the org-wide PR review rules file the caller's workflow fetched, such as `opendatahub-io/security-config`'s `configs/.coderabbit.yaml`; absolute, outside the workspace, a regular file of at most 100 KiB. Passed to the review as a file in both modes (applied by the claude-code harness; codex drops them with a warning until its images ship the updated skill). |
 | `chill_mode` | `true` | Drop suggestion-level comments. |
 | `inline_fixes` | `true` | Post `fix` objects as applicable suggestions. |
 | `recommend_deep_review` | `false` | Standard mode only. Before the agent starts, run the panel's triage on the runner and, when it picks the deep tier, add a line to the summary that recommends adding the `deep_review_label` label and names what triggered it (see [The deep review recommendation](#the-deep-review-recommendation)). |
@@ -224,6 +229,8 @@ The steps that run on the runner always use the action's own copy: `review.py` p
 | `app_private_key` | -- | Private key of that App. Pass it from a secret. |
 | `github_token` | -- | A token to post with instead, such as one you minted or a fine-grained personal access token (see [Posting identity](#posting-identity)). |
 | `bot_login` | -- | The login `github_token` posts as: `<app-slug>[bot]` for an App token, or the user's login for a personal access token. Read only with `github_token`. A value that is neither fails the job before the review runs. |
+
+`org_review_rules` carries org-wide policy, so the caller's workflow does the authenticated fetch and passes the path of the fetched file: the action needs no token or App installation on the rules repository, and the content never travels through a step environment, which the runner prints into viewable logs. A step can fetch it with `timeout 30 gh api --hostname github.com -H "Accept: application/vnd.github.raw" "repos/opendatahub-io/security-config/contents/configs/.coderabbit.yaml?ref=main" > "$RUNNER_TEMP/org-rules.yaml"`, publish the path as a step output only after a successful fetch, and pass `steps.<id>.outputs.path` to the input, which fixes the rules revision in the caller (the central workflow example in [docs/github-app.md](docs/github-app.md) does exactly that, and warns instead of publishing an over-cap path). A fetch step that warns and continues must leave the input empty: the path is absolute and resolves outside the workspace (the PR checkout lives there), the file must be a regular file of at most 100 KiB, and anything else fails the prepare step with a clear error. Fork pull requests are skipped before any review runs, so they post nothing at all; a same-repository review whose fetch warned, or whose harness does not apply the rules, still posts without them.
 
 ### Backends
 
@@ -357,7 +364,7 @@ The checks fail open. The standard review finds the deep job through the Actions
 
 `deep_review_job` is the deep job's display name as GitHub shows it: its `name:` when it sets one, otherwise its job key (`deep-review` in the [Setup](#setup) workflow). With `name: Deep review`, set `deep_review_job: Deep review` in the standard job's `with:`. When the deep job calls a reusable workflow, use the calling job's name: GitHub lists the called jobs as `<caller> / <job>`. A matrix job matches as `<name> (<values>)`. The match is exact and case sensitive, so a name that is only a prefix or a suffix of another job's name does not match it. A wrong name means the standard review never finds the deep one: both post, and whichever finishes last replaces the other.
 
-Deep mode ignores `review_instructions` with a warning, because the panel reads its guidance from `REVIEW.md` at the base branch, so a pull request cannot loosen its own review. With `harness: codex`, the panel also comes from the image: `code-review-panel` predates `github-code-review`, so an image that ships the one ships both.
+Deep mode ignores `review_instructions` with a warning, because the panel reads its guidance from `REVIEW.md` at the base branch, so a pull request cannot loosen that base-ref guidance. `org_review_rules` is passed in both modes, standard and deep (applied by the claude-code harness; codex drops them with a warning until its images ship the updated skill): it is caller-supplied like `review_instructions`, so it is as trustworthy as the caller's workflow file, and a same-repo pull request that edits that workflow can change its own input. With `harness: codex`, the panel also comes from the image: `code-review-panel` predates `github-code-review`, so an image that ships the one ships both.
 
 #### The deep review recommendation
 

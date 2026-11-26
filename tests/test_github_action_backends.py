@@ -121,13 +121,19 @@ class OpenShellReviewTestCase(ReviewTestCase):
         lines = Path(self.timeout_log).read_text(encoding="utf-8").splitlines()
         return [json.loads(line) for line in lines]
 
-    def expected_prompt(self, harness: str, mode: str, instructions: bool = False) -> str:
+    def expected_prompt(
+        self, harness: str, mode: str, instructions: bool = False, org_rules: bool = False
+    ) -> str:
         if mode == "deep":
-            return deep_prompt(harness, self.BASE, self.HEAD).replace("/workspace", OPENSHELL_DIR)
+            return deep_prompt(harness, self.BASE, self.HEAD, org_rules=org_rules).replace(
+                "/workspace", OPENSHELL_DIR
+            )
         d = OPENSHELL_DIR
         paths = f"{d}/repo {d}/pr.diff {self.BASE} {self.HEAD} {d}/out/ai-review-output.json"
         if instructions:
             paths += f" {d}/instructions.md"
+        if org_rules:
+            paths += f" {d}/org-rules.yaml"
         if harness == "claude-code":
             return f"/code-review-skills:github-code-review {paths}"
         return (
@@ -346,6 +352,29 @@ class OpenShellReviewTests(OpenShellReviewTestCase):
                 self.assertNotIn("/workspace/", " ".join(tail))
                 if harness == "claude-code":
                     self.assertEqual(tail[1:], ["--", "--plugin-dir", f"{OPENSHELL_DIR}/plugin"])
+
+    def test_the_org_rules_path_is_a_sandbox_path(self):
+        write(self.ai_dir, "org-rules.yaml", "tone_instructions: Be brief.\n")
+        proc = self.openshell_review(AI_REVIEW_HARNESS="claude-code", ANTHROPIC_API_KEY="k")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        argv = self.agent_run()
+        prompt = argv[argv.index("--effort") + 2]
+        self.assertEqual(prompt, self.expected_prompt("claude-code", "standard", org_rules=True))
+        self.assertNotIn("/workspace/", prompt)
+
+    def test_the_deep_org_rules_path_is_a_sandbox_path(self):
+        # The deep sentence is a different string from the standard prompt's path word, so it
+        # must substitute the backend's container dir too.
+        write(self.ai_dir, "org-rules.yaml", "tone_instructions: Be brief.\n")
+        proc = self.openshell_review(
+            AI_REVIEW_MODE="deep", AI_REVIEW_HARNESS="claude-code", ANTHROPIC_API_KEY="k"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        argv = self.agent_run()
+        prompt = argv[argv.index("--effort") + 2]
+        self.assertEqual(prompt, self.expected_prompt("claude-code", "deep", org_rules=True))
+        self.assertIn(f"Apply the org review rules at {OPENSHELL_DIR}/org-rules.yaml.", prompt)
+        self.assertNotIn("/workspace/", prompt)
 
     def test_no_timeout_flag_reaches_agentic_ci(self):
         # OpenShell ignores it, so only the outer limit bounds the run.

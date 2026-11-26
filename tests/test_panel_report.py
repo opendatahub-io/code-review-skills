@@ -240,6 +240,47 @@ class ReportTestCase(PanelTestCase):
 
 
 class StableIdTests(ReportTestCase):
+    def test_a_warning_flag_is_its_own_paragraph_after_the_findings(self) -> None:
+        gitlab = self.path("warn.json")
+        doc = findings_doc([row()])
+        st, _ = self.status(FX.standard, doc)
+        verdicts = [v for k, status in st.items() if status == "pending" for v in upheld(k)]
+        proc = self.report(
+            FX.standard,
+            doc,
+            verdicts,
+            "--warning",
+            "Org review rules unavailable: bad credentials",
+            "--gitlab-json",
+            gitlab,
+        )
+        self.assertIn("Report warnings: Org review rules unavailable: bad credentials", proc.stdout)
+        summary = load_json(gitlab)["summary"]
+        self.assertIn("\n\nWarning: Org review rules unavailable: bad credentials", summary)
+
+    def test_generated_diagnostics_stay_out_of_the_posted_summary(self) -> None:
+        gitlab = self.path("gen-warn.json")
+        # The made-up path generates a diagnostic of its own, which stays in the local
+        # markdown report: only the explicit --warning line reaches the posted summary.
+        doc = findings_doc([row(file="src/nope.py")])
+        st, _ = self.status(FX.standard, doc)
+        verdicts = [
+            verdict(k, s, refuted=True)
+            for k, status in st.items()
+            if status == "pending"
+            for s in ("facts", "impact")
+        ]
+        proc = self.report(
+            FX.standard,
+            doc,
+            verdicts,
+            "--gitlab-json",
+            gitlab,
+        )
+        self.assertIn("does not exist at head", proc.stdout)
+        summary = load_json(gitlab)["summary"]
+        self.assertNotIn("does not exist at head", summary)
+
     def test_documented_example_id(self) -> None:
         self.assertEqual(finding_id("correctness", "off-by-one", "src/a.py"), A)
 

@@ -499,7 +499,14 @@ class ActionStaticTests(PanelTestCase):
 
     def test_the_review_step_holds_no_app_input_or_token(self):
         block = find_step("Review the pull request")
-        for needle in ("app_id", "app_private_key", "app-token", "github_token", "bot_login"):
+        for needle in (
+            "app_id",
+            "app_private_key",
+            "app-token",
+            "github_token",
+            "bot_login",
+            "org_review_rules",
+        ):
             with self.subTest(needle):
                 self.assertNotIn(needle, block)
 
@@ -796,6 +803,7 @@ class ActionStaticTests(PanelTestCase):
             ("Review the pull request", "AI_REVIEW_IMAGE", "inputs.image"),
             ("Review the pull request", "AI_REVIEW_INSTRUCTIONS", "inputs.review_instructions"),
             ("Prepare the diff", "AI_REVIEW_INSTRUCTIONS", "inputs.review_instructions"),
+            ("Prepare the diff", "AI_REVIEW_ORG_RULES", "inputs.org_review_rules"),
             ("Review the pull request", "AI_REVIEW_BACKEND", "inputs.backend"),
             ("Remove the checkout", "AI_REVIEW_BACKEND", "inputs.backend"),
             ("Prepare the diff", "AI_REVIEW_RECOMMEND_DEEP", "inputs.recommend_deep_review"),
@@ -1385,6 +1393,118 @@ class PrepareTests(PrepareTestCase):
         self.prepare(repo, base, head, AI_REVIEW_INSTRUCTIONS="")
         self.assertFalse(Path(self.ai_dir, "instructions.md").exists())
 
+    def test_org_rules_land_verbatim(self):
+        repo, base, head = self.make_pr()
+        text = 'tone_instructions: Be brief.\ncustom_checks:\n  - "quotes" and $HOME\n'
+        write(self.tmp, "org-rules-src.yaml", text)
+        proc = self.prepare(
+            repo, base, head, AI_REVIEW_ORG_RULES=os.path.join(self.tmp, "org-rules-src.yaml")
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(Path(self.ai_dir, "org-rules.yaml").read_text(encoding="utf-8"), text)
+
+    def test_org_rules_land_in_deep_mode_too(self):
+        repo, base, head = self.make_pr()
+        write(self.tmp, "org-rules-src.yaml", "x\n")
+        proc = self.prepare(
+            repo,
+            base,
+            head,
+            AI_REVIEW_MODE="deep",
+            AI_REVIEW_ORG_RULES=os.path.join(self.tmp, "org-rules-src.yaml"),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(Path(self.ai_dir, "org-rules.yaml").read_text(encoding="utf-8"), "x\n")
+
+    def test_a_relative_org_rules_path_fails_the_step(self):
+        # The PR checkout lives in the workspace, so a workspace-relative path could only
+        # name PR-controlled content: the input must be absolute, outside the workspace.
+        repo, base, head = self.make_pr()
+        write(self.workspace, "org-rules-src.yaml", "inside\n")
+        proc = self.prepare(repo, base, head, AI_REVIEW_ORG_RULES="org-rules-src.yaml")
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn(
+            "org_review_rules must be an absolute path outside the workspace", proc.stdout
+        )
+
+        self.assertFalse(Path(self.ai_dir, "org-rules.yaml").exists())
+
+    def test_a_missing_org_rules_file_fails_the_step(self):
+        repo, base, head = self.make_pr()
+        proc = self.prepare(
+            repo, base, head, AI_REVIEW_ORG_RULES=os.path.join(self.tmp, "nope.yaml")
+        )
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("org_review_rules is not a regular file", proc.stdout)
+        self.assertFalse(Path(self.ai_dir, "org-rules.yaml").exists())
+
+    def test_an_org_rules_file_inside_the_checkout_fails_the_step(self):
+        # The PR must not supply its own org rules through the caller's input.
+        repo, base, head = self.make_pr()
+        write(repo, "org-rules.yaml", "tone_instructions: injected\n")
+        proc = self.prepare(
+            repo, base, head, AI_REVIEW_ORG_RULES=os.path.join(repo, "org-rules.yaml")
+        )
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("org_review_rules must point outside the workspace", proc.stdout)
+        self.assertFalse(Path(self.ai_dir, "org-rules.yaml").exists())
+
+    def test_a_symlinked_workspace_still_contains_the_rules_check(self):
+        # A workspace behind a symlink must not let a file inside it past the guard.
+        repo, base, head = self.make_pr()
+        real = os.path.join(self.tmp, "real-workspace")
+        os.rename(self.workspace, real)
+        os.symlink(real, self.workspace)
+        write(real, "org-rules-src.yaml", "inside\n")
+        proc = self.prepare(
+            repo, base, head, AI_REVIEW_ORG_RULES=os.path.join(self.workspace, "org-rules-src.yaml")
+        )
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("org_review_rules must point outside the workspace", proc.stdout)
+        self.assertFalse(Path(self.ai_dir, "org-rules.yaml").exists())
+
+    def test_a_symlinked_org_rules_file_fails_the_step(self):
+        repo, base, head = self.make_pr()
+        write(self.tmp, "org-rules-src.yaml", "x\n")
+        os.symlink(
+            os.path.join(self.tmp, "org-rules-src.yaml"), os.path.join(self.tmp, "link.yaml")
+        )
+        proc = self.prepare(
+            repo, base, head, AI_REVIEW_ORG_RULES=os.path.join(self.tmp, "link.yaml")
+        )
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("org_review_rules is not a regular file", proc.stdout)
+
+    def test_no_org_rules_means_no_file(self):
+        repo, base, head = self.make_pr()
+        write(self.ai_dir, "org-rules.yaml", "stale")
+        proc = self.prepare(repo, base, head, AI_REVIEW_ORG_RULES="")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertFalse(Path(self.ai_dir, "org-rules.yaml").exists())
+
+    def test_oversized_org_rules_fail_the_step(self):
+        repo, base, head = self.make_pr()
+        write(self.tmp, "org-rules-src.yaml", b"x" * 102401)
+        proc = self.prepare(
+            repo, base, head, AI_REVIEW_ORG_RULES=os.path.join(self.tmp, "org-rules-src.yaml")
+        )
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("org_review_rules is", proc.stdout)
+        self.assertIn("102400", proc.stdout)
+        self.assertFalse(Path(self.ai_dir, "org-rules.yaml").exists())
+
+    def test_org_rules_of_exactly_the_cap_are_accepted(self):
+        # The guard is -le, so the cap itself is valid: a regression to -lt, or a wrong
+        # MAX_RULES_BYTES, would reject a legitimate at-cap input.
+        repo, base, head = self.make_pr()
+        write(self.tmp, "org-rules-src.yaml", b"x" * 102400)
+        proc = self.prepare(
+            repo, base, head, AI_REVIEW_ORG_RULES=os.path.join(self.tmp, "org-rules-src.yaml")
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        rules = os.path.join(self.ai_dir, "org-rules.yaml")
+        self.assertEqual(os.path.getsize(rules), 102400)
+
     def test_whitespace_in_the_workspace_path_fails(self):
         repo, base, head = self.make_pr()
         self.workspace = os.path.join(self.tmp, "work space")
@@ -1492,6 +1612,7 @@ class ReviewTestCase(ScriptTestCase):
     def expected_argv(
         self,
         instructions: bool = False,
+        org_rules: bool = False,
         model: str | None = None,
         minutes: int = 20,
         harness: str = "codex",
@@ -1514,6 +1635,8 @@ class ReviewTestCase(ScriptTestCase):
             tail = []
         if instructions:
             prompt += " /workspace/instructions.md"
+        if org_rules:
+            prompt += " /workspace/org-rules.yaml"
         argv = [
             "--from",
             f"agentic-ci=={self.VERSION}",
@@ -1599,9 +1722,45 @@ class ReviewTests(ReviewTestCase):
 
     def test_instructions_file_is_the_last_prompt_word(self):
         write(self.ai_dir, "instructions.md", "Focus on tests\n")
+        for harness in ("codex", "claude-code"):
+            with self.subTest(harness=harness):
+                Path(self.log).unlink(missing_ok=True)
+                proc = self.review(AI_REVIEW_HARNESS=harness, ANTHROPIC_API_KEY="sk-ant")
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual(
+                    self.record()["argv"], self.expected_argv(instructions=True, harness=harness)
+                )
+                prompt = self.record()["argv"][self.record()["argv"].index("--effort") + 2]
+                self.assertTrue(prompt.endswith("/workspace/instructions.md"), prompt)
+
+    def test_org_rules_file_is_the_last_prompt_word(self):
+        write(self.ai_dir, "org-rules.yaml", "tone_instructions: Be brief.\n")
+        proc = self.review(AI_REVIEW_HARNESS="claude-code", ANTHROPIC_API_KEY="sk-ant")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(
+            self.record()["argv"], self.expected_argv(harness="claude-code", org_rules=True)
+        )
+
+    def test_org_rules_follow_the_instructions_file(self):
+        write(self.ai_dir, "instructions.md", "Focus on tests\n")
+        write(self.ai_dir, "org-rules.yaml", "tone_instructions: Be brief.\n")
+        proc = self.review(AI_REVIEW_HARNESS="claude-code", ANTHROPIC_API_KEY="sk-ant")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(
+            self.record()["argv"],
+            self.expected_argv(harness="claude-code", instructions=True, org_rules=True),
+        )
+        prompt = self.record()["argv"][self.record()["argv"].index("--effort") + 2]
+        self.assertTrue(
+            prompt.endswith("/workspace/instructions.md /workspace/org-rules.yaml"), prompt
+        )
+
+    def test_codex_does_not_get_the_org_rules_word(self):
+        write(self.ai_dir, "org-rules.yaml", "tone_instructions: Be brief.\n")
         proc = self.review()
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertEqual(self.record()["argv"], self.expected_argv(instructions=True))
+        self.assertEqual(self.record()["argv"], self.expected_argv())
+        self.assertIn("::warning::org_review_rules is not passed to the codex harness", proc.stdout)
 
     def test_model_is_passed_when_set(self):
         self.review(AI_REVIEW_MODEL="some-model")

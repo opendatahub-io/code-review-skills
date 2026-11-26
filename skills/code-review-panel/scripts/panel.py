@@ -3043,7 +3043,7 @@ def summary_text(text: str) -> str:
     return esc(flat)
 
 
-def gitlab_json(plan: dict, out: Outcome, first: str) -> dict:
+def gitlab_json(plan: dict, out: Outcome, first: str, notes: list[str] | None = None) -> dict:
     added = added_lines(plan, {r["file"] for r in out.listed if r["line"]})
     inline = [r for r in out.listed if (r["file"], r["line"]) in added]
     lines = []
@@ -3076,6 +3076,14 @@ def gitlab_json(plan: dict, out: Outcome, first: str) -> dict:
         lines.append(
             f"- [{i['id']}] still open from an earlier round: {i['title']} ({esc(place(i))})"
         )
+    # Only the caller's explicit --warning lines, after the findings: generated diagnostics
+    # (an uncapped number of them) stay in the local markdown report, where they cannot
+    # bury the findings in the posted summary. The blank line keeps each Warning its own
+    # paragraph, not a lazy continuation of the last bullet.
+    if notes and lines and lines[-1]:
+        lines.append("")
+    for note in notes or []:
+        lines.append(f"Warning: {esc(note)}")
     reasons = "; ".join(out.approval["reasons"])
     lines += [
         "",
@@ -3200,7 +3208,7 @@ def load_plan(path: str) -> dict:
 
 def cmd_report(args: argparse.Namespace) -> int:
     plan = load_plan(args.plan)
-    warnings: list[str] = []
+    warnings: list[str] = list(args.warning)
     # The known file is the one triage read, so its round cap and ids match this plan.
     known = read_known(plan["known_file"]) if plan.get("known_file") else None
     if known is not None and known["round"] >= plan["round"]:
@@ -3223,7 +3231,7 @@ def cmd_report(args: argparse.Namespace) -> int:
         if args.status:
             return 0
         if args.gitlab_json:
-            write_json(args.gitlab_json, gitlab_json(plan, out, out.first))
+            write_json(args.gitlab_json, gitlab_json(plan, out, out.first, args.warning))
         if args.known_out:
             unchanged = known or {
                 "version": 1,
@@ -3260,7 +3268,10 @@ def cmd_report(args: argparse.Namespace) -> int:
     out = summarize(plan, data, rows, known, warnings)
     text = render(plan, data, rows, out, warnings)
     if args.gitlab_json:
-        write_json(args.gitlab_json, gitlab_json(plan, out, out.first or nothing_line(data, out)))
+        write_json(
+            args.gitlab_json,
+            gitlab_json(plan, out, out.first or nothing_line(data, out), args.warning),
+        )
     if args.known_out:
         write_json(args.known_out, next_known(plan, data, rows, out, known))
     sys.stdout.write(text)
@@ -3284,6 +3295,12 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--plan", required=True, help="triage output")
     r.add_argument("--findings", required=True, help="merged findings file")
     r.add_argument("--verdicts", help="skeptic verdicts, one JSON object per line")
+    r.add_argument(
+        "--warning",
+        action="append",
+        default=[],
+        help="extra warning line, carried into the report and the summary (repeatable)",
+    )
     r.add_argument("--known-out", help="write the next known findings file here")
     r.add_argument("--gitlab-json", help="also write gitlab-code-review JSON here")
     r.add_argument("--status", action="store_true", help="print one status line per finding")
