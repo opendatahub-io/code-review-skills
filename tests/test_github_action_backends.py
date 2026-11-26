@@ -176,7 +176,7 @@ class OpenShellReviewTestCase(ReviewTestCase):
             "--workdir",
             self.ai_dir,
             "--image",
-            f"quay.io/aipcc/agentic-ci/{family}-sandbox:latest",
+            f"quay.io/aipcc/agentic-ci/{family}-sandbox:{VERIFIED_AGENTIC_CI_VERSION}",
             "--no-otel",
             "--effort",
             script_constant("AGENT_EFFORT"),
@@ -278,7 +278,7 @@ class OpenShellReviewTests(OpenShellReviewTestCase):
         self.assertEqual(argv[image + 1 : image + 3], ["agentic-ci", "run"])
 
     def test_the_openshell_tag_is_the_agentic_ci_version(self):
-        for version in (VERIFIED_AGENTIC_CI_VERSION, "0.5.16", "1.0.0rc1"):
+        for version in (VERIFIED_AGENTIC_CI_VERSION, "0.5.17", "1.0.0rc1"):
             with self.subTest(version):
                 Path(self.docker_log).unlink(missing_ok=True)
                 self.VERSION = version
@@ -454,7 +454,9 @@ class OpenShellReviewTests(OpenShellReviewTestCase):
             ],
         )
         self.assertIn(f"ai-review-store-{suffix}:/var/lib/containers", calls[2])
-        self.assertEqual(calls[2][-1], "quay.io/aipcc/agentic-ci/codex-sandbox:latest")
+        self.assertEqual(
+            calls[2][-1], f"quay.io/aipcc/agentic-ci/codex-sandbox:{VERIFIED_AGENTIC_CI_VERSION}"
+        )
         self.assertIn("agentic-ci", calls[3])
         self.assertIn("--entrypoint", calls[4])
         self.assertEqual(len(calls), 5)
@@ -721,7 +723,7 @@ class BackendChoiceTests(OpenShellReviewTestCase):
     def test_podman_argv_equals_the_shape_before_the_backend_input(self):
         proc = self.openshell_review(AI_REVIEW_BACKEND="podman")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        image = "quay.io/aipcc/agentic-ci/codex-runner:latest"
+        image = f"quay.io/aipcc/agentic-ci/codex-runner:{VERIFIED_AGENTIC_CI_VERSION}"
         prompt = (
             "Invoke the /code-review-skills:github-code-review skill with the arguments: "
             f"/workspace/repo /workspace/pr.diff {self.BASE} {self.HEAD} "

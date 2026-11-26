@@ -24,7 +24,8 @@ inputs:
       With the podman backend it is the PyPI version uvx installs. The default
       is the one the action was checked against.
     required: false
-    default: '0.5.15'
+    # renovate: datasource=docker depName=quay.io/aipcc/agentic-ci/openshell
+    default: '0.5.16'
   backend:
     description: >-
       Where agentic-ci runs the agent. 'openshell' runs the openshell image as a

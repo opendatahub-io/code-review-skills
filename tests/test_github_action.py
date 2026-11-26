@@ -35,10 +35,10 @@ SKILL = REPO_ROOT / "skills/github-code-review/SKILL.md"
 README = REPO_ROOT / "README.md"
 REVIEW_PY_REL = "skills/gitlab-code-review/scripts/review.py"
 
-# The agentic-ci version the flags in review-pr.sh were checked against with `agentic-ci run
-# --help` and a smoke run. Bump it only after re-running that check, together with action.yml's
-# default and the README row.
-VERIFIED_AGENTIC_CI_VERSION = "0.5.15"
+# The agentic-ci release the defaults pin: action.yml's agentic_ci_version, the image constants in
+# review-pr.sh and the README row. Renovate bumps all of them together, and the E2E workflow runs
+# the action on that release before the bump can merge.
+VERIFIED_AGENTIC_CI_VERSION = "0.5.16"
 
 FORBIDDEN_TOOLS = re.compile(r"\b(Bash|WebFetch|WebSearch)\b")
 # A bare `claude` word: not the `claude-code` tool name, `claude-runner` image or a comment.
@@ -190,6 +190,63 @@ def evaluate_expression(
     }
     # The source is action.yml's own text, limited to the forms above.
     return eval(source, namespace)
+
+
+class ImagePinTests(unittest.TestCase):
+    """The default images are a pinned agentic-ci release that Renovate can bump."""
+
+    AGENTIC_CI_IMAGE = re.compile(r"quay\.io/aipcc/agentic-ci/[\w-]+:[\w.-]+")
+
+    def test_no_default_floats_on_latest(self):
+        for path in (ACTION_YML, SCRIPT):
+            with self.subTest(path.name):
+                tags = self.AGENTIC_CI_IMAGE.findall(path.read_text(encoding="utf-8"))
+                self.assertFalse([t for t in tags if t.endswith(":latest")], tags)
+
+    def renovate_matches(self, path: Path) -> dict[str, set[str]]:
+        config = json.loads((REPO_ROOT / "renovate.json").read_text(encoding="utf-8"))
+        found: dict[str, set[str]] = {}
+        rel = path.relative_to(REPO_ROOT).as_posix()
+        for manager in config["customManagers"]:
+            if rel not in manager["managerFilePatterns"]:
+                continue
+            for pattern in manager["matchStrings"]:
+                # Renovate writes named groups the JavaScript way.
+                regex = re.compile(pattern.replace("(?<", "(?P<"))
+                for m in regex.finditer(path.read_text(encoding="utf-8")):
+                    name = m.groupdict().get("depName") or manager["depNameTemplate"]
+                    found.setdefault(name, set()).add(m["currentValue"])
+        return found
+
+    def test_renovate_finds_every_default_image_at_the_verified_release(self):
+        images = {
+            f"quay.io/aipcc/agentic-ci/{harness}-{family}": {VERIFIED_AGENTIC_CI_VERSION}
+            for harness in ("claude", "codex")
+            for family in ("runner", "sandbox")
+        }
+        self.assertEqual(self.renovate_matches(SCRIPT), images)
+
+    def test_renovate_finds_the_agentic_ci_version_everywhere_it_is_written(self):
+        # The README row and this file's constant move with the default, so the bump's own
+        # E2E run is what decides whether it merges.
+        for path in (ACTION_YML, REPO_ROOT / "README.md", Path(__file__)):
+            with self.subTest(path.name):
+                self.assertEqual(
+                    self.renovate_matches(path),
+                    {"quay.io/aipcc/agentic-ci/openshell": {VERIFIED_AGENTIC_CI_VERSION}},
+                )
+
+    def test_the_readme_writes_the_version_only_where_renovate_finds_it(self):
+        text = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+        row = f"| `agentic_ci_version` | `{VERIFIED_AGENTIC_CI_VERSION}` |"
+        minimum = f"agentic-ci {VERIFIED_AGENTIC_CI_VERSION} or later"
+        rest = text.replace(row, "").replace(minimum, "")
+        self.assertNotIn(VERIFIED_AGENTIC_CI_VERSION, rest)
+
+    def test_renovate_groups_the_agentic_ci_images(self):
+        config = json.loads((REPO_ROOT / "renovate.json").read_text(encoding="utf-8"))
+        names = [n for rule in config["packageRules"] for n in rule.get("matchPackageNames", [])]
+        self.assertTrue(any(n.startswith("/^quay\\.io/aipcc/agentic-ci/") for n in names), names)
 
 
 class ActionStaticTests(PanelTestCase):
@@ -572,15 +629,27 @@ class ActionStaticTests(PanelTestCase):
                 with self.subTest(harness=harness, family=family):
                     self.assertEqual(
                         script_constant(f"{harness.upper()}_{family.upper()}_IMAGE"),
-                        f'"quay.io/aipcc/agentic-ci/{harness}-{family}:latest"',
+                        f'"quay.io/aipcc/agentic-ci/{harness}-{family}:{VERIFIED_AGENTIC_CI_VERSION}"',
                     )
 
     def test_default_image_picks_the_family_of_the_backend(self):
         cases = {
-            ("codex", "podman"): "quay.io/aipcc/agentic-ci/codex-runner:latest",
-            ("claude-code", "podman"): "quay.io/aipcc/agentic-ci/claude-runner:latest",
-            ("codex", "openshell"): "quay.io/aipcc/agentic-ci/codex-sandbox:latest",
-            ("claude-code", "openshell"): "quay.io/aipcc/agentic-ci/claude-sandbox:latest",
+            (
+                "codex",
+                "podman",
+            ): f"quay.io/aipcc/agentic-ci/codex-runner:{VERIFIED_AGENTIC_CI_VERSION}",
+            (
+                "claude-code",
+                "podman",
+            ): f"quay.io/aipcc/agentic-ci/claude-runner:{VERIFIED_AGENTIC_CI_VERSION}",
+            (
+                "codex",
+                "openshell",
+            ): f"quay.io/aipcc/agentic-ci/codex-sandbox:{VERIFIED_AGENTIC_CI_VERSION}",
+            (
+                "claude-code",
+                "openshell",
+            ): f"quay.io/aipcc/agentic-ci/claude-sandbox:{VERIFIED_AGENTIC_CI_VERSION}",
         }
         for (harness, backend), image in cases.items():
             with self.subTest(harness=harness, backend=backend):
@@ -1385,7 +1454,7 @@ class ReviewTestCase(ScriptTestCase):
 
     BASE = "a" * 40
     HEAD = "b" * 40
-    IMAGE = "quay.io/aipcc/agentic-ci/codex-runner:latest"
+    IMAGE = f"quay.io/aipcc/agentic-ci/codex-runner:{VERIFIED_AGENTIC_CI_VERSION}"
     VERSION = VERIFIED_AGENTIC_CI_VERSION
 
     def setUp(self):
@@ -1650,9 +1719,12 @@ class ReviewTests(ReviewTestCase):
     def test_an_empty_image_picks_the_runner_image_of_the_harness(self):
         # The podman backend cannot run the sandbox images, so it keeps the runner family.
         for harness, image in (
-            ("", "quay.io/aipcc/agentic-ci/codex-runner:latest"),
-            ("codex", "quay.io/aipcc/agentic-ci/codex-runner:latest"),
-            ("claude-code", "quay.io/aipcc/agentic-ci/claude-runner:latest"),
+            ("", f"quay.io/aipcc/agentic-ci/codex-runner:{VERIFIED_AGENTIC_CI_VERSION}"),
+            ("codex", f"quay.io/aipcc/agentic-ci/codex-runner:{VERIFIED_AGENTIC_CI_VERSION}"),
+            (
+                "claude-code",
+                f"quay.io/aipcc/agentic-ci/claude-runner:{VERIFIED_AGENTIC_CI_VERSION}",
+            ),
         ):
             with self.subTest(harness=harness):
                 Path(self.podman_log).unlink(missing_ok=True)
