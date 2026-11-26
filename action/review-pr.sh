@@ -4,9 +4,9 @@
 # Usage: review-pr.sh {check|prepare|review|post|cleanup}
 #
 # The agent step runs in a Podman container through agentic-ci and holds no write token.
-# It reads an export of the PR checkout, without its .git, and writes one file. The post step
-# holds the token, validates that one file and posts a copy of it through the same review.py
-# GitLab uses.
+# It reads an export of the PR checkout with a git repository of its own, built without the
+# checkout's config, remotes or credentials, and writes one file. The post step holds the token,
+# validates that one file and posts a copy of it through the same review.py GitLab uses.
 #
 # Environment (set by action.yml):
 #   AI_REVIEW_EVENT               github.event_name (check)
@@ -14,6 +14,8 @@
 #   AI_REVIEW_ACTOR               github.actor (check)
 #   AI_REVIEW_TRIGGERING_ACTOR    github.triggering_actor (check)
 #   AI_REVIEW_HARNESS             harness input (check, review, post)
+#   AI_REVIEW_MODE                mode input: standard or deep (check, prepare, review)
+#   AI_REVIEW_DRAFT               pull_request.draft (check)
 #   AI_REVIEW_BASE_SHA            pull_request.base.sha (prepare, review)
 #   AI_REVIEW_HEAD_SHA            pull_request.head.sha (prepare, review)
 #   AI_REVIEW_INSTRUCTIONS        review_instructions input (prepare)
@@ -33,7 +35,8 @@
 # The PR head checkout is $GITHUB_WORKSPACE/.ai-review-head. The container never mounts it.
 #
 # Layout under $GITHUB_WORKSPACE/.ai-review, which the container mounts at /workspace:
-#   repo/                         the checkout's working tree, exported without .git
+#   repo/                         the checkout's working tree, exported without its .git, plus
+#                                 a fresh .git with the history of the base and the head
 #   pr.diff, instructions.md      inputs of the review
 #   plugin/                       a copy of this action, loaded with --plugin-dir
 #   out/                          the only place the review writes
@@ -52,6 +55,9 @@ OUT_DIR="$AI_DIR/out"
 OUT="$OUT_DIR/ai-review-output.json"
 # The container's view of AI_DIR, which the prompt names.
 CONTAINER_DIR=/workspace
+# The agent's wall-clock limit in minutes when the timeout_minutes input is empty, per mode.
+STANDARD_TIMEOUT_MINUTES=20
+DEEP_TIMEOUT_MINUTES=75
 # Reasoning effort of the agent, which the summary footer also reports.
 AGENT_EFFORT=high
 # The runner image of each harness, used when the image input is empty.
@@ -62,6 +68,10 @@ MAX_OUTPUT_BYTES=1048576
 REVIEW_PY_REL="skills/gitlab-code-review/scripts/review.py"
 # The private TMPDIR of the review step, which the EXIT trap removes.
 REVIEW_TMP=""
+# The scratch directory of the prepare step's git calls, which the EXIT trap removes.
+PREPARE_TMP=""
+# standard or deep, set by require_mode.
+REVIEW_MODE=""
 
 error() {
     echo "::error::$*"
@@ -70,6 +80,10 @@ error() {
 
 notice() {
     echo "::notice::$*"
+}
+
+warning() {
+    echo "::warning::$*"
 }
 
 # A value like 1 or true; empty, 0 and false are off.
@@ -101,6 +115,15 @@ refuse_redirected_workdirs() {
 reject_whitespace() {
     case "$1" in
         *[[:space:]]*) error "Path contains whitespace, which the container mount cannot carry: $1" ;;
+    esac
+}
+
+# An empty mode is the input's default.
+require_mode() {
+    REVIEW_MODE="${AI_REVIEW_MODE:-standard}"
+    case "$REVIEW_MODE" in
+        standard | deep) ;;
+        *) error "mode must be standard or deep, got: '$REVIEW_MODE'" ;;
     esac
 }
 
@@ -143,8 +166,11 @@ cmd_check() {
     if [ "${AI_REVIEW_EVENT:-}" != "pull_request" ]; then
         error "This action only supports the pull_request event, got '${AI_REVIEW_EVENT:-}'. Do not use pull_request_target: it runs with write access on code from forks."
     fi
+    require_mode
 
-    if [ -z "${AI_REVIEW_HEAD_REPO:-}" ] || [ "${AI_REVIEW_HEAD_REPO}" != "${GITHUB_REPOSITORY:-}" ]; then
+    if [ "${AI_REVIEW_DRAFT:-}" = "true" ]; then
+        skip_reason="the pull request is a draft. Marking it ready for review runs the review"
+    elif [ -z "${AI_REVIEW_HEAD_REPO:-}" ] || [ "${AI_REVIEW_HEAD_REPO}" != "${GITHUB_REPOSITORY:-}" ]; then
         skip_reason="the pull request comes from a fork, where the workflow has no secrets and a read-only token"
     elif [ "$actor" = "dependabot[bot]" ] || [ "$triggering" = "dependabot[bot]" ]; then
         skip_reason="the run was triggered by Dependabot, which gets no secrets and a read-only token"
@@ -167,6 +193,45 @@ cmd_check() {
     fi
 }
 
+# Give the export a .git of its own: the history of the base and the head, fetched from the
+# checkout's objects, and nothing else of the checkout. No remote, credentials, hooks,
+# alternates, hardlinks or config come over, and no host path is left in it, so the agent can
+# run git log and merge-base without reaching the checkout or the token.
+# The host never runs git in AI_DIR once the review step starts: the agent can rewrite this
+# .git, and the post step reads back only the one validated output file.
+build_container_repo() {
+    local base="$1" head="$2" repo="$AI_DIR/repo"
+    local src="$PWD"
+    [ ! -e "$repo/.git" ] || error "$repo/.git exists after the export, so the action stopped"
+    PREPARE_TMP="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/ai-review-tmp.XXXXXX")"
+    trap 'rm -rf -- "$PREPARE_TMP"' EXIT
+    mkdir "$PREPARE_TMP/template" "$PREPARE_TMP/home"
+    # Each git call exits on failure itself: errexit does not apply in a subshell tested by ||.
+    (
+        # Only the command line and the overrides below configure git: no global or system
+        # config, no user config under HOME, and no repo or work tree from the environment.
+        unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY \
+            GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR GIT_NAMESPACE
+        export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+        export HOME="$PREPARE_TMP/home" XDG_CONFIG_HOME="$PREPARE_TMP/home/.config"
+        harden_git
+        # An empty template: no hooks, no info/exclude, no description.
+        git -c init.defaultBranch=main init -q --template="$PREPARE_TMP/template" "$repo" || exit 1
+        # A fetch, not clone --local: no hardlinks into the checkout and no alternates file.
+        # Named refs keep both commits reachable. No FETCH_HEAD, which would name this path.
+        git -C "$repo" fetch -q --no-tags --no-write-fetch-head --no-recurse-submodules \
+            --no-auto-maintenance "$src" "$base:refs/ai-review/base" "$head:refs/ai-review/head" \
+            || exit 1
+        # Detach HEAD at the head and load its tree into the index. The export is the working
+        # tree already, so nothing is checked out over it.
+        git -C "$repo" update-ref --no-deref HEAD "$head" || exit 1
+        git -C "$repo" read-tree "$head" || exit 1
+        # Record the exported files' stat data, so git status in the container reads clean.
+        git -C "$repo" update-index -q --refresh >/dev/null || true
+    ) || error "Could not build the git repository for the review in $repo"
+    rm -rf -- "$repo/.git/FETCH_HEAD" "$repo/.git/logs"
+}
+
 cmd_prepare() {
     require_workspace
     refuse_redirected_workdirs
@@ -177,6 +242,7 @@ cmd_prepare() {
             || error "$GITHUB_ACTION_PATH/$plugin_part is missing: the action's own files are incomplete"
     done
     reject_whitespace "$AI_DIR"
+    require_mode
     local base="${AI_REVIEW_BASE_SHA:-}" head="${AI_REVIEW_HEAD_SHA:-}"
     require_sha "pull_request.base.sha" "$base"
     require_sha "pull_request.head.sha" "$head"
@@ -199,9 +265,11 @@ cmd_prepare() {
     git diff --no-ext-diff --no-textconv --text --no-color --src-prefix=a/ --dst-prefix=b/ \
         "$merge_base" "$head" >"$DIFF_FILE"
 
-    # The agent gets the working tree without .git, so it cannot reach the config, the object
-    # store or anything git would run later. Not git archive: it honors the PR's export-ignore.
+    # The agent gets the working tree without the checkout's .git, so it cannot reach that
+    # config, its object store or anything git would run later there. Not git archive: it honors
+    # the PR's export-ignore.
     tar -C . --exclude=./.git -cf - . | tar -C "$AI_DIR/repo" -xf -
+    build_container_repo "$base" "$head"
 
     # Claude Code loads this copy, not the registry copy in the image, which lacks the skill.
     # Codex takes no plugin directory: it loads the skill installed in its runner image.
@@ -218,6 +286,7 @@ cmd_review() {
     require_workspace
     refuse_redirected_workdirs
     reject_whitespace "$AI_DIR"
+    require_mode
     local harness="${AI_REVIEW_HARNESS:-claude-code}"
     case "$harness" in
         claude-code | codex) ;;
@@ -229,6 +298,10 @@ cmd_review() {
     [ -f "$DIFF_FILE" ] || error "$DIFF_FILE is missing: the prepare step did not run"
     if [ "$harness" = "claude-code" ] && [ ! -d "$PLUGIN_DIR" ]; then
         error "$PLUGIN_DIR is missing: the prepare step did not run"
+    fi
+    # The panel reads the history. A test, not a git call: the host never runs git in AI_DIR.
+    if [ "$REVIEW_MODE" = "deep" ] && [ ! -d "$AI_DIR/repo/.git" ]; then
+        error "$AI_DIR/repo/.git is missing: the prepare step did not run"
     fi
 
     local image="${AI_REVIEW_IMAGE:-}" version="${AI_REVIEW_AGENTIC_CI_VERSION:-}"
@@ -244,7 +317,14 @@ cmd_review() {
     esac
     local version_re='^[0-9][0-9A-Za-z.+!-]*$'
     [[ "$version" =~ $version_re ]] || error "agentic_ci_version must be a package version such as 0.5.15, got: '$version'"
-    local minutes="${AI_REVIEW_TIMEOUT_MINUTES:-20}"
+    local minutes="${AI_REVIEW_TIMEOUT_MINUTES:-}"
+    if [ -z "$minutes" ]; then
+        if [ "$REVIEW_MODE" = "deep" ]; then
+            minutes="$DEEP_TIMEOUT_MINUTES"
+        else
+            minutes="$STANDARD_TIMEOUT_MINUTES"
+        fi
+    fi
     [[ "$minutes" =~ ^[1-9][0-9]*$ ]] || error "timeout_minutes must be a positive integer, got: '$minutes'"
 
     # The agent's credentials arrive from the job environment, the keys agentic-ci reads.
@@ -272,13 +352,29 @@ cmd_review() {
     # it loads the skill installed in its runner image, and the prompt names it the way
     # agentic-ci's skill runs do.
     local prompt
-    if [ "$harness" = "claude-code" ]; then
-        prompt="/code-review-skills:github-code-review $CONTAINER_DIR/repo $CONTAINER_DIR/pr.diff $base $head $CONTAINER_DIR/out/ai-review-output.json"
+    if [ "$REVIEW_MODE" = "deep" ]; then
+        # The panel writes gitlab-code-review's JSON, which the post step validates and posts like
+        # a standard review. It takes the repo's guidance from REVIEW.md at the base ref, so a PR
+        # cannot loosen its own review, and free-form instructions are not passed. One line: the
+        # prompt is a single argument.
+        local task="the committed changes in $CONTAINER_DIR/repo from base $base to head $head. Run its triage from inside $CONTAINER_DIR/repo with --base $base --head $head, pass --gitlab-json $CONTAINER_DIR/out/ai-review-output.json to its final report command, and do not post anything."
+        if [ "$harness" = "claude-code" ]; then
+            prompt="/code-review-skills:code-review-panel Review $task"
+        else
+            prompt="Use the /code-review-panel skill to review $task"
+        fi
+        if [ -f "$INSTRUCTIONS_FILE" ]; then
+            warning "review_instructions is ignored in deep mode: the panel reads REVIEW.md from the base branch instead."
+        fi
     else
-        prompt="Use the /github-code-review skill with the arguments: $CONTAINER_DIR/repo $CONTAINER_DIR/pr.diff $base $head $CONTAINER_DIR/out/ai-review-output.json"
-    fi
-    if [ -f "$INSTRUCTIONS_FILE" ]; then
-        prompt="$prompt $CONTAINER_DIR/instructions.md"
+        if [ "$harness" = "claude-code" ]; then
+            prompt="/code-review-skills:github-code-review $CONTAINER_DIR/repo $CONTAINER_DIR/pr.diff $base $head $CONTAINER_DIR/out/ai-review-output.json"
+        else
+            prompt="Use the /github-code-review skill with the arguments: $CONTAINER_DIR/repo $CONTAINER_DIR/pr.diff $base $head $CONTAINER_DIR/out/ai-review-output.json"
+        fi
+        if [ -f "$INSTRUCTIONS_FILE" ]; then
+            prompt="$prompt $CONTAINER_DIR/instructions.md"
+        fi
     fi
 
     # The container is the sandbox: agentic-ci runs the agent with every tool enabled, so a

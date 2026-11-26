@@ -41,9 +41,10 @@ whitespace into `<repo-dir> <diff-file> <base-sha> <head-sha> <output-path>
 fewer than five values are present, a SHA is not hex, or a path is not
 absolute, say what is wrong and stop without writing anything.
 
-- `repo-dir`: the working tree at `head-sha`. In the action it has no `.git`,
-  so there is no git history to query. The working directory is not
-  `repo-dir`.
+- `repo-dir`: the working tree at `head-sha`. In the action it is a git
+  checkout at `head-sha` with the history of `base-sha` and `head-sha`, and no
+  remote. You still run no commands: read its files. The working directory is
+  not `repo-dir`.
 - `diff-file`: the pull request diff, from the merge base to the head.
 - `base-sha`: the tip of the base branch when the review started. The diff starts
   at the merge base of `base-sha` and `head-sha`, which can be older.

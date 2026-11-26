@@ -87,7 +87,9 @@ The repo root is a composite action that reviews a pull request and posts the re
 
 ```yaml
 name: AI review
-on: pull_request
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
 
 concurrency:
   group: ai-review-${{ github.event.pull_request.number }}
@@ -110,7 +112,7 @@ jobs:
       - uses: opendatahub-io/code-review-skills@<full commit sha>
 ```
 
-Pin a full commit SHA: there are no release tags yet. The action checks out the PR head itself, so the job needs no checkout step.
+Pin a full commit SHA: there are no release tags yet. The action checks out the PR head itself, so the job needs no checkout step. Draft pull requests are skipped with a notice, and `ready_for_review` reviews them once they are marked ready.
 
 Requirements: Podman on the runner, and a credential for the harness in the job's `env:`. For `claude-code` that is `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN` (a token from `claude setup-token`); for `codex` it is `OPENAI_API_KEY`. For Vertex, set `GCLOUD_CREDENTIALS` or `GCP_SERVICE_ACCOUNT_KEY` in the job's `env:`, or set `CLAUDE_CODE_USE_VERTEX=1` on its own, which needs application default credentials as a file (`~/.config/gcloud/application_default_credentials.json` or `GOOGLE_APPLICATION_CREDENTIALS`), plus `ANTHROPIC_VERTEX_PROJECT_ID` (or `GCP_PROJECT_ID`). The GCE metadata server is not supported, so `GCLOUD_CREDENTIALS` or `GCP_SERVICE_ACCOUNT_KEY` are the portable options. agentic-ci resolves the credentials. Bedrock is not supported. The Podman on GitHub-hosted runners can need the crun workaround from agentic-ci's [setup-podman action](https://github.com/opendatahub-io/agentic-ci/blob/main/.github/actions/setup-podman/action.yml). The action does not run `sudo` for you, so add that step to the job when the container fails to start.
 
@@ -122,22 +124,60 @@ To run Codex instead, set `harness: codex` and put `OPENAI_API_KEY` in the job's
 | `model` | harness default | Model for the review, also shown in the summary footer. |
 | `agentic_ci_version` | `0.5.15` | Version of the `agentic-ci` package that runs the agent. Every flag the action passes was checked against the default. |
 | `image` | runner image for the harness | Container image the agent runs in. Empty picks `quay.io/aipcc/agentic-ci/claude-runner:latest` or `.../codex-runner:latest`. The default tag floats: pin a digest (`...runner@sha256:<digest>`) to freeze it. |
-| `timeout_minutes` | `20` | Wall-clock limit for the agent step. The step fails when the review takes longer. |
-| `review_instructions` | -- | Extra guidance such as focus areas or team standards, passed to the review as a file. |
+| `mode` | `standard` | `standard` runs one review pass with `github-code-review`. `deep` runs `code-review-panel`, which ignores `review_instructions` (see [Deep review](#deep-review)). |
+| `timeout_minutes` | `20` standard, `75` deep | Wall-clock limit for the agent step. The step fails when the review takes longer. Empty picks the default for the mode. |
+| `review_instructions` | -- | Extra guidance such as focus areas or team standards, passed to the review as a file. Standard mode only. |
 | `chill_mode` | `true` | Drop suggestion-level comments. |
 | `inline_fixes` | `true` | Post `fix` objects as applicable suggestions. |
 
 Limitations:
 
-- Only the `pull_request` event is supported. Runs for pull requests from forks and runs triggered by Dependabot exit 0 with a notice, because they get no secrets and a read-only token. A run without a credential for the harness in the job environment does the same.
+- Only the `pull_request` event is supported. Runs for pull requests from forks and runs triggered by Dependabot exit 0 with a notice, because they get no secrets and a read-only token. A run without a credential for the harness in the job environment, or for a draft pull request, does the same.
 - The action posts as `github-actions[bot]` with the workflow token, and recognizes its own comments by that login and a marker. Run one copy of the action per pull request: two would fight over the same comments.
-- The action fetches the full history of the PR head (`fetch-depth: 0`) on every run, to find the merge base reliably. On a very large repo that costs time on every push.
+- The action fetches the full history of the PR head (`fetch-depth: 0`) on every run, to find the merge base reliably, and copies the history of the base and the head into the agent's repository. On a very large repo that costs time and disk on every push.
 - A very large diff can exceed what the agent reads in one run. The review then says in its summary that it covered only part of the diff.
-- The agent runs in a Podman container with every tool the harness provides enabled, so the container is the boundary, not a tool allowlist. It reads an export of the PR's working tree in `.ai-review/repo` under the workspace. The checkout itself, with its `.git`, sits in `.ai-review-head` and is never mounted, so the container never sees it or the write token. The post step reads one file from the mount, refuses a symlink or anything over 1 MiB, and posts a copy of it. Both directories are removed at the end.
+- The agent runs in a Podman container with every tool the harness provides enabled, so the container is the boundary, not a tool allowlist. It reads an export of the PR's working tree in `.ai-review/repo` under the workspace, with a git repository of its own: HEAD detached at the PR head and the full history of the base and the head, fetched from the checkout's objects without its config, remotes, hooks or credentials. The checkout itself, with its `.git`, sits in `.ai-review-head` and is never mounted, so the container never sees it or the write token. The action never runs git in `.ai-review` once the agent starts. The post step reads one file from the mount, refuses a symlink or anything over 1 MiB, and posts a copy of it. Both directories are removed at the end.
 - The agent has network access and the model credentials, and its tools include Bash, so a prompt-injected agent can use them.
 - The default `image` tag floats (it is rebuilt daily), so a new image can change the review between runs: pin a digest with the `image` input to freeze it.
 - agentic-ci is pinned by version, not by hash, and its dependencies float.
 - Do not use `pull_request_target` with a checkout of the PR head: that runs code from the PR with write access and secrets. The action refuses that event.
+
+### Deep review
+
+`mode: deep` runs the [code-review-panel](#overview) skill instead of the single pass: one reviewer per lens plus skeptics that verify each finding. It costs many times a standard review and takes much longer, so run it on demand, for example from a second workflow that a `deep-review` label starts:
+
+```yaml
+name: AI deep review
+on:
+  pull_request:
+    types: [labeled, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  deep-review:
+    # When the label is added, and on later pushes while it is set. Other labels do not start it.
+    if: >-
+      github.event.action == 'labeled' && github.event.label.name == 'deep-review' ||
+      github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'deep-review')
+    # Its own group, so a deep review and a standard review do not cancel each other.
+    concurrency:
+      group: ai-deep-review-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    runs-on: ubuntu-latest
+    # The image pull (up to 15 minutes), timeout_minutes (75 by default in deep mode) and the checkout.
+    timeout-minutes: 120
+    env:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+    steps:
+      - uses: opendatahub-io/code-review-skills@<full commit sha>
+        with:
+          mode: deep
+```
+
+The panel writes the same review JSON, and the post step validates and posts it like a standard review, under the same summary comment and marker. A deep review and a standard review of the same pull request therefore replace each other's comments: the one that finishes last is what the pull request shows. Deep mode ignores `review_instructions` with a warning, because the panel reads its guidance from `REVIEW.md` at the base branch, so a pull request cannot loosen its own review. With `harness: codex`, the runner image must also include the `code-review-panel` skill.
 
 ## Development
 

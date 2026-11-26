@@ -313,6 +313,14 @@ class ActionStaticTests(PanelTestCase):
             ("Post the review", "AGENT_MODEL", "inputs.model"),
             ("Post the review", "AI_REVIEW_HARNESS", "inputs.harness"),
             ("Check the event and credentials", "AI_REVIEW_HARNESS", "inputs.harness"),
+            ("Check the event and credentials", "AI_REVIEW_MODE", "inputs.mode"),
+            (
+                "Check the event and credentials",
+                "AI_REVIEW_DRAFT",
+                "github.event.pull_request.draft",
+            ),
+            ("Prepare the diff", "AI_REVIEW_MODE", "inputs.mode"),
+            ("Review the pull request", "AI_REVIEW_MODE", "inputs.mode"),
             ("Review the pull request", "AI_REVIEW_MODEL", "inputs.model"),
             ("Review the pull request", "AI_REVIEW_TIMEOUT_MINUTES", "inputs.timeout_minutes"),
             ("Review the pull request", "AI_REVIEW_HARNESS", "inputs.harness"),
@@ -425,7 +433,9 @@ class ScriptTestCase(PanelTestCase):
         return self.head_dir
 
 
-class CheckTests(ScriptTestCase):
+class CheckTestCase(ScriptTestCase):
+    """Runs the check step with a same-repo pull request event that has a key."""
+
     BASE = dict(
         AI_REVIEW_EVENT="pull_request",
         GITHUB_REPOSITORY="o/r",
@@ -439,6 +449,8 @@ class CheckTests(ScriptTestCase):
         env = {**self.BASE, **overrides}
         return self.run_script("check", self.tmp, **env)
 
+
+class CheckTests(CheckTestCase):
     def test_same_repo_run_with_a_key_proceeds(self):
         proc = self.check()
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
@@ -530,7 +542,9 @@ class CheckTests(ScriptTestCase):
         self.assertEqual(self.github_output(), {"skip": "false"})
 
 
-class PrepareTests(ScriptTestCase):
+class PrepareTestCase(ScriptTestCase):
+    """Runs the prepare step against a throwaway PR checkout and a stand-in action tree."""
+
     def setUp(self):
         super().setUp()
         # A stand-in for the action's own tree, which prepare copies into the workdir.
@@ -558,6 +572,8 @@ class PrepareTests(ScriptTestCase):
             "prepare", repo, AI_REVIEW_BASE_SHA=base, AI_REVIEW_HEAD_SHA=head, **env
         )
 
+
+class PrepareTests(PrepareTestCase):
     def test_diff_starts_at_the_merge_base_not_the_base_tip(self):
         repo, base, head = self.make_pr()
         proc = self.prepare(repo, base, head)
@@ -578,11 +594,17 @@ class PrepareTests(ScriptTestCase):
         self.assertTrue(Path(self.repo_dir, "feature.txt").is_file())
         self.assertTrue(Path(self.repo_dir, "a.txt").is_file())
 
-    def test_exported_repo_has_no_git_and_keeps_the_files(self):
+    def test_exported_repo_gets_a_fresh_git_at_the_head_and_keeps_the_files(self):
+        # Not the checkout's .git: the container gets one built for it, at the PR head.
         repo, base, head = self.make_pr()
         proc = self.prepare(repo, base, head)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertFalse(Path(self.repo_dir, ".git").exists())
+        self.assertTrue(Path(self.repo_dir, ".git").is_dir())
+        self.assertFalse(Path(self.repo_dir, ".git").is_symlink())
+        self.assertEqual(git(self.repo_dir, "rev-parse", "HEAD").stdout.decode().strip(), head)
+        self.assertNotEqual(
+            os.stat(Path(self.repo_dir, ".git")).st_ino, os.stat(Path(repo, ".git")).st_ino
+        )
         self.assertEqual(Path(self.repo_dir, "a.txt").read_text(encoding="utf-8"), "one\n")
 
     def test_export_keeps_files_the_pr_marks_export_ignore(self):
@@ -746,7 +768,9 @@ if os.environ.get("FAKE_WRITE") == "1":
 """
 
 
-class ReviewTests(ScriptTestCase):
+class ReviewTestCase(ScriptTestCase):
+    """Runs the review step against a prepared workdir with fake uvx and podman."""
+
     BASE = "a" * 40
     HEAD = "b" * 40
     IMAGE = "quay.io/aipcc/agentic-ci/claude-runner:latest"
@@ -788,8 +812,11 @@ class ReviewTests(ScriptTestCase):
         model: str | None = None,
         minutes: int = 20,
         harness: str = "claude-code",
+        prompt: str | None = None,
     ) -> list[str]:
-        if harness == "claude-code":
+        if prompt is not None:
+            tail = ["--", "--plugin-dir", "/workspace/plugin"] if harness == "claude-code" else []
+        elif harness == "claude-code":
             prompt = (
                 "/code-review-skills:github-code-review /workspace/repo /workspace/pr.diff "
                 f"{self.BASE} {self.HEAD} /workspace/out/ai-review-output.json"
@@ -841,6 +868,8 @@ class ReviewTests(ScriptTestCase):
         )
         write_executable(Path(self.bin, "timeout"), body)
 
+
+class ReviewTests(ReviewTestCase):
     def test_agent_runs_under_the_timeout(self):
         log = os.path.join(self.tmp, "timeout.log")
         self.fake_timeout(124)

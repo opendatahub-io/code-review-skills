@@ -31,9 +31,11 @@ inputs:
     required: false
     default: ''
   timeout_minutes:
-    description: Wall-clock limit for the agent step, in minutes. The step fails when the review takes longer.
+    description: >-
+      Wall-clock limit for the agent step, in minutes. The step fails when the
+      review takes longer. Empty means 20 in standard mode and 75 in deep mode.
     required: false
-    default: '20'
+    default: ''
   chill_mode:
     description: Drop suggestion-level comments ('true' or 'false').
     required: false
@@ -42,6 +44,13 @@ inputs:
     description: Post applicable suggestions from fix objects ('true' or 'false').
     required: false
     default: 'true'
+  mode:
+    description: >-
+      'standard' runs one review pass. 'deep' runs the code-review-panel skill:
+      one reviewer per lens plus skeptics, for many times the cost. Deep mode
+      ignores review_instructions and reads REVIEW.md from the base branch.
+    required: false
+    default: 'standard'
 
 runs:
   using: composite
@@ -56,6 +65,8 @@ runs:
         AI_REVIEW_ACTOR: ${{ github.actor }}
         AI_REVIEW_TRIGGERING_ACTOR: ${{ github.triggering_actor }}
         AI_REVIEW_HARNESS: ${{ inputs.harness }}
+        AI_REVIEW_MODE: ${{ inputs.mode }}
+        AI_REVIEW_DRAFT: ${{ github.event.pull_request.draft }}
 
     - name: Check out the pull request head
       if: steps.check.outputs.skip != 'true'
@@ -65,6 +76,7 @@ runs:
         fetch-depth: 0
         persist-credentials: false
         # Outside .ai-review: the container mounts that directory and must not reach the checkout's .git.
+        # The prepare step builds the container's own .git from it, without its config or remote.
         path: .ai-review-head
 
     - name: Prepare the diff
@@ -76,6 +88,7 @@ runs:
         AI_REVIEW_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         AI_REVIEW_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         AI_REVIEW_INSTRUCTIONS: ${{ inputs.review_instructions }}
+        AI_REVIEW_MODE: ${{ inputs.mode }}
 
     - name: Set up uv
       if: steps.check.outputs.skip != 'true'
@@ -101,6 +114,7 @@ runs:
         AI_REVIEW_TIMEOUT_MINUTES: ${{ inputs.timeout_minutes }}
         AI_REVIEW_AGENTIC_CI_VERSION: ${{ inputs.agentic_ci_version }}
         AI_REVIEW_IMAGE: ${{ inputs.image }}
+        AI_REVIEW_MODE: ${{ inputs.mode }}
         # The agent never holds a token that can write to the repository.
         GITHUB_TOKEN: ''
         GH_TOKEN: ''
