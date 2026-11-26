@@ -289,6 +289,109 @@ class CommandLineTests(RecommendationTestCase):
         self.assertNotIn("::warning::", out)
 
 
+class DeepLabelTests(RecommendationTestCase):
+    def label_line(self, label, data=None):
+        args = self.args(data or review_data())
+        args.deep_recommendation_plan = self.plan_file(plan(evidence=[]))
+        args.deep_label = label
+        code, out, _ = self.call(review._github_post, args)
+        self.assertEqual(code, 0, out)
+        body = self.fake.summary_body()
+        self.assertEqual(len(self.recommendation_lines(body)), 1)
+        line = body.split("\n")[2]
+        self.assertTrue(line.startswith(f"{LINE_PREFIX} Add the "), line)
+        self.assertTrue(line.endswith(" label to this pull request to run it."), line)
+        self.assertLessEqual(len(body), review._GITHUB_BODY_LIMIT)
+        self.assertTrue(body.endswith(marker()))
+        self.assertEqual(body.count("<!--"), 1)
+        return line
+
+    def test_the_line_names_the_given_label(self):
+        line = self.label_line("ai: deep review")
+        self.assertEqual(
+            line, f"{LINE_PREFIX} Add the `ai: deep review` label to this pull request to run it."
+        )
+
+    def test_the_default_label_keeps_the_line_unchanged(self):
+        self.assertEqual(self.label_line(None), f"{LINE_PREFIX} {LINE_SUFFIX}")
+        self.assertEqual(self.label_line("deep-review"), f"{LINE_PREFIX} {LINE_SUFFIX}")
+
+    def test_backticks_cannot_close_the_code_span(self):
+        cases = {
+            "a`b": "`` a`b ``",
+            "`x": "`` `x ``",
+            "x```": "```` x``` ````",
+        }
+        for label, span in cases.items():
+            with self.subTest(label=label):
+                line = self.label_line(label)
+                self.assertIn(f"Add the {span} label", line)
+
+    def test_mentions_are_defused(self):
+        line = self.label_line("@org/team &#64;bob")
+        self.assertIsNone(LIVE_MENTION_RE.search(line))
+        self.assertIn(f"@{ZWSP}org/team", line)
+        self.assertNotIn("&#64;bob", line)
+
+    def test_an_html_comment_cannot_forge_the_marker(self):
+        line = self.label_line("<!-- ai-review -->")
+        self.assertNotIn("<!--", line)
+        self.assertEqual(review._github_trailing_marker(self.fake.summary_body()).group(1), HEAD)
+
+    def test_unusable_labels_exit_1_before_any_request(self):
+        for label in (
+            "",
+            "   ",
+            "x" * 51,
+            "deep\nreview",
+            "deep\rreview",
+            "deep\x1breview",
+            "deep\x85review",
+            "deep\u202ereview",
+            "deep\u200breview",
+            "deep\u2028review",
+            "deep\udcffreview",
+        ):
+            with self.subTest(label=label):
+                fake = FakeGitHub()
+                args = self.args(review_data([finding()]))
+                args.deep_label = label
+                code, _, err = self.call(review._github_post, args, fake=fake)
+                self.assertEqual(code, 1)
+                self.assertIn("--deep-label must be", err)
+                self.assertEqual(fake.calls, [])
+
+    def test_a_label_at_the_length_limit_is_accepted(self):
+        line = self.label_line("x" * 50)
+        self.assertIn(f"`{'x' * 50}`", line)
+
+
+class DeepLabelCommandLineTests(RecommendationTestCase):
+    def run_main(self, *extra):
+        path = write_json(os.path.join(self.tmp, "review.json"), review_data())
+        plan_path = self.plan_file(plan(evidence=[]))
+        argv = ["review.py", "post", path, "--deep-recommendation-plan", plan_path, *extra]
+        with patch.object(sys, "argv", argv):
+            return self.call(review.main)
+
+    def test_the_single_argument_form_takes_values_that_look_like_options(self):
+        for label, span in (("-x", "`-x`"), ("--mode", "`--mode`"), ("@team", f"`@{ZWSP}team`")):
+            with self.subTest(label=label):
+                self.fake = FakeGitHub()
+                code, _, err = self.run_main("--platform", "github", f"--deep-label={label}")
+                self.assertEqual(code, 0, err)
+                line = self.recommendation_lines(self.fake.summary_body())[0]
+                self.assertIn(f"Add the {span} label", line)
+
+    def test_the_flag_is_rejected_without_platform_github(self):
+        path = write_json(os.path.join(self.tmp, "review.json"), review_data())
+        with patch.object(sys, "argv", ["review.py", "post", path, "--deep-label=deep"]):
+            code, _, err = self.call(review.main)
+        self.assertEqual(code, 2)
+        self.assertIn("--deep-label needs --platform github", err)
+        self.assertEqual(self.fake.calls, [])
+
+
 class PanelOutputRenderingTests(GitHubTestCase):
     """Pin how the panel's --gitlab-json text looks after the GitHub poster handles it.
 

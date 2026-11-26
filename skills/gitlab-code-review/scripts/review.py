@@ -54,7 +54,7 @@ Usage:
   review.py post review.json [--chill|--no-chill] [--inline-fixes|--no-inline-fixes] [--verbose]
   review.py post review.json --platform github [--deep-recommendation-plan PATH]
                                [--mode standard|deep] [--deep-job NAME]
-                               [--posted-flag PATH]
+                               [--deep-label=LABEL] [--posted-flag PATH]
   review.py stand-down --platform github --mode standard|deep [--deep-job NAME]
   review.py display review.json [--chill|--no-chill] [--inline-fixes|--no-inline-fixes]
   review.py suggest-reviewers [--verbose]
@@ -906,15 +906,22 @@ def _summary_positive_lines(positives: list[str]) -> list[str]:
     return ["\n### Positive Aspects", *(f"- {p}" for p in positives)]
 
 
-def _summary_count_lines(inline: list[dict[str, Any]], apply_hint: str) -> list[str]:
-    """Markdown lines with severity counts and the applicable-suggestion count."""
+def _summary_count_lines(
+    inline: list[dict[str, Any]], apply_hint: str, heading: str | None = None
+) -> list[str]:
+    """Markdown lines with severity counts and the applicable-suggestion count.
+
+    ``heading`` replaces the default "Issues Found (N total)" heading text.
+    """
     if not inline:
         return []
     severity_counts: dict[str, int] = {}
     for c in inline:
         severity_counts[c["severity"]] = severity_counts.get(c["severity"], 0) + 1
 
-    lines = [f"\n### Issues Found ({len(inline)} total)"]
+    if heading is None:
+        heading = f"Issues Found ({len(inline)} total)"
+    lines = [f"\n### {heading}"]
     for sev in SEVERITY_ORDER:
         if sev in severity_counts:
             icon = SEVERITY_ICONS.get(sev, "")
@@ -1008,6 +1015,12 @@ _STANDDOWN_JOB_PAGES = 2
 _STANDDOWN_PER_PAGE = 100
 _GITHUB_DEEP_JOB_DEFAULT = "deep-review"
 _GITHUB_DEEP_JOB_CHARS = 200
+# The label the recommendation line tells reviewers to add. GitHub caps label names at 50.
+_GITHUB_DEEP_LABEL_DEFAULT = "deep-review"
+_GITHUB_DEEP_LABEL_CHARS = 50
+# Control, format (bidi overrides, zero-width marks), surrogate and line or paragraph
+# separator characters: each can hide or reorder text, or break the line.
+_LABEL_BAD_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Zl", "Zp"})
 # A deep review job in one of these states has started or is about to. A completed one
 # counts only when it succeeded: one that failed, was cancelled or skipped posted nothing.
 _GITHUB_JOB_STARTED = frozenset({"queued", "in_progress", "waiting", "requested", "pending"})
@@ -1756,6 +1769,34 @@ def _github_deep_job(value: str | None) -> str:
     return value
 
 
+def _github_deep_label(value: str | None) -> str:
+    """Return the label the deep review recommendation names, exiting 1 on an unusable one."""
+    if value is None:
+        return _GITHUB_DEEP_LABEL_DEFAULT
+    if (
+        not value.strip()
+        or len(value) > _GITHUB_DEEP_LABEL_CHARS
+        or any(unicodedata.category(ch) in _LABEL_BAD_CATEGORIES for ch in value)
+    ):
+        _error(
+            f"--deep-label must be a label name of 1 to {_GITHUB_DEEP_LABEL_CHARS} characters, "
+            "not blank, without control or invisible format characters"
+        )
+        sys.exit(1)
+    return value
+
+
+def _github_label_span(label: str) -> str:
+    """Render a label name as an inline code span, keeping a plain name as `name`.
+
+    The delimiter outlasts any backtick run in the name; the padding keeps a backtick
+    at either end from joining the delimiter, and GitHub strips it again.
+    """
+    delimiter = "`" * (_longest_backtick_run(label) + 1)
+    pad = " " if "`" in label else ""
+    return f"{delimiter}{pad}{label}{pad}{delimiter}"
+
+
 def _github_session(ctx: _GitHubContext) -> requests.Session:
     session = _SafeSession()
     session.headers.update(
@@ -1927,11 +1968,13 @@ def _github_read_plan(path: str) -> dict[str, Any] | None:
     return None
 
 
-def _github_recommendation(path: str) -> str | None:
+def _github_recommendation(path: str, label: str = _GITHUB_DEEP_LABEL_DEFAULT) -> str | None:
     """Build the deep-review recommendation line from a triage plan, or None.
 
     Only a plan whose tier is ``deep`` yields a line. Any other tier is silent;
-    a file that cannot be used, or has the wrong shape, gets one warning.
+    a file that cannot be used, or has the wrong shape, gets one warning. ``label``
+    is the label that starts the deep review, checked by ``_github_deep_label``; the
+    summary defuses mentions and ``<!--`` in the whole line.
     """
     plan = _github_read_plan(path)
     if plan is None:
@@ -1954,7 +1997,7 @@ def _github_recommendation(path: str) -> str | None:
     reason_text = f"{reasons}. " if reasons else ""
     return (
         f"**Deep review recommended:** {reason_text}"
-        "Add the `deep-review` label to this pull request to run it."
+        f"Add the {_github_label_span(label)} label to this pull request to run it."
     )
 
 
@@ -2070,13 +2113,16 @@ def _github_build_summary_body(
     unanchored: list[dict[str, Any]] | None = None,
     carried: int = 0,
     recommendation: str | None = None,
+    mode: str | None = None,
 ) -> str:
     """Build the markdown summary body for the PR comment.
 
     ``data["inline_comments"]`` holds the findings that were posted inline;
     ``unanchored`` holds the ones that were not posted inline; ``carried`` is
     the number of earlier threads still open on code that did not change.
-    ``recommendation`` is a line placed directly under the heading.
+    ``recommendation`` is a line placed directly under the heading. With ``mode``
+    ``deep`` the counts are headed as inline comments, since the panel's own summary
+    counts every finding, and the footer names the mode.
     """
     parts: list[str] = ["## AI Code Review Summary\n"]
     if recommendation:
@@ -2090,9 +2136,12 @@ def _github_build_summary_body(
     positives = [str(p) for p in raw_positives]
     # Defuse each line after its list prefix is added, as GitHub renders it.
     parts.extend(_github_text(line) for line in _summary_positive_lines(positives))
+    inline_posted = data.get("inline_comments", [])
+    deep = mode == "deep"
     count_lines = _summary_count_lines(
-        data.get("inline_comments", []),
+        inline_posted,
         "use **Commit suggestion** on the inline comment",
+        f"Inline comments ({len(inline_posted)})" if deep else None,
     )
     if carried > 0:
         carried_line = f"- Still open from earlier runs, on code that did not change: {carried}"
@@ -2107,7 +2156,7 @@ def _github_build_summary_body(
     footer = (
         "\n\n---\n"
         "*Generated by [Code Review](https://github.com/opendatahub-io/code-review-skills)"
-        f"{run}{_footer_facts()}*"
+        f"{run}{_footer_facts()}{' • Mode: deep' if deep else ''}*"
     )
     # Most severe first, so the cap leaves out the least severe findings.
     ranked = sorted(
@@ -2195,6 +2244,7 @@ def _github_post(args: argparse.Namespace) -> None:
     # Without --mode nothing checks for a review that should win, as before.
     mode = getattr(args, "mode", None)
     deep_job = _github_deep_job(getattr(args, "deep_job", None))
+    deep_label = _github_deep_label(getattr(args, "deep_label", None))
     # Written only once the summary is up, so a caller can tell a review that posted from
     # one that stood down or found the head moved, which both exit 0.
     posted_flag = getattr(args, "posted_flag", None)
@@ -2209,7 +2259,9 @@ def _github_post(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     plan_path = getattr(args, "deep_recommendation_plan", None)
-    recommendation = _github_recommendation(plan_path) if plan_path is not None else None
+    recommendation = (
+        _github_recommendation(plan_path, deep_label) if plan_path is not None else None
+    )
 
     # A path with a control character is never in a diff, and printing it
     # would let the model start a workflow command in the log.
@@ -2239,7 +2291,10 @@ def _github_post(args: argparse.Namespace) -> None:
 
         summary_id, prev_sha = _github_find_summary(session, ctx)
         original = list(data["inline_comments"])
-        if prev_sha and prev_sha != head_sha:
+        # A deep review re-reviews the whole pull request and replaces every earlier thread,
+        # so it posts all its findings. The summary SHA may come from a standard review that
+        # never saw them.
+        if prev_sha and prev_sha != head_sha and mode != "deep":
             _step(f"Found previous review (sha: {prev_sha[:8]}...), filtering unchanged code...")
             data = filter_already_reviewed(data, prev_sha, head_sha)
 
@@ -2301,7 +2356,7 @@ def _github_post(args: argparse.Namespace) -> None:
         # come back instead of staying dropped as "unchanged code".
         summary_marker = review_marker if not (unanchored or failed) else _make_review_marker()
         summary_body = _github_build_summary_body(
-            data, summary_marker, ctx.run_url, unanchored, carried, recommendation
+            data, summary_marker, ctx.run_url, unanchored, carried, recommendation, mode
         )
         # The inline comments are already up; a review that should win replaces them.
         if mode and _github_stands_down(session, ctx, mode, deep_job):
@@ -2986,6 +3041,15 @@ def main() -> None:
         ),
     )
     post_parser.add_argument(
+        "--deep-label",
+        metavar="LABEL",
+        help=(
+            "label the deep-review recommendation tells reviewers to add "
+            f"(default: {_GITHUB_DEEP_LABEL_DEFAULT}; at most {_GITHUB_DEEP_LABEL_CHARS} "
+            "characters; pass it as --deep-label=LABEL; needs --platform github)"
+        ),
+    )
+    post_parser.add_argument(
         "--posted-flag",
         metavar="PATH",
         help=(
@@ -3037,6 +3101,7 @@ def main() -> None:
             ("--deep-recommendation-plan", args.deep_recommendation_plan),
             ("--mode", args.mode),
             ("--deep-job", args.deep_job),
+            ("--deep-label", args.deep_label),
             ("--posted-flag", args.posted_flag),
         ):
             if value is not None:
