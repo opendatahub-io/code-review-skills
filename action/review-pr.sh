@@ -23,7 +23,8 @@
 #   AI_REVIEW_MODE                mode input: standard or deep (check, prepare, standdown,
 #                                 review, post)
 #   AI_REVIEW_DEEP_JOB            deep_review_job input (standdown, post)
-#   AI_REVIEW_RECOMMEND_DEEP      recommend_deep_review input (prepare, post)
+#   AI_REVIEW_DEEP_LABEL          deep_review_label input (check, post)
+#   AI_REVIEW_RECOMMEND_DEEP      recommend_deep_review input (check, prepare, post)
 #   AI_REVIEW_SUGGEST_REVIEWERS   suggest_reviewers input (post)
 #   AI_REVIEW_BOT_LOGIN           account the post token belongs to, empty for
 #                                 github-actions[bot] (check validates the bot_login input,
@@ -36,13 +37,16 @@
 #   AI_REVIEW_INSTRUCTIONS        review_instructions input (prepare, review)
 #   AI_REVIEW_MODEL               model input (review)
 #   AI_REVIEW_TIMEOUT_MINUTES     timeout_minutes input (review)
-#   AI_REVIEW_AGENTIC_CI_VERSION  agentic_ci_version input (review, cleanup)
+#   AI_REVIEW_AGENTIC_CI_VERSION  agentic_ci_version input (review, cleanup): a PyPI version for
+#                                 podman, an openshell image tag, optionally <tag>@sha256:<digest>,
+#                                 for openshell
 #   AI_REVIEW_IMAGE               image input (review)
 #   GITHUB_OUTPUT, GITHUB_REPOSITORY, GITHUB_WORKSPACE, GITHUB_ACTION_PATH, GITHUB_RUN_ID,
 #   GITHUB_RUN_ATTEMPT:           set by the runner
 #   RUNNER_TEMP                   set by the runner (review: parent of the agent's private TMPDIR,
 #                                 post: parent of the copy of the output and of the flag that the
-#                                 summary was posted, prepare and post: parent of the triage plan)
+#                                 summary was posted, prepare and post: parent of the triage plan,
+#                                 standdown: its working directory)
 #   GITHUB_TOKEN                  github.token (standdown); the github_token input, else a
 #                                 minted App token, else github.token (post); no other step
 #                                 gets one
@@ -64,9 +68,9 @@
 # The triage plan of the deep-review recommendation is $RUNNER_TEMP/ai-review-triage/plan.json,
 # outside the mount, written by prepare before any agent runs and read only by post.
 #
-# prepare, standdown and post run in .ai-review-head. review runs in .ai-review, not in a
-# checkout, so uvx does not read a uv config that arrives with the PR. check and cleanup run
-# anywhere.
+# prepare and post run in .ai-review-head. standdown runs in RUNNER_TEMP, before the checkout
+# exists. review runs in .ai-review, not in a checkout, so uvx does not read a uv config that
+# arrives with the PR. check and cleanup run anywhere.
 
 set -euo pipefail
 
@@ -83,7 +87,10 @@ PODMAN_CONTAINER_DIR=/workspace
 OPENSHELL_CONTAINER_DIR=/sandbox/.ai-review
 # The image that runs agentic-ci and the OpenShell gateway for the openshell backend. Its tag is
 # the agentic_ci_version input, so the bundled agentic-ci is the version the action asks for.
+# openshell_image_ref builds the reference.
 OPENSHELL_IMAGE_REPO="quay.io/aipcc/agentic-ci/openshell"
+# The plugin the agent's skill catalog is narrowed to, as the GitLab job does.
+ENABLED_PLUGINS="code-review-skills"
 # The label on every docker container and volume of a run, whose value is the absolute AI_DIR,
 # so cleanup finds them after a SIGKILL.
 WORKDIR_LABEL="ai-review.workdir"
@@ -123,6 +130,8 @@ MAX_PLAN_BYTES=1048576
 TRIAGE_TIMEOUT=60s
 # The deep_review_job input's default, which review.py also uses.
 DEFAULT_DEEP_JOB="deep-review"
+# The deep_review_label input's default, which review.py also uses.
+DEFAULT_DEEP_LABEL="deep-review"
 # The exit status of review.py stand-down when a review that should win makes this one redundant.
 STANDDOWN_EXIT=10
 # The private TMPDIR of the review step, which the EXIT trap removes.
@@ -217,6 +226,21 @@ deep_job_name() {
     echo "${AI_REVIEW_DEEP_JOB:-$DEFAULT_DEEP_JOB}"
 }
 
+# The label that starts the deep review. An empty one is the input's default.
+deep_label_name() {
+    echo "${AI_REVIEW_DEEP_LABEL:-$DEFAULT_DEEP_LABEL}"
+}
+
+# The openshell image for an agentic_ci_version: a tag, or a tag pinned to a digest as
+# <tag>@sha256:<64 lowercase hex>, which docker pulls and runs by the digest. Fails on anything
+# else, so the agent run and the cleanup run only a reference this check accepted.
+openshell_image_ref() {
+    # Plain ASCII ranges, whatever the runner's locale.
+    local LC_ALL=C
+    [[ "${1:-}" =~ ^[0-9][0-9A-Za-z._-]*(@sha256:[0-9a-f]{64})?$ ]] || return 1
+    echo "$OPENSHELL_IMAGE_REPO:$1"
+}
+
 # The directory of the triage plan. Fails when RUNNER_TEMP is not an absolute path, so no caller
 # removes or writes a directory at the filesystem root.
 triage_dir() {
@@ -259,6 +283,28 @@ require_bot_login() {
     error "bot_login must be a GitHub App bot login like my-app[bot] or a GitHub user login, got: '$shown'"
 }
 
+# Fail on a deep_review_label that review.py would reject in the post step, before any agent
+# spends on the review: blank, over 50 characters, or with a control, format, surrogate or line
+# or paragraph separator character. Only checked where post passes it: standard mode with the
+# recommendation on. review.py stays the full check.
+require_deep_label() {
+    [ "$REVIEW_MODE" = "standard" ] && is_on "${AI_REVIEW_RECOMMEND_DEEP:-}" || return 0
+    local label="${AI_REVIEW_DEEP_LABEL:-}" problem
+    # Empty is the input's default.
+    [ -n "$label" ] || return 0
+    problem="$(python3 -I -c 'import sys, unicodedata
+label = sys.argv[1]
+if not label.strip():
+    print("is blank")
+elif len(label) > 50:
+    print("is longer than 50 characters")
+elif any(unicodedata.category(c) in ("Cc", "Cf", "Cs", "Zl", "Zp") for c in label):
+    print("contains a control, format or line separator character")' "$label")" \
+        || error "Could not check the deep_review_label input"
+    # The value is not shown: it can hold a newline that would start a workflow command.
+    [ -z "$problem" ] || error "deep_review_label $problem, so the summary could not name it"
+}
+
 # Whether the job environment carries a credential agentic-ci can use for the harness.
 # The keys are agentic-ci's, not the action's: it reads them from the environment.
 has_harness_credentials() {
@@ -287,6 +333,7 @@ cmd_check() {
     fi
     require_mode
     require_bot_login
+    require_deep_label
 
     # Forks and Dependabot come first: their runs get no secrets, so they skip in every mode.
     local fail_in_deep=""
@@ -573,7 +620,9 @@ run_openshell_agent() {
     command -v docker >/dev/null 2>&1 \
         || error "The openshell backend needs docker on the runner. Set backend: podman to run the agent with Podman instead"
 
-    local openshell_image="$OPENSHELL_IMAGE_REPO:$version" suffix
+    local openshell_image suffix
+    openshell_image="$(openshell_image_ref "$version")" \
+        || error "No openshell image for agentic_ci_version '$version'"
     suffix="$(docker_run_suffix)"
     local name="ai-review-$suffix" volume="ai-review-store-$suffix"
     local label="$WORKDIR_LABEL=$AI_DIR"
@@ -594,8 +643,7 @@ run_openshell_agent() {
     else
         names="$CODEX_CREDENTIAL_VARS"
     fi
-    # Narrows the image's skill catalog to this plugin, as the GitLab job does.
-    export AGENT_ENABLED_PLUGINS=code-review-skills
+    # cmd_review sets it for both backends.
     local env_args=(-e AGENT_ENABLED_PLUGINS)
     for var in $names; do
         if [ -n "${!var:-}" ]; then
@@ -702,10 +750,17 @@ cmd_review() {
         *[[:space:]]*) error "image must not contain whitespace, got: '$image'" ;;
     esac
     local version_re='^[0-9][0-9A-Za-z.+!-]*$'
-    [[ "$version" =~ $version_re ]] || error "agentic_ci_version must be a package version such as 0.5.15, got: '$version'"
-    # The version is the openshell image's tag, which allows fewer characters than a version.
-    if [ "$backend" = "openshell" ] && [[ ! "$version" =~ ^[0-9][0-9A-Za-z._-]*$ ]]; then
-        error "agentic_ci_version must be a tag of the openshell image with the openshell backend, got: '$version'"
+    if [ "$backend" = "openshell" ]; then
+        # The version is the openshell image's tag, which allows fewer characters than a
+        # version, and can pin the image by digest.
+        if [[ ! "${version%%@*}" =~ $version_re ]] || ! openshell_image_ref "$version" >/dev/null; then
+            error "agentic_ci_version must be a tag of the openshell image with the openshell backend, such as 0.5.15, or a tag pinned to a digest, such as 0.5.15@sha256:<64 lowercase hex digits>, got: '$version'"
+        fi
+    else
+        case "$version" in
+            *@*) error "agentic_ci_version is the PyPI version of agentic-ci with backend: podman, so it cannot pin a digest: only the openshell image is pinned by digest, got: '$version'" ;;
+        esac
+        [[ "$version" =~ $version_re ]] || error "agentic_ci_version must be a package version such as 0.5.15, got: '$version'"
     fi
     local minutes="${AI_REVIEW_TIMEOUT_MINUTES:-}"
     if [ -z "$minutes" ]; then
@@ -775,6 +830,10 @@ cmd_review() {
         args+=(-- --plugin-dir "$cdir/plugin")
     fi
 
+    # Narrows the image's skill catalog to this plugin, as the GitLab job does. agentic-ci reads
+    # it from its environment: openshell passes it into the container, and with podman the uvx
+    # run inherits it, like the credentials.
+    export AGENT_ENABLED_PLUGINS="$ENABLED_PLUGINS"
     if [ "$backend" = "openshell" ]; then
         run_openshell_agent "$harness" "$image" "$version" "$minutes" "${args[@]}"
     else
@@ -893,10 +952,14 @@ cmd_post() {
         local dir plan
         # Only prepare writes the plan, outside the mount. A link or anything but a file there
         # was not written by it.
-        if is_on "${AI_REVIEW_RECOMMEND_DEEP:-}" && dir="$(triage_dir)"; then
-            plan="$dir/plan.json"
-            if [ ! -L "$dir" ] && [ -d "$dir" ] && [ ! -L "$plan" ] && [ -f "$plan" ]; then
-                args+=(--deep-recommendation-plan "$plan")
+        if is_on "${AI_REVIEW_RECOMMEND_DEEP:-}"; then
+            # The label the recommendation tells people to add. One argument, like the job name.
+            args+=("--deep-label=$(deep_label_name)")
+            if dir="$(triage_dir)"; then
+                plan="$dir/plan.json"
+                if [ ! -L "$dir" ] && [ -d "$dir" ] && [ ! -L "$plan" ] && [ -f "$plan" ]; then
+                    args+=(--deep-recommendation-plan "$plan")
+                fi
             fi
         fi
     fi
@@ -933,10 +996,11 @@ cmd_standdown() {
         args+=("--deep-job=$(deep_job_name)")
     fi
 
-    # The step runs in the checkout, whose git config is the PR's.
+    # The step runs in RUNNER_TEMP, before the checkout, and review.py runs no git here. The
+    # overrides still stop any git config above this directory from running code.
     harden_git
     local status=0
-    # uv must ignore config and .python-version files that arrive with the PR.
+    # uv must ignore config and .python-version files, here or above this directory.
     UV_NO_CONFIG=1 UV_PYTHON="$(command -v python3)" "$review_py" "${args[@]}" || status=$?
     case "$status" in
         0)
@@ -1018,9 +1082,8 @@ remove_docker_leftovers() {
 # that left them has it, and a root chown over a tree the agent wrote is not worth the risk.
 give_back_workdir() {
     uses_openshell_docker || return 1
-    local version="${AI_REVIEW_AGENTIC_CI_VERSION:-}"
-    [[ "$version" =~ ^[0-9][0-9A-Za-z._-]*$ ]] || return 1
-    local openshell_image="$OPENSHELL_IMAGE_REPO:$version"
+    local openshell_image
+    openshell_image="$(openshell_image_ref "${AI_REVIEW_AGENTIC_CI_VERSION:-}")" || return 1
     docker image inspect "$openshell_image" >/dev/null 2>&1 || return 1
     timeout 2m docker run --rm --pull never \
         --label "$WORKDIR_LABEL=$AI_DIR" \
@@ -1049,9 +1112,10 @@ cmd_cleanup() {
         rm -rf -- "$dir" || failed=1
     fi
 
-    # A review step that was killed before its trap ran leaves its private TMPDIR behind.
+    # A review step that was killed before its trap ran leaves its private TMPDIR behind, and the
+    # post step leaves its copy of the review output.
     if [ -n "${RUNNER_TEMP:-}" ]; then
-        for dir in "$RUNNER_TEMP"/ai-review-tmp.*; do
+        for dir in "$RUNNER_TEMP"/ai-review-tmp.* "$RUNNER_TEMP"/ai-review-post.*; do
             if [ -d "$dir" ] && [ ! -L "$dir" ]; then
                 rm -rf -- "$dir" || failed=1
             fi

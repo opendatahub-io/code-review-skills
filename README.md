@@ -124,12 +124,15 @@ jobs:
       - uses: opendatahub-io/code-review-skills@<full commit sha>
         with:
           recommend_deep_review: 'true'
+          # The label in the deep job's if: below, which the recommendation tells people to add.
+          deep_review_label: deep-review
 
   deep-review:
     # The standard review finds this job by its name: keep it equal to deep_review_job.
     name: deep-review
     # When the deep-review label is added, and on later pushes while it is set. Never for a draft:
-    # the action fails a deep review of a draft, which would show as a failed job.
+    # the action fails a deep review of a draft, which would show as a failed job. The label is
+    # the standard job's deep_review_label input: keep the two equal.
     if: >-
       contains(github.event.pull_request.labels.*.name, 'deep-review') &&
       !github.event.pull_request.draft &&
@@ -152,7 +155,7 @@ Then:
 
 1. Replace `<full commit sha>` with the commit of this repository you want to run. There are no release tags yet, so pin a full commit SHA.
 2. Add the model key as a secret of the repository, or as an organization secret that the repository can read: `OPENAI_API_KEY` for the default `codex` harness. See [Credentials](#credentials) for Claude Code and Vertex.
-3. Create a `deep-review` label in the repository. Adding it to a pull request starts a deep review, and later pushes run the deep review again while the label is set. Removing it goes back to standard reviews.
+3. Create a `deep-review` label in the repository. Adding it to a pull request starts a deep review, and later pushes run the deep review again while the label is set. Removing it goes back to standard reviews. To use another label, put its name in the deep job's `if:` and `concurrency:` and in the standard job's `deep_review_label` input.
 
 What each part is for:
 
@@ -161,7 +164,7 @@ What each part is for:
 - **Concurrency.** The groups are set on the jobs, not the workflow. A new push cancels the outdated review of the same kind, a standard and a deep review never cancel each other, and a run that a job skips gets a `noop` group of its own, so an unrelated label cannot cancel a review in flight. A workflow-level group would: every label change starts a run.
 - **The deep job's `if:`.** It skips drafts itself rather than leaving that to the action. In deep mode the action fails on a draft instead of skipping it: a skipped run would end in success, and a later standard review of the same commit would take it for a finished deep review and stand down with nothing posted. A failed deep job, or one skipped by `if:`, never counts, but the `if:` keeps a failed job off the pull request.
 - **The deep job's credentials.** Give the deep job the same model credentials as the standard job. A deep job without one fails with an error rather than skipping with a notice, for the same reason as a draft, so a missing secret shows as a failed job instead of passing silently. The standard review of that push can still stand down while the deep job is starting, so fix the secret and push again.
-- **The deep job's name.** The standard review finds the deep job by its display name, which the `deep_review_job` input gives (`deep-review` by default). Keep the job's `name:` and that input equal, and keep the label called `deep-review`: the deep review recommendation in the summary tells people to add exactly that label.
+- **The deep job's name and label.** The standard review finds the deep job by its display name, which the `deep_review_job` input gives (`deep-review` by default). Keep the job's `name:` and that input equal. The deep review recommendation in the summary tells people to add the label that the `deep_review_label` input names (`deep-review` by default), so keep it equal to the label in the deep job's `if:`.
 - **Timeouts.** A composite action cannot bound itself, so the jobs do: 45 minutes for the standard review (20 agent minutes by default) and 120 for the deep one (75 agent minutes). The rest covers the image pulls, about a minute in practice and at most 15 minutes each, and the checkout. When you raise `timeout_minutes`, raise the job's `timeout-minutes` with it.
 - **No checkout step.** The action checks out the pull request head itself.
 
@@ -197,22 +200,25 @@ A standard review without a credential for its harness exits 0 with a notice and
 
 Codex has no plugin flag, so it does not load the action's own copy of the skills: it loads `github-code-review` (and `code-review-panel` in deep mode) from the skills-registry copy installed in its image. The image must be a build that already includes `github-code-review`: the first agentic-ci release after 0.5.15, or a `:latest` built after 2026-11-25, when code-review-skills commit `ac21ab6` added it. An older image cannot find the skill, and the run fails with "produced no output" and a hint that names the `image` input. The image, not the action, then decides which skill revision runs, so pin the image by digest. Claude Code loads the skills from the action's own copy, so it does not depend on which skills its image ships.
 
+The steps that run on the runner always use the action's own copy: `review.py` posts, and with `recommend_deep_review` the triage runs the action's `panel.py`. With `harness: codex` the agent's skills (and, in deep mode, the panel's own triage) come from the image instead, so the image and the action's commit should come from the same release of this repository, or the recommendation and the review JSON can come from different skill revisions. The default images float until the action pins an agentic-ci release that ships these skills; until then, pin an `image` built from the same code-review-skills commit as the action when you need them aligned.
+
 ### Inputs
 
 | Input | Default | Description |
 |-------|---------|-------------|
 | `harness` | `codex` | Agent harness agentic-ci runs: `codex` or `claude-code`. Its credential goes in the job's `env:` (see [Credentials](#credentials)). |
 | `model` | harness default | Model for the review, also shown in the summary footer. |
-| `agentic_ci_version` | `0.5.15` | Version of `agentic-ci` that runs the agent. With `backend: openshell` it is the tag of `quay.io/aipcc/agentic-ci/openshell`, whose bundled agentic-ci runs; with `backend: podman` it is the package version `uvx` installs. Every flag the action passes was checked against the default. |
+| `agentic_ci_version` | `0.5.15` | Version of `agentic-ci` that runs the agent. With `backend: openshell` it is the tag of `quay.io/aipcc/agentic-ci/openshell`, whose bundled agentic-ci runs, and `<tag>@sha256:<digest>` (64 lowercase hex digits) pins that image by digest; with `backend: podman` it is the package version `uvx` installs, and a digest fails the review step. Every flag the action passes was checked against the default. |
 | `backend` | `openshell` | Where agentic-ci runs the agent: `openshell` or `podman` (see [Backends](#backends)). Any other value fails the review step. |
-| `image` | image for the harness and backend | Container image the agent runs in. Empty picks the agentic-ci image for the harness: `quay.io/aipcc/agentic-ci/codex-sandbox:latest` or `.../claude-sandbox:latest` with `backend: openshell`, and `.../codex-runner:latest` or `.../claude-runner:latest` with `backend: podman`. The `*-sandbox` images do not work with Podman: they keep their config under a user that the Podman run does not start the agent as. The default tag floats until the action pins an agentic-ci release: pin a digest (`...sandbox@sha256:<digest>`) to freeze it. Codex needs an image that ships its skills (see [Credentials](#credentials)). |
+| `image` | image for the harness and backend | Container image the agent runs in. Empty picks the agentic-ci image for the harness: `quay.io/aipcc/agentic-ci/codex-sandbox:latest` or `.../claude-sandbox:latest` with `backend: openshell`, and `.../codex-runner:latest` or `.../claude-runner:latest` with `backend: podman`. The `*-sandbox` images do not work with Podman: they keep their config under a user that the Podman run does not start the agent as. The default tag floats until the action pins an agentic-ci release: pin a digest (`...sandbox@sha256:<digest>`) to freeze it. Codex needs an image that ships its skills (see [Credentials](#credentials)). With either backend the action narrows the image's plugin catalog to `code-review-skills`, so a custom image must include that plugin. |
 | `mode` | `standard` | `standard` runs one review pass with `github-code-review`. `deep` runs `code-review-panel`, which ignores `review_instructions` (see [Deep review](#deep-review)). |
 | `timeout_minutes` | `20` standard, `75` deep | Wall-clock limit for the agent step. The step fails when the review takes longer. Empty picks the default for the mode. Keep the job's `timeout-minutes` above it. |
 | `review_instructions` | -- | Extra guidance such as focus areas or team standards, passed to the review as a file. Standard mode only. |
 | `chill_mode` | `true` | Drop suggestion-level comments. |
 | `inline_fixes` | `true` | Post `fix` objects as applicable suggestions. |
-| `recommend_deep_review` | `false` | Standard mode only. Before the agent starts, run the panel's triage on the runner and, when it picks the deep tier, add a line to the summary that recommends adding the `deep-review` label and names what triggered it (see [The deep review recommendation](#the-deep-review-recommendation)). |
+| `recommend_deep_review` | `false` | Standard mode only. Before the agent starts, run the panel's triage on the runner and, when it picks the deep tier, add a line to the summary that recommends adding the `deep_review_label` label and names what triggered it (see [The deep review recommendation](#the-deep-review-recommendation)). |
 | `deep_review_job` | `deep-review` | Display name of the job that runs the action with `mode: deep`, which a standard review stands down for (see [Deep review](#deep-review)). |
+| `deep_review_label` | `deep-review` | The label that starts the deep job, which the recommendation tells people to add. Keep it equal to the label in the deep job's `if:`. Read only with `recommend_deep_review` in standard mode, where a blank value, one over 50 characters or one with a control character fails the job before the review runs. |
 | `suggest_reviewers` | `false` | Standard mode only. After the review posts, comment once on the pull request with up to five reviewers (see [Reviewer suggestions](#reviewer-suggestions)). |
 | `app_id` | -- | App ID or Client ID of a GitHub App to post as (see [Posting identity](#posting-identity)). Empty posts with the workflow token. |
 | `app_private_key` | -- | Private key of that App. Pass it from a secret. |
@@ -224,10 +230,12 @@ Codex has no plugin flag, so it does not load the action's own copy of the skill
 `backend: openshell`, the default, runs the image `quay.io/aipcc/agentic-ci/openshell:<agentic_ci_version>` as a privileged docker container (`docker run --rm --privileged --init`). The agentic-ci bundled in that image runs `agentic-ci run --backend openshell`: it starts an OpenShell gateway with its own nested Podman, uploads `.ai-review` into the sandbox at `/sandbox/.ai-review`, runs the agent from the `*-sandbox` image and downloads the result back. This is the topology agentic-ci's own `E2E openshell-sandbox` job runs on `ubuntu-latest`: run [41913015162](https://github.com/opendatahub-io/agentic-ci/actions/runs/41913015162/job/126867367300) (job 126867367300) ran Codex and Claude Code through it with `openshell:0.5.15`, as did run 41777652433 on `main` at the same commit.
 
 - Requirements: docker with privileged containers, as on GitHub-hosted Ubuntu runners. The image (about 300 MB) and the sandbox image (about 700 to 900 MB) are pulled before the agent starts, each under its own 15 minute limit, so neither counts against `timeout_minutes`.
+- Pinning: the image runs as root with the model credentials, and a tag can be moved to another image. To freeze it, set `agentic_ci_version` to the tag and its digest, `0.5.15@sha256:<digest>`: the action then pulls and runs `quay.io/aipcc/agentic-ci/openshell:0.5.15@sha256:<digest>`, for the agent and for the cleanup alike. Pin the sandbox image with the `image` input too.
 - Only `.ai-review` is mounted, at its own path, with a docker volume of the run for the nested image storage: never `RUNNER_TEMP`, the checkout or the docker socket. The container gets the harness credentials as `-e NAME`, and never `GITHUB_TOKEN`, `GH_TOKEN` or the OIDC variables.
 - agentic-ci's `--timeout` does not bound an OpenShell run, so `timeout_minutes` is enforced from outside: the agent gets SIGINT, then SIGKILL 60 seconds later.
 - The download back into `.ai-review` leaves files owned by root, so a short container gives them back to the runner user after every run. The cleanup step removes the run's labelled containers and volume, also after a cancelled run.
-- `--privileged` is root on the host. On a self-hosted runner, use it only on runners dedicated to this job, or use Podman.
+- Each run gets a fresh docker volume for the nested image storage, on purpose: concurrent jobs on one runner never share a nested Podman store. So every run pulls the sandbox, supervisor and runtime images again, and the cleanup step deletes them.
+- `--privileged` is root on the host. On a self-hosted runner, use it only on runners dedicated to this job, or use Podman, which reuses the runner's image store instead of pulling on every run.
 
 `backend: podman` is the fallback, for runners without privileged docker: agentic-ci runs on the runner through `uvx` and starts a Podman container from the `*-runner` image, with `.ai-review` mounted at `/workspace`. It needs Podman on the runner. The Podman on GitHub-hosted runners can need the crun workaround from agentic-ci's [setup-podman action](https://github.com/opendatahub-io/agentic-ci/blob/main/.github/actions/setup-podman/action.yml). The action does not run `sudo` for you, so add that step to the job when the container fails to start.
 
@@ -258,6 +266,10 @@ on:
       deep_review_job:
         type: string
         default: deep-review
+      # The label in the caller's deep job, which the recommendation names.
+      deep_review_label:
+        type: string
+        default: deep-review
     secrets:
       OPENAI_API_KEY:
         required: false
@@ -285,6 +297,7 @@ jobs:
         with:
           mode: ${{ inputs.mode }}
           deep_review_job: ${{ inputs.deep_review_job }}
+          deep_review_label: ${{ inputs.deep_review_label }}
           recommend_deep_review: ${{ inputs.mode == 'standard' }}
           app_id: ${{ secrets.AI_REVIEW_APP_ID }}
           app_private_key: ${{ secrets.AI_REVIEW_APP_PRIVATE_KEY }}
@@ -302,6 +315,8 @@ jobs:
     uses: my-org/ai-review-workflows/.github/workflows/ai-review.yml@<full commit sha>
     with:
       deep_review_job: deep-review
+      # The label in the deep job's if: below.
+      deep_review_label: deep-review
     secrets: inherit
 
   deep-review:
@@ -334,9 +349,9 @@ The panel writes the same review JSON, and the post step validates and posts it 
 
 - A standard review stands down when a job named by `deep_review_job` has started for the same commit (queued, waiting or in progress) or has succeeded for it. A deep job that failed, was cancelled or was skipped does not count.
 - A deep review stands down when the pull request has a newer commit than the one it reviewed.
-- Each review checks before the agent starts, then again before it deletes old threads and before it writes the summary, so one that starts while the other runs still wins. A review that stands down exits 0 with a notice and posts nothing. The spend of a review that stands down after its agent ran is not recovered.
+- Each review checks before the checkout and the agent, then again before it deletes old threads and before it writes the summary, so one that starts while the other runs still wins. A review that stands down exits 0 with a notice and posts nothing. The spend of a review that stands down after its agent ran is not recovered.
 
-On a push while the label is set, both jobs run in the same workflow run: the standard review sees the deep job queued and stands down before its agent starts.
+On a push while the label is set, both jobs run in the same workflow run: the standard review sees the deep job queued and stands down before it checks out the pull request, so it spends neither the checkout nor the agent.
 
 The checks fail open. The standard review finds the deep job through the Actions API, so its job needs `actions: read`. When the API refuses the call (for example on a private repository without `actions: read`) or cannot answer, the review warns, names the permission, and goes ahead as if there were no deep review, so it may then replace a deep review's comments. The warning repeats each time the check runs, so a standard review can log it up to three times: before the agent starts, before it deletes old threads and before it writes the summary. The deep review's own check reads only the pull request.
 
@@ -352,7 +367,7 @@ With `recommend_deep_review: 'true'`, a standard review runs the panel's triage 
 **Deep review recommended:** <category>: `<path>` and N more; ... Add the `deep-review` label to this pull request to run it.
 ```
 
-To act on it, add the `deep-review` label. The deep job starts from that `labeled` event, and its review replaces the standard one under the same summary comment. Leave the label off to keep the standard review. The log shows only the tier. A triage that fails or times out only warns, and the summary then has no recommendation. A deep review never recommends one. The line names the `deep-review` label whatever `deep_review_job` says, so keep the label under that name, and leave `recommend_deep_review` off in a repository without a deep job.
+The line names the label that `deep_review_label` gives, `deep-review` by default. To act on it, add that label. The deep job starts from that `labeled` event, and its review replaces the standard one under the same summary comment. Leave the label off to keep the standard review. The log shows only the tier. A triage that fails or times out only warns, and the summary then has no recommendation. A deep review never recommends one. Keep `deep_review_label` equal to the label in the deep job's `if:`, and leave `recommend_deep_review` off in a repository without a deep job.
 
 ### Reviewer suggestions
 
@@ -383,12 +398,12 @@ Changes that existing workflows notice:
 
 - Only the `pull_request` event is supported. Runs for pull requests from forks and runs triggered by Dependabot exit 0 with a notice, because they get no secrets and a read-only token. Do not use `pull_request_target` with a checkout of the PR head: that runs code from the PR with write access and secrets. The action refuses that event.
 - The action recognizes its own comments by the login it posts as (see [Posting identity](#posting-identity)) and a marker. Run one standard and at most one deep copy of the action per pull request: two of the same mode would fight over the same comments.
-- The action fetches the full history of the PR head (`fetch-depth: 0`) on every run, to find the merge base reliably, and copies the history of the base and the head into the agent's repository. On a very large repo that costs time and disk on every push.
+- The action fetches the full history of the PR head (`fetch-depth: 0`) on every run that does not stand down, to find the merge base reliably, and copies the history of the base and the head into the agent's repository. On a very large repo that costs time and disk on every push.
 - A very large diff can exceed what the agent reads in one run. The review then says in its summary that it covered only part of the diff.
 - The agent has network access and the model credentials, and its tools include Bash, so a prompt-injected agent can use them.
 - `backend: openshell` runs a `--privileged` docker container on the runner. On a self-hosted runner that is root on the host: use it only on runners dedicated to this job, or set `backend: podman`.
 - The default `image` tag floats (it is rebuilt daily), so a new image can change the review between runs: pin a digest with the `image` input to freeze it.
-- agentic-ci is pinned by version, not by hash, and its dependencies float.
+- With `backend: openshell`, `agentic_ci_version` pins the openshell image by tag unless it carries a digest (see [Backends](#backends)). With `backend: podman`, agentic-ci is pinned by version, not by hash, and its dependencies float.
 
 ## Development
 

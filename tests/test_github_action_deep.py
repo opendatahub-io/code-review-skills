@@ -109,6 +109,16 @@ class ModeStaticTests(PanelTestCase):
         self.assertRegex(job, r"(?m)^      group: ai-deep-review-")
         self.assertIn("types: [labeled, synchronize, reopened, ready_for_review]", readme)
 
+    def test_readme_standard_job_names_the_label_of_the_deep_job(self):
+        readme = README.read_text(encoding="utf-8")
+        setup = readme.split("\n## GitHub Action", 1)[-1].split("\n### Credentials", 1)[0]
+        review_job = re.search(r"(?ms)^  review:\n(.*?)^  deep-review:\n", setup).group(1)
+        label = re.search(r"(?m)^          deep_review_label: (\S+)$", review_job).group(1)
+        self.assertEqual(label, input_default("deep_review_label"))
+        deep_job = re.search(r"(?ms)^  deep-review:\n(.*?)^```", setup).group(1)
+        self.assertIn(f"github.event.label.name == '{label}'", deep_job)
+        self.assertIn(f"labels.*.name, '{label}'", deep_job)
+
 
 class DraftAndModeCheckTests(CheckTestCase):
     def test_a_draft_is_skipped_in_standard_mode(self):

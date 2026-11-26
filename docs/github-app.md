@@ -96,6 +96,10 @@ on:
       deep_review_job:
         type: string
         default: deep-review
+      # The label the caller's deep job runs for, which the recommendation names.
+      deep_review_label:
+        type: string
+        default: deep-review
       harness:
         type: string
         default: codex
@@ -148,6 +152,7 @@ jobs:
         with:
           mode: ${{ inputs.mode }}
           deep_review_job: ${{ inputs.deep_review_job }}
+          deep_review_label: ${{ inputs.deep_review_label }}
           harness: ${{ inputs.harness }}
           model: ${{ inputs.model }}
           review_instructions: ${{ inputs.review_instructions }}
@@ -199,6 +204,8 @@ jobs:
       # Must name the deep job below. It matters to this job: it is how the standard review
       # finds the deep review and stands down.
       deep_review_job: deep-review
+      # The label in the deep job's if: below, which the recommendation names.
+      deep_review_label: deep-review
     secrets: inherit
 
   deep-review:
@@ -223,7 +230,7 @@ jobs:
 
 Replace `1111111111111111111111111111111111111111` with the full commit SHA of the central workflow. Dependabot or Renovate can keep that pin current.
 
-Keep the label named `deep-review`: the deep review recommendation in the standard summary tells people to add exactly that label.
+The deep review recommendation in the standard summary tells people to add the label the `deep_review_label` input names, `deep-review` by default. To use another label, change it in the deep job's `if:` and `concurrency:` and pass it to the standard job as `deep_review_label`, which the central workflow hands to the action.
 
 Remove any older per-repository review workflow when you add the caller. Two copies of the action on one pull request fight over the same comments.
 

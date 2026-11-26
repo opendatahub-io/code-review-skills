@@ -17,6 +17,7 @@ from unittest.mock import patch
 from tests.helpers import REPO_ROOT, PanelTestCase, commit, git, make_repo, write
 from tests.test_github_action import (
     REVIEW_PY_REL,
+    CheckTestCase,
     PrepareTestCase,
     ScriptTestCase,
     script_constant,
@@ -125,10 +126,10 @@ class FakeReviewPyMixin:
 
 
 class StanddownTests(FakeReviewPyMixin, ScriptTestCase):
+    # The step runs before the checkout, in RUNNER_TEMP, so no checkout exists here.
     def setUp(self):
         super().setUp()
-        repo, _base = make_repo(self.tmp, {"a.txt": "one\n"})
-        self.repo = self.move_repo_into_place(repo)
+        os.makedirs(self.workspace)
         self.install_fake_review_py()
         self.github_env = os.path.join(self.tmp, "github_env")
 
@@ -140,7 +141,7 @@ class StanddownTests(FakeReviewPyMixin, ScriptTestCase):
             GITHUB_ENV=self.github_env,
         )
         defaults.update(env)
-        return self.run_script("standdown", self.repo, **defaults)
+        return self.run_script("standdown", self.runner_temp, **defaults)
 
     def test_exit_zero_proceeds(self):
         proc = self.standdown()
@@ -209,10 +210,12 @@ class StanddownTests(FakeReviewPyMixin, ScriptTestCase):
             self.calls()[-1]["argv"], ["stand-down", "--platform", "github", "--mode", "deep"]
         )
 
-    def test_review_py_runs_in_the_checkout_with_no_uv_config_and_hardened_git(self):
-        self.standdown()
+    def test_review_py_runs_in_runner_temp_with_no_uv_config_and_hardened_git(self):
+        proc = self.standdown()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertFalse(os.path.exists(self.head_dir))
         call = self.calls()[-1]
-        self.assertEqual(call["cwd"], self.repo)
+        self.assertEqual(call["cwd"], self.runner_temp)
         env = call["env"]
         self.assertEqual(env["UV_NO_CONFIG"], "1")
         self.assertEqual(env["UV_PYTHON"], shutil.which("python3"))
@@ -504,10 +507,37 @@ class PostFlagTests(FakeReviewPyMixin, ScriptTestCase):
                 "--mode",
                 "standard",
                 "--deep-job=deep-review",
+                "--deep-label=deep-review",
                 "--deep-recommendation-plan",
                 self.plan,
             ],
         )
+
+    def test_the_deep_label_is_one_argument_whatever_it_looks_like(self):
+        for label in ("needs-deep-review", "-deep", "--deep-review", "deep review (panel)"):
+            with self.subTest(label=label):
+                argv = self.argv(AI_REVIEW_RECOMMEND_DEEP="true", AI_REVIEW_DEEP_LABEL=label)
+                self.assertIn(f"--deep-label={label}", argv)
+                self.assertEqual(sum(a.startswith("--deep-label") for a in argv), 1)
+
+    def test_an_empty_deep_label_is_the_input_default(self):
+        argv = self.argv(AI_REVIEW_RECOMMEND_DEEP="true", AI_REVIEW_DEEP_LABEL="")
+        self.assertIn("--deep-label=deep-review", argv)
+
+    def test_the_deep_label_is_passed_without_a_plan(self):
+        argv = self.argv(AI_REVIEW_RECOMMEND_DEEP="true", AI_REVIEW_DEEP_LABEL="x")
+        self.assertIn("--deep-label=x", argv)
+        self.assertNotIn("--deep-recommendation-plan", argv)
+
+    def test_the_deep_label_needs_the_recommendation_and_standard_mode(self):
+        for env in (
+            dict(AI_REVIEW_RECOMMEND_DEEP="false"),
+            dict(AI_REVIEW_RECOMMEND_DEEP=""),
+            dict(AI_REVIEW_RECOMMEND_DEEP="true", AI_REVIEW_MODE="deep"),
+        ):
+            with self.subTest(env=env):
+                argv = self.argv(AI_REVIEW_DEEP_LABEL="x", **env)
+                self.assertFalse([a for a in argv if a.startswith("--deep-label")], argv)
 
     def test_standard_mode_passes_the_deep_job_name(self):
         argv = self.argv(AI_REVIEW_DEEP_JOB="Deep review (codex)")
@@ -574,6 +604,50 @@ class PostFlagTests(FakeReviewPyMixin, ScriptTestCase):
         proc = self.post(AI_REVIEW_MODE="thorough")
         self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
         self.assertEqual(self.calls(), [])
+
+
+class DeepLabelCheckTests(CheckTestCase):
+    """The check step fails on a label review.py would reject, before the agent runs."""
+
+    def check_label(self, label: str, **env: str):
+        Path(self.output).unlink(missing_ok=True)
+        return self.check(AI_REVIEW_RECOMMEND_DEEP="true", AI_REVIEW_DEEP_LABEL=label, **env)
+
+    def test_good_labels_pass(self):
+        for label in ("", "deep-review", "needs: deep review", "-x", "é" * 50, "🔍 deep"):
+            with self.subTest(label=label):
+                proc = self.check_label(label)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual(self.github_output(), {"skip": "false"})
+
+    def test_bad_labels_fail_without_echoing_them(self):
+        cases = {
+            "blank": " \t ",
+            "too long": "x" * 51,
+            "newline": "deep\n::warning::injected",
+            "carriage return": "deep\rreview",
+            "escape": "deep\x1b[31m",
+            "zero-width space": "deep\u200breview",
+            "line separator": "deep\u2028review",
+            "paragraph separator": "deep\u2029review",
+        }
+        for name, label in cases.items():
+            with self.subTest(name):
+                proc = self.check_label(label)
+                self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+                self.assertIn("::error::deep_review_label ", proc.stdout)
+                self.assertNotIn("injected", proc.stdout)
+                self.assertEqual(self.github_output(), {})
+
+    def test_a_label_post_does_not_pass_is_not_checked(self):
+        for env in (
+            dict(AI_REVIEW_RECOMMEND_DEEP="false"),
+            dict(AI_REVIEW_RECOMMEND_DEEP="true", AI_REVIEW_MODE="deep"),
+        ):
+            with self.subTest(env=env):
+                Path(self.output).unlink(missing_ok=True)
+                proc = self.check(AI_REVIEW_DEEP_LABEL="x" * 51, **env)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
 
 
 class CleanupTriageTests(ScriptTestCase):
@@ -651,7 +725,8 @@ class ReviewPyParserTests(FakeReviewPyMixin, ScriptTestCase):
                 self.assertIn(args.mode, ("standard", "deep"))
                 flags.update(a.split("=", 1)[0] for a in argv if a.startswith("--"))
         self.assertEqual(
-            flags, {"--platform", "--mode", "--deep-job", "--deep-recommendation-plan"}
+            flags,
+            {"--platform", "--mode", "--deep-job", "--deep-label", "--deep-recommendation-plan"},
         )
         post = self.parse(argvs[1])
         self.assertEqual(post.deep_job, "Deep review / panel")
@@ -676,6 +751,23 @@ class ReviewPyParserTests(FakeReviewPyMixin, ScriptTestCase):
                 self.assertEqual(parsed.deep_job, name)
                 self.assertEqual(parsed.review_file, post[-1])
 
+    def test_the_deep_label_round_trips_whatever_it_looks_like(self):
+        common = dict(GITHUB_ACTION_PATH=self.action_path, FAKE_LOG=self.log, GITHUB_TOKEN=TOKEN)
+        for label in ("deep-review", "-deep", "--deep-review", "deep=review", "deep review (x)"):
+            with self.subTest(label=label):
+                proc = self.run_script(
+                    "post",
+                    self.repo,
+                    AI_REVIEW_RECOMMEND_DEEP="true",
+                    AI_REVIEW_DEEP_LABEL=label,
+                    **common,
+                )
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                post = self.calls()[-1]["argv"]
+                parsed = self.parse(post)
+                self.assertEqual(parsed.deep_label, label)
+                self.assertEqual(parsed.review_file, post[-1])
+
 
 class StanddownConstantTests(PanelTestCase):
     def test_the_stand_down_exit_matches_review_py(self):
@@ -684,6 +776,11 @@ class StanddownConstantTests(PanelTestCase):
     def test_the_default_deep_job_matches_review_py(self):
         self.assertEqual(
             script_constant("DEFAULT_DEEP_JOB"), f'"{review._GITHUB_DEEP_JOB_DEFAULT}"'
+        )
+
+    def test_the_default_deep_label_matches_review_py(self):
+        self.assertEqual(
+            script_constant("DEFAULT_DEEP_LABEL"), f'"{review._GITHUB_DEEP_LABEL_DEFAULT}"'
         )
 
     def test_the_plan_limit_matches_review_py(self):

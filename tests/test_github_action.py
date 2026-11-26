@@ -465,17 +465,29 @@ class ActionStaticTests(PanelTestCase):
                 continue
             self.assertIn("steps.check.outputs.skip != 'true'", block)
 
-    def test_only_review_the_mint_and_post_honor_stand_down(self):
+    def test_every_step_after_the_stand_down_honors_it(self):
         gated = [
             re.search(r"(?m)^name:\s*(.+)$", block).group(1).strip()
             for block in action_steps()
             if "steps.standdown.outputs.stand_down" in block
         ]
         self.assertEqual(
-            gated, ["Review the pull request", "Mint the posting token", "Post the review"]
+            gated,
+            [
+                "Check out the pull request head",
+                "Prepare the diff",
+                "Review the pull request",
+                "Mint the posting token",
+                "Post the review",
+            ],
         )
         # The mint adds its own app_id condition, checked with its other options.
-        for step in ("Review the pull request", "Post the review"):
+        for step in (
+            "Check out the pull request head",
+            "Prepare the diff",
+            "Review the pull request",
+            "Post the review",
+        ):
             with self.subTest(step):
                 self.assertRegex(
                     find_step(step),
@@ -483,21 +495,31 @@ class ActionStaticTests(PanelTestCase):
                     r"steps\.standdown\.outputs\.stand_down != 'true'\s*$",
                 )
 
-    def test_standdown_runs_after_uv_and_before_the_review(self):
-        names = [
-            re.search(r"(?m)^name:\s*(.+)$", block).group(1).strip() for block in action_steps()
-        ]
-        standdown = names.index("Check for a review that should win")
-        self.assertEqual(names[standdown - 1], "Set up uv")
-        self.assertEqual(names[standdown + 1], "Review the pull request")
+    def test_standdown_runs_right_after_the_check_and_uv_before_the_checkout(self):
+        self.assertEqual(
+            step_names()[:5],
+            [
+                "Check the event and credentials",
+                "Set up uv",
+                "Check for a review that should win",
+                "Check out the pull request head",
+                "Prepare the diff",
+            ],
+        )
         block = find_step("Check for a review that should win")
         self.assertRegex(block, r"(?m)^\s*id:\s*standdown\s*$")
-        self.assertEqual(working_directory(block), ".ai-review-head")
+        # Not the checkout, which does not exist yet, nor the workspace, which can hold the
+        # PR's files.
+        self.assertRegex(block, r"(?m)^\s*working-directory:\s*\$\{\{ runner\.temp \}\}\s*$")
 
     def test_stand_down_inputs_default_to_off_and_the_conventional_job_name(self):
         self.assertEqual(input_default("recommend_deep_review"), "false")
         self.assertEqual(input_default("deep_review_job"), "deep-review")
         self.assertEqual(script_constant("DEFAULT_DEEP_JOB"), '"deep-review"')
+
+    def test_the_deep_label_defaults_to_the_conventional_label(self):
+        self.assertEqual(input_default("deep_review_label"), "deep-review")
+        self.assertEqual(script_constant("DEFAULT_DEEP_LABEL"), '"deep-review"')
 
     def test_every_input_is_documented_in_the_readme(self):
         text = ACTION_YML.read_text(encoding="utf-8")
@@ -707,6 +729,13 @@ class ActionStaticTests(PanelTestCase):
             ("Post the review", "AI_REVIEW_MODE", "inputs.mode"),
             ("Post the review", "AI_REVIEW_DEEP_JOB", "inputs.deep_review_job"),
             ("Post the review", "AI_REVIEW_RECOMMEND_DEEP", "inputs.recommend_deep_review"),
+            ("Post the review", "AI_REVIEW_DEEP_LABEL", "inputs.deep_review_label"),
+            (
+                "Check the event and credentials",
+                "AI_REVIEW_RECOMMEND_DEEP",
+                "inputs.recommend_deep_review",
+            ),
+            ("Check the event and credentials", "AI_REVIEW_DEEP_LABEL", "inputs.deep_review_label"),
             ("Post the review", "AI_REVIEW_SUGGEST_REVIEWERS", "inputs.suggest_reviewers"),
             (
                 "Remove the checkout",
@@ -1317,6 +1346,7 @@ import sys
 env_keys = [
     "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GITHUB_TOKEN", "GH_TOKEN",
     "ACTIONS_ID_TOKEN_REQUEST_TOKEN", "ACTIONS_ID_TOKEN_REQUEST_URL", "UV_NO_CONFIG", "TMPDIR",
+    "AGENT_ENABLED_PLUGINS",
 ]
 args = sys.argv[1:]
 record = {
@@ -1944,11 +1974,29 @@ class CleanupTests(ScriptTestCase):
     def test_removes_leftover_private_tmpdirs_under_runner_temp_and_nothing_else(self):
         write(self.runner_temp, "ai-review-tmp.AbC123/credentials.json", "{}")
         write(self.runner_temp, "ai-review-tmp.XyZ789/credentials.json", "{}")
+        write(self.runner_temp, "other/file.txt", "x\n")
+        write(self.runner_temp, "ai-review-postx/file.txt", "x\n")
+        proc = self.cleanup()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(sorted(os.listdir(self.runner_temp)), ["ai-review-postx", "other"])
+
+    def test_removes_the_post_steps_copies_of_the_review_output(self):
         write(self.runner_temp, "ai-review-post.Q1/ai-review-output.json", "{}")
+        write(self.runner_temp, "ai-review-post.Q1/posted", "")
+        write(self.runner_temp, "ai-review-post.R2/ai-review-output.json", "{}")
         write(self.runner_temp, "other/file.txt", "x\n")
         proc = self.cleanup()
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertEqual(sorted(os.listdir(self.runner_temp)), ["ai-review-post.Q1", "other"])
+        self.assertEqual(os.listdir(self.runner_temp), ["other"])
+
+    def test_a_symlinked_post_copy_is_not_followed(self):
+        target = tempfile.mkdtemp(dir=self.tmp)
+        write(target, "precious.txt", "x\n")
+        link = os.path.join(self.runner_temp, "ai-review-post.Link01")
+        os.symlink(target, link)
+        self.assertEqual(self.cleanup().returncode, 0)
+        self.assertTrue(os.path.exists(os.path.join(target, "precious.txt")))
+        self.assertTrue(os.path.islink(link))
 
     def test_a_failed_removal_still_removes_the_private_tmpdirs_and_fails_at_the_end(self):
         write(self.ai_dir, "out/locked/file.txt", "x\n")

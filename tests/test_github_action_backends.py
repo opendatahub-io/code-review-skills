@@ -32,6 +32,7 @@ TOKEN_NAMES = ("GITHUB_TOKEN", "GH_TOKEN")
 TOKEN_VALUES = ("ghs_secret", "gh_secret", "oidc-token", "https://oidc.example", "oidc-extra")
 RUN_ID = "4242"
 RUN_ATTEMPT = "3"
+DIGEST = "sha256:" + "0123456789abcdef" * 4
 
 # Stands in for timeout: appends its own options and the command to FAKE_TIMEOUT_LOG as one JSON
 # line, then runs the command. With FAKE_TIMEOUT_STATUS set, the agent run (the call that starts
@@ -295,6 +296,40 @@ class OpenShellReviewTests(OpenShellReviewTestCase):
                 proc = self.openshell_review()
                 self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
                 self.assertIn("tag of the openshell image", proc.stdout)
+                self.assertEqual(self.docker_calls(), [])
+
+    def test_a_digest_pins_the_openshell_image_everywhere_it_runs(self):
+        self.VERSION = f"{VERIFIED_AGENTIC_CI_VERSION}@{DIGEST}"
+        proc = self.openshell_review()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        image = f"quay.io/aipcc/agentic-ci/openshell:{VERIFIED_AGENTIC_CI_VERSION}@{DIGEST}"
+        self.assertEqual(self.docker_calls()[0], ["pull", "--quiet", image])
+        runs = self.runs()
+        self.assertEqual(len(runs), 3, runs)
+        for argv in runs:
+            with self.subTest(argv=argv[:8]):
+                self.assertIn(image, argv)
+
+    def test_a_malformed_digest_fails_before_any_container(self):
+        hex64 = "0123456789abcdef" * 4
+        for version in (
+            f"0.5.15@sha256:{hex64[:-1]}",
+            f"0.5.15@sha256:{hex64}0",
+            f"0.5.15@sha256:{hex64.upper()}",
+            f"0.5.15@sha512:{hex64}",
+            f"0.5.15@{hex64}",
+            f"@sha256:{hex64}",
+            f"0.5.15@sha256:{hex64}@sha256:{hex64}",
+            f"0.5.15:latest@sha256:{hex64}",
+            f"1.0+local@sha256:{hex64}",
+            "0.5.15@",
+        ):
+            with self.subTest(version):
+                self.VERSION = version
+                proc = self.openshell_review()
+                self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+                self.assertIn("tag of the openshell image", proc.stdout)
+                self.assertIn("@sha256:", proc.stdout)
                 self.assertEqual(self.docker_calls(), [])
 
     def test_prompt_paths_are_sandbox_paths(self):
@@ -720,6 +755,33 @@ class BackendChoiceTests(OpenShellReviewTestCase):
         limits = [t["limit"] for t in self.timeouts()]
         self.assertEqual(limits, [["15m"], ["-s", "INT", "--kill-after=60s", "20m"]])
 
+    def test_podman_rejects_a_digest_with_a_clear_error(self):
+        self.VERSION = f"{VERIFIED_AGENTIC_CI_VERSION}@{DIGEST}"
+        proc = self.openshell_review(AI_REVIEW_BACKEND="podman")
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("PyPI version", proc.stdout)
+        self.assertIn("cannot pin a digest", proc.stdout)
+        self.assertFalse(os.path.exists(self.log))
+        self.assertEqual(self.podman_calls(), [])
+        self.assertEqual(self.docker_calls(), [])
+
+    def test_podman_narrows_the_skill_catalog_to_this_plugin(self):
+        # A value from the job environment does not widen it.
+        for job_env in ({}, {"AGENT_ENABLED_PLUGINS": "other-plugin,code-review-skills"}):
+            with self.subTest(job_env=job_env):
+                proc = self.openshell_review(AI_REVIEW_BACKEND="podman", **job_env)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual(
+                    self.record()["env"]["AGENT_ENABLED_PLUGINS"], "code-review-skills"
+                )
+
+    def test_both_backends_narrow_the_catalog_from_one_constant(self):
+        self.assertEqual(script_constant("ENABLED_PLUGINS"), '"code-review-skills"')
+        self.assertIn(
+            'export AGENT_ENABLED_PLUGINS="$ENABLED_PLUGINS"', script_function("cmd_review")
+        )
+        self.assertEqual(SCRIPT.read_text(encoding="utf-8").count("AGENT_ENABLED_PLUGINS="), 1)
+
     def test_podman_keeps_the_blanked_tokens(self):
         self.openshell_review(AI_REVIEW_BACKEND="podman")
         env = self.record()["env"]
@@ -845,6 +907,39 @@ class OpenShellCleanupTests(ScriptTestCase):
             chown[0][-6:], [image, "-R", "-h", "-P", f"{os.getuid()}:{os.getgid()}", self.ai_dir]
         )
         self.assertNotIn("--privileged", chown[0])
+
+    def test_root_owned_leftovers_are_given_back_by_the_pinned_image(self):
+        self.lock_a_directory()
+        version = f"{VERIFIED_AGENTIC_CI_VERSION}@{DIGEST}"
+        proc = self.cleanup(FAKE_DOCKER_IMAGE_PRESENT="1", AI_REVIEW_AGENTIC_CI_VERSION=version)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        image = f"quay.io/aipcc/agentic-ci/openshell:{version}"
+        self.assertIn(["image", "inspect", image], self.docker_calls())
+        chown = [argv for argv in self.docker_calls() if "--entrypoint" in argv]
+        self.assertEqual(len(chown), 1)
+        self.assertEqual(chown[0][-6], image)
+
+    def test_a_malformed_version_runs_no_cleanup_image(self):
+        self.lock_a_directory()
+        for version in (f"0.5.15@sha256:{'0' * 63}", "0.5.15 ; id", ""):
+            with self.subTest(version):
+                Path(self.docker_log).unlink(missing_ok=True)
+                proc = self.cleanup(
+                    FAKE_DOCKER_IMAGE_PRESENT="1", AI_REVIEW_AGENTIC_CI_VERSION=version
+                )
+                self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+                calls = self.docker_calls()
+                self.assertEqual([a for a in calls if a[:2] == ["image", "inspect"]], [])
+                self.assertEqual([a for a in calls if "--entrypoint" in a], [])
+
+    def test_the_agent_and_the_cleanup_build_the_image_ref_one_way(self):
+        for function in ("run_openshell_agent", "give_back_workdir"):
+            with self.subTest(function):
+                self.assertIn("openshell_image_ref", script_function(function))
+                self.assertNotIn("OPENSHELL_IMAGE_REPO", script_function(function))
+        script = SCRIPT.read_text(encoding="utf-8")
+        self.assertEqual(script.count("$OPENSHELL_IMAGE_REPO"), 1)
+        self.assertIn("$OPENSHELL_IMAGE_REPO", script_function("openshell_image_ref"))
 
     def test_leftovers_without_the_image_fail_at_the_end(self):
         self.lock_a_directory()

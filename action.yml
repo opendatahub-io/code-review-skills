@@ -20,7 +20,9 @@ inputs:
     description: >-
       Version of agentic-ci that runs the agent. With the openshell backend it is
       the tag of the quay.io/aipcc/agentic-ci/openshell image, whose bundled
-      agentic-ci runs. The default is the one the action was checked against.
+      agentic-ci runs, and '<tag>@sha256:<digest>' pins that image by digest.
+      With the podman backend it is the PyPI version uvx installs. The default
+      is the one the action was checked against.
     required: false
     default: '0.5.15'
   backend:
@@ -79,6 +81,13 @@ inputs:
       ('true' or 'false').
     required: false
     default: 'false'
+  deep_review_label:
+    description: >-
+      Label that starts the deep review job, which the deep review
+      recommendation tells people to add. Keep it equal to the label in that
+      job's 'if:'.
+    required: false
+    default: 'deep-review'
   suggest_reviewers:
     description: >-
       In standard mode, after the review is posted, comment once with up to five
@@ -131,32 +140,12 @@ runs:
         AI_REVIEW_HARNESS: ${{ inputs.harness }}
         AI_REVIEW_MODE: ${{ inputs.mode }}
         AI_REVIEW_DRAFT: ${{ github.event.pull_request.draft }}
+        # Validated before the agent spends on the review, like bot_login.
+        AI_REVIEW_RECOMMEND_DEEP: ${{ inputs.recommend_deep_review }}
+        AI_REVIEW_DEEP_LABEL: ${{ inputs.deep_review_label }}
         # The bot_login the post step will use, checked before the agent spends on the review.
         # Only whether github_token is set reaches this step, never the token.
         AI_REVIEW_BOT_LOGIN: ${{ inputs.github_token != '' && inputs.bot_login || '' }}
-
-    - name: Check out the pull request head
-      if: steps.check.outputs.skip != 'true'
-      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      with:
-        ref: ${{ github.event.pull_request.head.sha }}
-        fetch-depth: 0
-        persist-credentials: false
-        # Outside .ai-review: the container mounts that directory and must not reach the checkout's .git.
-        # The prepare step builds the container's own .git from it, without its config or remote.
-        path: .ai-review-head
-
-    - name: Prepare the diff
-      if: steps.check.outputs.skip != 'true'
-      shell: bash
-      working-directory: .ai-review-head
-      run: '"$GITHUB_ACTION_PATH/action/review-pr.sh" prepare'
-      env:
-        AI_REVIEW_BASE_SHA: ${{ github.event.pull_request.base.sha }}
-        AI_REVIEW_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        AI_REVIEW_INSTRUCTIONS: ${{ inputs.review_instructions }}
-        AI_REVIEW_MODE: ${{ inputs.mode }}
-        AI_REVIEW_RECOMMEND_DEEP: ${{ inputs.recommend_deep_review }}
 
     - name: Set up uv
       if: steps.check.outputs.skip != 'true'
@@ -173,13 +162,37 @@ runs:
       if: steps.check.outputs.skip != 'true'
       shell: bash
       # Holds the token only to read the Actions API and the pull request: review.py makes no
-      # write call here. Runs before the agent, so a review that would be replaced costs nothing.
-      working-directory: .ai-review-head
+      # write call here. Runs before the checkout and the agent, so a review that would be
+      # replaced costs neither. Not the workspace, which can hold the PR's files.
+      working-directory: ${{ runner.temp }}
       run: '"$GITHUB_ACTION_PATH/action/review-pr.sh" standdown'
       env:
         GITHUB_TOKEN: ${{ github.token }}
         AI_REVIEW_MODE: ${{ inputs.mode }}
         AI_REVIEW_DEEP_JOB: ${{ inputs.deep_review_job }}
+
+    - name: Check out the pull request head
+      if: steps.check.outputs.skip != 'true' && steps.standdown.outputs.stand_down != 'true'
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      with:
+        ref: ${{ github.event.pull_request.head.sha }}
+        fetch-depth: 0
+        persist-credentials: false
+        # Outside .ai-review: the container mounts that directory and must not reach the checkout's .git.
+        # The prepare step builds the container's own .git from it, without its config or remote.
+        path: .ai-review-head
+
+    - name: Prepare the diff
+      if: steps.check.outputs.skip != 'true' && steps.standdown.outputs.stand_down != 'true'
+      shell: bash
+      working-directory: .ai-review-head
+      run: '"$GITHUB_ACTION_PATH/action/review-pr.sh" prepare'
+      env:
+        AI_REVIEW_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        AI_REVIEW_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        AI_REVIEW_INSTRUCTIONS: ${{ inputs.review_instructions }}
+        AI_REVIEW_MODE: ${{ inputs.mode }}
+        AI_REVIEW_RECOMMEND_DEEP: ${{ inputs.recommend_deep_review }}
 
     - name: Review the pull request
       if: steps.check.outputs.skip != 'true' && steps.standdown.outputs.stand_down != 'true'
@@ -243,6 +256,7 @@ runs:
         AI_REVIEW_MODE: ${{ inputs.mode }}
         AI_REVIEW_DEEP_JOB: ${{ inputs.deep_review_job }}
         AI_REVIEW_RECOMMEND_DEEP: ${{ inputs.recommend_deep_review }}
+        AI_REVIEW_DEEP_LABEL: ${{ inputs.deep_review_label }}
         AI_REVIEW_SUGGEST_REVIEWERS: ${{ inputs.suggest_reviewers }}
 
     # Composite actions have no post hook, so this step always runs.
