@@ -1,0 +1,111 @@
+# Runs the GitHub Action from the pull request's own commit against that pull request, with the
+# default (pinned) agentic-ci images, and fails unless the review was posted. Renovate's agentic-ci
+# image bumps run the deep review too, so a bump only goes green when both paths work.
+name: E2E
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
+    paths:
+      - 'action.yml'
+      - 'action/**'
+      - 'skills/**'
+      - 'renovate.json'
+      - '.github/workflows/e2e.yml'
+
+permissions: {}
+
+jobs:
+  review:
+    name: E2E standard review
+    # Fork pull requests get no secrets. Drafts are skipped by the action, which would pass
+    # without posting.
+    if: >-
+      github.event.action != 'labeled' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      !github.event.pull_request.draft
+    concurrency:
+      group: e2e-review-${{ github.event.action != 'labeled' && github.event.pull_request.number || format('noop-{0}', github.run_id) }}
+      cancel-in-progress: true
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      actions: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+    steps:
+      - name: Check out the action
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Note the start time
+        id: start
+        run: echo "time=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >>"$GITHUB_OUTPUT"
+
+      - name: Run the action
+        uses: ./
+        with:
+          recommend_deep_review: 'true'
+          # The deep job below also runs on Renovate pull requests. A name no job has keeps this
+          # review from standing down for it, so both paths are tested on the same commit.
+          deep_review_job: e2e-no-stand-down
+
+      - name: Check that the review was posted
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          SINCE: ${{ steps.start.outputs.time }}
+          EXPECT: ''
+        run: .github/e2e-check-summary.sh
+
+  deep-review:
+    # The name the standard job's deep_review_job would have to match: it does not, on purpose.
+    name: deep-review
+    # Renovate's image bumps, and any pull request while the deep-review label is set.
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      !github.event.pull_request.draft &&
+      (
+        (startsWith(github.head_ref, 'renovate/') && github.event.action != 'labeled') ||
+        (contains(github.event.pull_request.labels.*.name, 'deep-review') &&
+          (github.event.action != 'labeled' || github.event.label.name == 'deep-review'))
+      )
+    concurrency:
+      group: e2e-deep-review-${{ (github.event.action != 'labeled' || github.event.label.name == 'deep-review') && github.event.pull_request.number || format('noop-{0}', github.run_id) }}
+      cancel-in-progress: true
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+    steps:
+      - name: Check out the action
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Note the start time
+        id: start
+        run: echo "time=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >>"$GITHUB_OUTPUT"
+
+      - name: Run the action
+        uses: ./
+        with:
+          mode: deep
+
+      - name: Check that the deep review was posted
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          SINCE: ${{ steps.start.outputs.time }}
+          EXPECT: 'Mode: deep'
+        run: .github/e2e-check-summary.sh
