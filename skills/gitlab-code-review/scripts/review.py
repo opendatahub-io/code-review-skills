@@ -38,6 +38,12 @@ Environment variables (for 'post --platform github', which is never auto-detecte
   GITHUB_EVENT_PATH             Path to the pull_request event payload (required)
   GITHUB_SERVER_URL             Server URL, for the run link in the footer (optional)
   GITHUB_RUN_ID                 Run ID, for the run link in the footer (optional)
+  AI_REVIEW_BOT_LOGIN           Account GITHUB_TOKEN posts as, when it is not
+                                github-actions[bot]: a GitHub App's <slug>[bot], or
+                                the user login behind a personal access token
+                                (optional). Comments of github-actions[bot] still
+                                count as ours, but only the account's own summary
+                                is updated in place.
   CHILL_MODE, INLINE_FIXES, VERBOSE, AGENT_MODEL, AGENT_REASONING_EFFORT apply as above
 
 Usage:
@@ -58,6 +64,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import unicodedata
 from pathlib import Path
 from typing import Any, NamedTuple
 from urllib.parse import urlparse
@@ -943,9 +950,15 @@ MAX_INLINE_COMMENTS = 50
 _GITHUB_LISTED_FINDING_CHARS = 500
 _GITHUB_LISTED_FINDINGS = 100
 
-# Only the workflow token is supported, so our comments come from this bot.
+# The workflow token posts as this bot. AI_REVIEW_BOT_LOGIN names another posting account
+# (a GitHub App or a token owner); comments of this bot still count as ours after a switch.
 _GITHUB_BOT_REST_LOGIN = "github-actions[bot]"
 _GITHUB_BOT_GRAPHQL_LOGIN = "github-actions"
+_GITHUB_BOT_LOGIN_ENV = "AI_REVIEW_BOT_LOGIN"
+# The App slug charset is not documented; every observed slug is lowercase alphanumerics and
+# hyphens. Logins are compared for equality, so a permissive pattern cannot cause a false match.
+_GITHUB_APP_LOGIN_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,62}\[bot\]")
+_GITHUB_USER_LOGIN_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}")
 
 # Our comments end with the marker; one earlier in the body (a fence, a path)
 # never counts.
@@ -1010,6 +1023,76 @@ class _GitHubContext(NamedTuple):
         return f"{self.api_url}/repos/{self.owner}/{self.repo}"
 
 
+class _GitHubIdentity(NamedTuple):
+    """How one posting account appears as a REST ``user`` and as a GraphQL ``author``."""
+
+    rest_login: str
+    graphql_login: str
+    kind: str  # REST ``type`` and GraphQL ``__typename``: "Bot" or "User"
+
+    def _is_login(self, login: Any, expected: str) -> bool:
+        if not isinstance(login, str):
+            return False
+        # GitHub user logins are case-insensitive and ASCII; bot logins are compared exactly.
+        if self.kind == "User":
+            return login.isascii() and login.lower() == expected.lower()
+        return login == expected
+
+    def wrote_rest(self, user: Any) -> bool:
+        return (
+            isinstance(user, dict)
+            and user.get("type") == self.kind
+            and self._is_login(user.get("login"), self.rest_login)
+        )
+
+    def wrote_graphql(self, author: Any) -> bool:
+        # A deleted account comes back as a null author, which counts as human.
+        return (
+            isinstance(author, dict)
+            and author.get("__typename") == self.kind
+            and self._is_login(author.get("login"), self.graphql_login)
+        )
+
+
+_GITHUB_ACTIONS_IDENTITY = _GitHubIdentity(_GITHUB_BOT_REST_LOGIN, _GITHUB_BOT_GRAPHQL_LOGIN, "Bot")
+
+
+def _github_configured_identity() -> _GitHubIdentity | None:
+    """Return the account named by AI_REVIEW_BOT_LOGIN, or None for the workflow bot.
+
+    ``<slug>[bot]`` is a GitHub App, which GraphQL names without the suffix. A
+    plain login is the user behind a personal access token. Raises ValueError
+    on anything else.
+    """
+    login = os.environ.get(_GITHUB_BOT_LOGIN_ENV, "")
+    if not login or login == _GITHUB_BOT_REST_LOGIN:
+        return None
+    if _GITHUB_APP_LOGIN_RE.fullmatch(login):
+        return _GitHubIdentity(login, login[: -len("[bot]")], "Bot")
+    if _GITHUB_USER_LOGIN_RE.fullmatch(login):
+        return _GitHubIdentity(login, login, "User")
+    raise ValueError(
+        f"{_GITHUB_BOT_LOGIN_ENV} must be a GitHub App bot login like my-app[bot] "
+        f"or a GitHub user login, got: {login[:80]!r}"
+    )
+
+
+def _github_identities() -> tuple[_GitHubIdentity, tuple[_GitHubIdentity, ...]]:
+    """Return the account that posts now, and every account whose comments are ours.
+
+    Comments of the workflow bot stay ours after a switch to another account,
+    so its summaries and threads from earlier runs are still recognized.
+    """
+    try:
+        current = _github_configured_identity() or _GITHUB_ACTIONS_IDENTITY
+    except ValueError:
+        # _github_load_context exits on a bad value before any request; never widen on one.
+        current = _GITHUB_ACTIONS_IDENTITY
+    if current == _GITHUB_ACTIONS_IDENTITY:
+        return current, (current,)
+    return current, (current, _GITHUB_ACTIONS_IDENTITY)
+
+
 def _github_annotation(level: str, msg: str) -> None:
     """Emit a GitHub Actions workflow command (notice, warning or error)."""
     data = msg.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
@@ -1024,6 +1107,11 @@ def _github_load_context() -> _GitHubContext:
     token = os.environ.get("GITHUB_TOKEN")
     if not token:
         _error("GITHUB_TOKEN environment variable is required")
+        sys.exit(1)
+    try:
+        _github_configured_identity()
+    except ValueError as e:
+        _error(str(e))
         sys.exit(1)
 
     api_url = (os.environ.get("GITHUB_API_URL") or "https://api.github.com").rstrip("/")
@@ -1122,20 +1210,19 @@ def _github_paginated_get(
 
 
 def _github_rest_is_ours(user: Any) -> bool:
-    return (
-        isinstance(user, dict)
-        and user.get("login") == _GITHUB_BOT_REST_LOGIN
-        and user.get("type") == "Bot"
-    )
+    return any(identity.wrote_rest(user) for identity in _github_identities()[1])
 
 
 def _github_graphql_is_ours(author: Any) -> bool:
-    # A deleted account comes back as a null author, which counts as human.
-    return (
-        isinstance(author, dict)
-        and author.get("login") == _GITHUB_BOT_GRAPHQL_LOGIN
-        and author.get("__typename") == "Bot"
-    )
+    return any(identity.wrote_graphql(author) for identity in _github_identities()[1])
+
+
+def _github_comment_is_ours(user: Any) -> bool:
+    """Whether a REST issue or review comment author is one of our posting accounts.
+
+    Callers still check that the body ends with their own marker.
+    """
+    return _github_rest_is_ours(user)
 
 
 def _github_trailing_marker(body: Any) -> re.Match[str] | None:
@@ -1145,19 +1232,26 @@ def _github_trailing_marker(body: Any) -> re.Match[str] | None:
 def _github_find_summary(
     session: requests.Session, ctx: _GitHubContext
 ) -> tuple[int | None, str | None]:
-    """Return the id and review SHA of our newest summary comment on the PR.
+    """Return the id of the summary to update and the review SHA to dedup against.
 
     Lists sort ascending, so the last match is the newest. A comment is ours
-    only when the workflow bot wrote it and its body ends with the marker.
+    only when one of our accounts wrote it and its body ends with the marker.
+    The SHA comes from our newest summary, whichever account wrote it. The id
+    is that of the newest summary the current account wrote: editing one of
+    another account would keep that account as its author.
     """
+    current, known = _github_identities()
     comment_id: int | None = None
     sha: str | None = None
     url = f"{ctx.repo_url}/issues/{ctx.number}/comments"
     for comment in _github_paginated_get(session, ctx, url, strict=True):
         marker = _github_trailing_marker(comment.get("body"))
-        if marker and _github_rest_is_ours(comment.get("user")):
+        user = comment.get("user")
+        if not marker or not any(identity.wrote_rest(user) for identity in known):
+            continue
+        sha = marker.group(1)
+        if current.wrote_rest(user):
             comment_id = comment["id"]
-            sha = marker.group(1)
     return comment_id, sha
 
 
@@ -1388,9 +1482,19 @@ def _github_code_span(text: str) -> str:
     return f"{delimiter} {text} {delimiter}"
 
 
+def _github_reason_text(value: str) -> str:
+    """Flatten ``value`` to one line without backticks, control or format characters.
+
+    Format characters (category Cf, such as bidi overrides and zero-width
+    marks) are invisible, so they could make a path read differently than it is.
+    """
+    value = "".join(ch for ch in value if unicodedata.category(ch) != "Cf")
+    return " ".join(_CONTROL_CHARS_RE.sub(" ", value.replace("`", "")).split())
+
+
 def _github_reason_path(value: str) -> str:
     """Render a path from the pull request as an inert, bounded code span."""
-    cleaned = " ".join(_CONTROL_CHARS_RE.sub(" ", value.replace("`", "")).split())
+    cleaned = _github_reason_text(value)
     cleaned = cleaned[:_REASON_PATH_CHARS]
     return f"`{cleaned}`" if cleaned else "(unnamed path)"
 
@@ -1415,7 +1519,7 @@ def _github_reason_summary(evidence: list[str]) -> str:
         grouped[category] = (example, count)
     parts = []
     for category, (example, count) in list(grouped.items())[:_REASON_CATEGORIES]:
-        name = " ".join(_CONTROL_CHARS_RE.sub(" ", category.replace("`", "")).split())
+        name = _github_reason_text(category)
         name = html.escape(name[:_REASON_CATEGORY_CHARS], quote=False) or "changes"
         path = f": {_github_reason_path(example)}" if example is not None else ""
         extra = f" and {count - 1} more" if example is not None and count > 1 else ""
@@ -1448,7 +1552,8 @@ def _github_read_plan(path: str) -> dict[str, Any] | None:
                 reason = "is larger than 1 MiB"
             else:
                 try:
-                    plan = json.loads(raw)
+                    # json.loads would also take UTF-16 and UTF-32 bytes; panel.py writes UTF-8.
+                    plan = json.loads(raw.decode("utf-8"))
                 except (ValueError, RecursionError):
                     reason = "is not valid JSON"
                 else:
