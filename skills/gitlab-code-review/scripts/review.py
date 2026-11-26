@@ -13,6 +13,7 @@ Subcommands:
   post               Post review as inline comments + summary to a GitLab MR or GitHub PR
   display            Display review results in the terminal
   suggest-reviewers  Suggest reviewers based on git history of modified files
+  stand-down         Exit 10 when another review should win over this one (GitHub only)
 
 Environment variables (for 'post' with GitLab):
   GITLAB_API_TOKEN              GitLab Personal Access Token (required)
@@ -38,6 +39,8 @@ Environment variables (for 'post --platform github', which is never auto-detecte
   GITHUB_EVENT_PATH             Path to the pull_request event payload (required)
   GITHUB_SERVER_URL             Server URL, for the run link in the footer (optional)
   GITHUB_RUN_ID                 Run ID, for the run link in the footer (optional)
+  RUNNER_NAME                   Runner of this job; with GITHUB_RUN_ID, keeps the
+                                stand-down check from matching its own job (optional)
   AI_REVIEW_BOT_LOGIN           Account GITHUB_TOKEN posts as, when it is not
                                 github-actions[bot]: a GitHub App's <slug>[bot], or
                                 the user login behind a personal access token
@@ -49,6 +52,8 @@ Environment variables (for 'post --platform github', which is never auto-detecte
 Usage:
   review.py post review.json [--chill|--no-chill] [--inline-fixes|--no-inline-fixes] [--verbose]
   review.py post review.json --platform github [--deep-recommendation-plan PATH]
+                               [--mode standard|deep] [--deep-job NAME]
+  review.py stand-down --platform github --mode standard|deep [--deep-job NAME]
   review.py display review.json [--chill|--no-chill] [--inline-fixes|--no-inline-fixes]
   review.py suggest-reviewers [--verbose]
 """
@@ -65,6 +70,7 @@ import stat
 import subprocess
 import sys
 import unicodedata
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, NamedTuple
 from urllib.parse import urlparse
@@ -984,6 +990,21 @@ _REASON_PATH_CHARS = 160
 _REASON_CATEGORY_CHARS = 60
 _REASON_CATEGORIES = 10
 
+# Stand-down: a standard review gives way to a deep review of the same head, and a deep
+# review gives way to a newer head. Each check makes at most _STANDDOWN_MAX_CALLS GETs,
+# every page included: one page of runs (the newest 100 for the head) and at most two
+# pages of jobs per run. Every lookup failure lets the review go ahead.
+_STANDDOWN_EXIT = 10
+_STANDDOWN_MAX_CALLS = 20
+_STANDDOWN_RUN_PAGES = 1
+_STANDDOWN_JOB_PAGES = 2
+_STANDDOWN_PER_PAGE = 100
+_GITHUB_DEEP_JOB_DEFAULT = "deep-review"
+_GITHUB_DEEP_JOB_CHARS = 200
+# A deep review job in one of these states has started or is about to. A completed one
+# counts only when it succeeded: one that failed, was cancelled or skipped posted nothing.
+_GITHUB_JOB_STARTED = frozenset({"queued", "in_progress", "waiting", "requested", "pending"})
+
 _GITHUB_THREADS_QUERY = """
 query($owner: String!, $name: String!, $number: Int!, $after: String) {
   repository(owner: $owner, name: $name) {
@@ -1017,6 +1038,9 @@ class _GitHubContext(NamedTuple):
     number: int
     head_sha: str
     run_url: str | None
+    # From the event payload, None when absent or malformed; nothing posts with them.
+    base_sha: str | None = None
+    author_login: str | None = None
 
     @property
     def repo_url(self) -> str:
@@ -1154,6 +1178,17 @@ def _github_load_context() -> _GitHubContext:
     if not isinstance(head_sha, str) or not _GITHUB_SHA_RE.match(head_sha):
         _error(f"pull_request.head.sha: expected a hex commit SHA, got {head_sha!r}")
         sys.exit(1)
+    base = pull_request.get("base")
+    base_sha = base.get("sha") if isinstance(base, dict) else None
+    if not isinstance(base_sha, str) or not _GITHUB_SHA_RE.match(base_sha):
+        base_sha = None
+    # A pull request is opened by a user or by a GitHub App (<slug>[bot]).
+    author = pull_request.get("user")
+    author_login = author.get("login") if isinstance(author, dict) else None
+    if not isinstance(author_login, str) or not any(
+        pattern.fullmatch(author_login) for pattern in (_GITHUB_USER_LOGIN_RE, _GITHUB_APP_LOGIN_RE)
+    ):
+        author_login = None
 
     server_url = os.environ.get("GITHUB_SERVER_URL", "").rstrip("/")
     run_id = os.environ.get("GITHUB_RUN_ID", "")
@@ -1170,6 +1205,8 @@ def _github_load_context() -> _GitHubContext:
         number=number,
         head_sha=head_sha,
         run_url=run_url,
+        base_sha=base_sha,
+        author_login=author_login,
     )
 
 
@@ -1417,6 +1454,291 @@ def _github_delete_previous_threads(
                 print(resp.text, file=sys.stderr)
     _success(f"Deleted {deleted}/{len(to_delete)} previous thread(s)")
     return protected
+
+
+# ---------------------------------------------------------------------------
+# Stand-down
+# ---------------------------------------------------------------------------
+
+
+class _GitHubLookupError(Exception):
+    """A stand-down lookup that did not answer cleanly. The message names the cause only."""
+
+
+class _GitHubBudgetError(Exception):
+    """A stand-down check used up its calls before it found an answer."""
+
+
+class _GitHubBudget:
+    def __init__(self, calls: int) -> None:
+        self.remaining = calls
+
+    def spend(self) -> None:
+        if self.remaining <= 0:
+            raise _GitHubBudgetError
+        self.remaining -= 1
+
+
+def _github_wrapped_pages(
+    session: requests.Session,
+    ctx: _GitHubContext,
+    url: str,
+    key: str,
+    params: dict[str, Any],
+    *,
+    max_pages: int,
+    budget: _GitHubBudget,
+) -> Iterator[tuple[list[Any], bool]]:
+    """Yield the list under ``key`` from each page of a wrapped list such as workflow runs.
+
+    Follows ``Link: rel="next"`` only over https on the API host, as
+    _github_paginated_get does. The path is not pinned: these next links use
+    ``/repositories/{id}/...``. The flag is True when the page cap left a next
+    page unread. Raises _GitHubLookupError on any failure, after yielding the
+    pages read so far, and _GitHubBudgetError before a GET the budget cannot pay.
+    """
+    api_netloc = urlparse(ctx.api_url).netloc
+    request_params: dict[str, Any] | None = params
+    for page in range(1, max_pages + 1):
+        budget.spend()
+        try:
+            resp = session.get(url, params=request_params)
+        except requests.exceptions.RequestException as e:
+            raise _GitHubLookupError(type(e).__name__) from None
+        request_params = None
+        if resp.status_code != 200:
+            raise _GitHubLookupError(f"HTTP {resp.status_code}")
+        try:
+            payload = resp.json()
+        except ValueError:
+            raise _GitHubLookupError("invalid JSON") from None
+        items = payload.get(key) if isinstance(payload, dict) else None
+        if not isinstance(items, list):
+            raise _GitHubLookupError(f"no {key} list")
+        m = _GITHUB_NEXT_LINK_RE.search(resp.headers.get("Link", ""))
+        if not m or page == max_pages:
+            yield items, bool(m)
+            return
+        yield items, False
+        next_url = urlparse(m.group(1))
+        if next_url.scheme != "https" or next_url.netloc != api_netloc:
+            raise _GitHubLookupError("pagination link off the API host")
+        url = m.group(1)
+
+
+def _github_deep_job_matches(name: Any, deep_job: str) -> bool:
+    """Whether a job name from the jobs API is the deep review job ``deep_job``.
+
+    ``deep_job`` is the job's display name: its ``name:``, else its key. A
+    matrix job shows as ``J (value)``, and a job of a called reusable workflow
+    as ``J / callee``. The comparison is exact: a suffix rule would let
+    ``review`` match the standard job ``review / review``.
+    """
+    if not isinstance(name, str) or not deep_job:
+        return False
+    if name == deep_job or name.startswith(deep_job + " / "):
+        return True
+    first = name.split(" / ", 1)[0]
+    return first.startswith(deep_job + " (") and first.endswith(")")
+
+
+def _github_runs_to_check(runs: list[Any], ctx: _GitHubContext) -> list[dict[str, Any]]:
+    """Return the runs of this PR head that may hold a deep review job, unfinished first."""
+    candidates = []
+    for run in runs:
+        if not isinstance(run, dict):
+            continue
+        run_id = run.get("id")
+        if not isinstance(run_id, int) or isinstance(run_id, bool) or run_id <= 0:
+            continue
+        if run.get("head_sha") != ctx.head_sha or run.get("event") != "pull_request":
+            continue
+        # Every job of such a run was skipped, so it has no deep review to find.
+        if run.get("status") == "completed" and run.get("conclusion") == "skipped":
+            continue
+        # The list is empty for forks and closed PRs, so it can only rule a run out:
+        # another open PR from a branch with the same head.
+        prs = run.get("pull_requests")
+        if (
+            isinstance(prs, list)
+            and prs
+            and not any(isinstance(p, dict) and p.get("number") == ctx.number for p in prs)
+        ):
+            continue
+        candidates.append(run)
+    # sorted() is stable, so each group keeps the API's newest-first order.
+    return sorted(candidates, key=lambda r: r.get("status") == "completed")
+
+
+def _github_find_deep_review(
+    session: requests.Session, ctx: _GitHubContext, deep_job: str
+) -> dict[str, Any] | None:
+    """Return a deep review job for this head that started or succeeded, else None.
+
+    The current run counts, since a push can start both reviews in one run.
+    Only the job running this check is skipped: same run and same runner, so a
+    deep job name that also matches the standard job cannot block it forever.
+    """
+    budget = _GitHubBudget(_STANDDOWN_MAX_CALLS)
+    own_run = os.environ.get("GITHUB_RUN_ID", "")
+    own_runner = os.environ.get("RUNNER_NAME", "")
+    runs: list[Any] = []
+    params = {"head_sha": ctx.head_sha, "event": "pull_request", "per_page": _STANDDOWN_PER_PAGE}
+    for items, more in _github_wrapped_pages(
+        session,
+        ctx,
+        f"{ctx.repo_url}/actions/runs",
+        "workflow_runs",
+        params,
+        max_pages=_STANDDOWN_RUN_PAGES,
+        budget=budget,
+    ):
+        runs.extend(items)
+        if more:
+            _github_annotation(
+                "warning",
+                f"More than {len(runs)} workflow runs for {ctx.head_sha[:8]}; "
+                f"checked the newest {len(runs)} for a deep review.",
+            )
+
+    for run in _github_runs_to_check(runs, ctx):
+        own = bool(own_runner) and own_run.isdigit() and int(own_run) == run["id"]
+        for items, more in _github_wrapped_pages(
+            session,
+            ctx,
+            f"{ctx.repo_url}/actions/runs/{run['id']}/jobs",
+            "jobs",
+            {"filter": "latest", "per_page": _STANDDOWN_PER_PAGE},
+            max_pages=_STANDDOWN_JOB_PAGES,
+            budget=budget,
+        ):
+            for job in items:
+                if not isinstance(job, dict):
+                    continue
+                if own and job.get("runner_name") == own_runner:
+                    continue
+                if not _github_deep_job_matches(job.get("name"), deep_job):
+                    continue
+                if job.get("head_sha") and job.get("head_sha") != ctx.head_sha:
+                    continue
+                status = job.get("status")
+                if status in _GITHUB_JOB_STARTED or (
+                    status == "completed" and job.get("conclusion") == "success"
+                ):
+                    return job
+            if more:
+                _github_annotation(
+                    "warning",
+                    f"Run {run['id']} has more jobs than the stand-down check reads; "
+                    "checked the first pages only.",
+                )
+    return None
+
+
+def _github_head_moved(session: requests.Session, ctx: _GitHubContext) -> bool:
+    """Deep mode: whether the PR has a newer head than the one this run reviewed."""
+    reason = None
+    current = None
+    try:
+        resp = session.get(f"{ctx.repo_url}/pulls/{ctx.number}")
+        if resp.status_code != 200:
+            reason = f"HTTP {resp.status_code}"
+        else:
+            payload = resp.json()
+            head = payload.get("head") if isinstance(payload, dict) else None
+            current = head.get("sha") if isinstance(head, dict) else None
+            if not isinstance(current, str) or not _GITHUB_SHA_RE.match(current):
+                reason = "no head SHA"
+    except requests.exceptions.RequestException as e:
+        reason = type(e).__name__
+    except ValueError:
+        reason = "invalid JSON"
+    if reason is not None or current is None:
+        _github_annotation(
+            "warning",
+            f"Could not check whether PR #{ctx.number} has a newer head ({reason}); "
+            "continuing without the check.",
+        )
+        return False
+    if current == ctx.head_sha:
+        return False
+    _github_annotation(
+        "notice",
+        f"PR #{ctx.number} moved to {current[:8]} since this run started "
+        f"({ctx.head_sha[:8]}); the deep review stands down.",
+    )
+    return True
+
+
+def _github_stands_down(
+    session: requests.Session, ctx: _GitHubContext, mode: str, deep_job: str
+) -> bool:
+    """Whether a review that should win makes this one redundant. Never writes.
+
+    Standard mode gives way to a deep review job of the same head that started
+    or succeeded. Deep mode gives way to a newer head. A lookup that fails
+    warns once and lets the review go ahead.
+    """
+    if mode == "deep":
+        return _github_head_moved(session, ctx)
+    try:
+        job = _github_find_deep_review(session, ctx, deep_job)
+    except _GitHubLookupError as e:
+        _github_annotation(
+            "warning",
+            f"Could not check for a deep review ({e}); grant the job 'actions: read' "
+            "so the standard review can stand down for one. Continuing without the check.",
+        )
+        return False
+    except _GitHubBudgetError:
+        _github_annotation(
+            "warning",
+            f"The check for a deep review stopped after {_STANDDOWN_MAX_CALLS} API calls; "
+            "continuing without it.",
+        )
+        return False
+    if job is None:
+        return False
+    name = _CONTROL_CHARS_RE.sub("", job["name"])[:_GITHUB_DEEP_JOB_CHARS]
+    _github_annotation(
+        "notice",
+        f"{name} ({job.get('status')}) is running or has posted for {ctx.head_sha[:8]}; "
+        "the standard review stands down.",
+    )
+    return True
+
+
+def _github_deep_job(value: str | None) -> str:
+    """Return the deep review job name to match, exiting 1 on an unusable one."""
+    if value is None:
+        return _GITHUB_DEEP_JOB_DEFAULT
+    if not value or len(value) > _GITHUB_DEEP_JOB_CHARS or _CONTROL_CHARS_RE.search(value):
+        _error(
+            f"--deep-job must be a job name of 1 to {_GITHUB_DEEP_JOB_CHARS} characters "
+            "without control characters"
+        )
+        sys.exit(1)
+    return value
+
+
+def _github_session(ctx: _GitHubContext) -> requests.Session:
+    session = _SafeSession()
+    session.headers.update(
+        {
+            "Authorization": f"Bearer {ctx.token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+    )
+    return session
+
+
+def cmd_stand_down(args: argparse.Namespace) -> None:
+    """Exit 10 when the review should stand down, 0 when it should go ahead."""
+    ctx = _github_load_context()
+    deep_job = _github_deep_job(args.deep_job)
+    if _github_stands_down(_github_session(ctx), ctx, args.mode, deep_job):
+        sys.exit(_STANDDOWN_EXIT)
 
 
 def _scan_fences(text: str) -> tuple[list[tuple[str, bool]], str | None]:
@@ -1826,6 +2148,9 @@ def _github_upsert_summary(
 def _github_post(args: argparse.Namespace) -> None:
     """Post review results to the GitHub pull request named by the Actions event."""
     ctx = _github_load_context()
+    # Without --mode nothing checks for a review that should win, as before.
+    mode = getattr(args, "mode", None)
+    deep_job = _github_deep_job(getattr(args, "deep_job", None))
     verbose = _resolve_verbose(args)
     chill = _resolve_chill(args)
     inline_fixes = _resolve_inline_fixes(args)
@@ -1846,14 +2171,7 @@ def _github_post(args: argparse.Namespace) -> None:
         _warning(f"Dropped {len(data['inline_comments']) - len(clean)} comment(s): bad file path")
         data["inline_comments"] = clean
 
-    session = _SafeSession()
-    session.headers.update(
-        {
-            "Authorization": f"Bearer {ctx.token}",
-            "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2022-11-28",
-        }
-    )
+    session = _github_session(ctx)
     head_sha = ctx.head_sha
     review_marker = _make_review_marker(head_sha)
 
@@ -1889,6 +2207,8 @@ def _github_post(args: argparse.Namespace) -> None:
                 if c.get("fix"):
                     dropped.add((c["file"], c["fix"]["end_line"]))
 
+        if mode and _github_stands_down(session, ctx, mode, deep_job):
+            return
         carried = _github_delete_previous_threads(session, ctx, dropped, verbose=verbose)
 
         inline = data.get("inline_comments", [])
@@ -1936,6 +2256,9 @@ def _github_post(args: argparse.Namespace) -> None:
         summary_body = _github_build_summary_body(
             data, summary_marker, ctx.run_url, unanchored, carried, recommendation
         )
+        # The inline comments are already up; a review that should win replaces them.
+        if mode and _github_stands_down(session, ctx, mode, deep_job):
+            return
         if _github_upsert_summary(session, ctx, summary_body, summary_id, verbose=verbose):
             _success(f"Summary posted to pull request #{ctx.number}")
         else:
@@ -2339,6 +2662,22 @@ def main() -> None:
             "a deep review (needs --platform github)"
         ),
     )
+    post_parser.add_argument(
+        "--mode",
+        choices=["standard", "deep"],
+        help=(
+            "check for a review that should win before deleting old threads and before "
+            "the summary, as stand-down does (needs --platform github)"
+        ),
+    )
+    post_parser.add_argument(
+        "--deep-job",
+        metavar="NAME",
+        help=(
+            f"display name of the deep review job (default: {_GITHUB_DEEP_JOB_DEFAULT}; "
+            "needs --platform github)"
+        ),
+    )
     post_parser.add_argument("--verbose", action="store_true", help="Verbose output")
     post_parser.set_defaults(func=cmd_post)
 
@@ -2352,13 +2691,31 @@ def main() -> None:
     suggest_parser.add_argument("--verbose", action="store_true", help="Verbose output")
     suggest_parser.set_defaults(func=cmd_suggest_reviewers)
 
+    standdown_parser = subparsers.add_parser(
+        "stand-down",
+        help=(
+            "Exit 10 when a review that should win makes this one redundant, 0 otherwise: "
+            "a deep review job of the same head for standard, a newer head for deep"
+        ),
+    )
+    standdown_parser.add_argument("--platform", choices=["github"], required=True)
+    standdown_parser.add_argument("--mode", choices=["standard", "deep"], required=True)
+    standdown_parser.add_argument(
+        "--deep-job",
+        metavar="NAME",
+        help=f"display name of the deep review job (default: {_GITHUB_DEEP_JOB_DEFAULT})",
+    )
+    standdown_parser.set_defaults(func=cmd_stand_down)
+
     args = parser.parse_args()
-    if (
-        args.command == "post"
-        and args.platform != "github"
-        and args.deep_recommendation_plan is not None
-    ):
-        post_parser.error("--deep-recommendation-plan needs --platform github")
+    if args.command == "post" and args.platform != "github":
+        for flag, value in (
+            ("--deep-recommendation-plan", args.deep_recommendation_plan),
+            ("--mode", args.mode),
+            ("--deep-job", args.deep_job),
+        ):
+            if value is not None:
+                post_parser.error(f"{flag} needs --platform github")
     args.func(args)
 
 
