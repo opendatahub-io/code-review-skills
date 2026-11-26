@@ -42,7 +42,7 @@ Environment variables (for 'post --platform github', which is never auto-detecte
 
 Usage:
   review.py post review.json [--chill|--no-chill] [--inline-fixes|--no-inline-fixes] [--verbose]
-  review.py post review.json --platform github
+  review.py post review.json --platform github [--deep-recommendation-plan PATH]
   review.py display review.json [--chill|--no-chill] [--inline-fixes|--no-inline-fixes]
   review.py suggest-reviewers [--verbose]
 """
@@ -50,10 +50,12 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -959,6 +961,16 @@ _FENCE_OPEN_RE = re.compile(r"^( {0,3})(`{3,}(?=[^`]*$)|~{3,})")
 _FENCE_CLOSE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})[ \t]*$")
 _MENTION_RE = re.compile(r"(?<![A-Za-z0-9])(@|&#0*64;|&#[xX]0*40;|&commat;)(?=[A-Za-z0-9])")
 
+# The deep-review recommendation reads panel.py triage output. Paths come from the
+# pull request, so each is bounded and the number of categories shown is capped.
+_PLAN_MAX_BYTES = 1024 * 1024
+# DOTALL: a path may hold a newline, and its category still comes last.
+_EVIDENCE_RE = re.compile(r"^(.*?) \(([^()]*)\)$", re.DOTALL)
+_EVIDENCE_MORE_RE = re.compile(r"^and (\d{1,9}) more$")
+_REASON_PATH_CHARS = 160
+_REASON_CATEGORY_CHARS = 60
+_REASON_CATEGORIES = 10
+
 _GITHUB_THREADS_QUERY = """
 query($owner: String!, $name: String!, $number: Int!, $after: String) {
   repository(owner: $owner, name: $name) {
@@ -1376,6 +1388,113 @@ def _github_code_span(text: str) -> str:
     return f"{delimiter} {text} {delimiter}"
 
 
+def _github_reason_path(value: str) -> str:
+    """Render a path from the pull request as an inert, bounded code span."""
+    cleaned = " ".join(_CONTROL_CHARS_RE.sub(" ", value.replace("`", "")).split())
+    cleaned = cleaned[:_REASON_PATH_CHARS]
+    return f"`{cleaned}`" if cleaned else "(unnamed path)"
+
+
+def _github_reason_summary(evidence: list[str]) -> str:
+    """Show one path per evidence category and count the remaining paths.
+
+    Evidence entries look like ``path (category)`` or ``and N more (category)``,
+    as panel.py triage writes them.
+    """
+    grouped: dict[str, tuple[str | None, int]] = {}
+    for reason in evidence:
+        match = _EVIDENCE_RE.fullmatch(reason)
+        label, category = match.groups() if match else (reason, "changes")
+        example, count = grouped.get(category, (None, 0))
+        more = _EVIDENCE_MORE_RE.fullmatch(label)
+        if more:
+            count += int(more.group(1))
+        else:
+            example = example or label
+            count += 1
+        grouped[category] = (example, count)
+    parts = []
+    for category, (example, count) in list(grouped.items())[:_REASON_CATEGORIES]:
+        name = " ".join(_CONTROL_CHARS_RE.sub(" ", category.replace("`", "")).split())
+        name = html.escape(name[:_REASON_CATEGORY_CHARS], quote=False) or "changes"
+        path = f": {_github_reason_path(example)}" if example is not None else ""
+        extra = f" and {count - 1} more" if example is not None and count > 1 else ""
+        parts.append(f"{name}{path}{extra}")
+    if len(grouped) > _REASON_CATEGORIES:
+        parts.append(f"and {len(grouped) - _REASON_CATEGORIES} more categories")
+    return "; ".join(parts)
+
+
+def _github_read_plan(path: str) -> dict[str, Any] | None:
+    """Read a triage plan file, or warn and return None when it is unusable."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as e:
+        reason = "does not exist" if isinstance(e, FileNotFoundError) else "is unreadable"
+        _github_annotation("warning", f"No deep-review recommendation: the triage plan {reason}")
+        return None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            reason = "is not a regular file"
+        elif info.st_size > _PLAN_MAX_BYTES:
+            reason = "is larger than 1 MiB"
+        else:
+            with os.fdopen(fd, "rb") as f:
+                fd = -1
+                raw = f.read(_PLAN_MAX_BYTES + 1)
+            if len(raw) > _PLAN_MAX_BYTES:
+                reason = "is larger than 1 MiB"
+            else:
+                try:
+                    plan = json.loads(raw)
+                except (ValueError, RecursionError):
+                    reason = "is not valid JSON"
+                else:
+                    if isinstance(plan, dict):
+                        return plan
+                    reason = "is not a JSON object"
+    except OSError:
+        reason = "is unreadable"
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    _github_annotation("warning", f"No deep-review recommendation: the triage plan {reason}")
+    return None
+
+
+def _github_recommendation(path: str) -> str | None:
+    """Build the deep-review recommendation line from a triage plan, or None.
+
+    Only a plan whose tier is ``deep`` yields a line. Any other tier is silent;
+    a file that cannot be used, or has the wrong shape, gets one warning.
+    """
+    plan = _github_read_plan(path)
+    if plan is None:
+        return None
+    tier = plan.get("tier")
+    name = tier.get("name") if isinstance(tier, dict) else None
+    evidence = tier.get("evidence") if isinstance(tier, dict) else None
+    if isinstance(name, str) and name != "deep":
+        return None
+    if (
+        name != "deep"
+        or not isinstance(evidence, list)
+        or not all(isinstance(e, str) for e in evidence)
+    ):
+        _github_annotation(
+            "warning", "No deep-review recommendation: the triage plan has an unexpected shape"
+        )
+        return None
+    reasons = _github_reason_summary(evidence)
+    reason_text = f"{reasons}. " if reasons else ""
+    return (
+        f"**Deep review recommended:** {reason_text}"
+        "Add the `deep-review` label to this pull request to run it."
+    )
+
+
 def _github_cap(text: str, marker: str, limit: int = _GITHUB_BODY_LIMIT) -> str:
     """Return ``text`` plus the marker, truncated so the result fits in ``limit`` characters.
 
@@ -1487,14 +1606,18 @@ def _github_build_summary_body(
     run_url: str | None = None,
     unanchored: list[dict[str, Any]] | None = None,
     carried: int = 0,
+    recommendation: str | None = None,
 ) -> str:
     """Build the markdown summary body for the PR comment.
 
     ``data["inline_comments"]`` holds the findings that were posted inline;
     ``unanchored`` holds the ones that were not posted inline; ``carried`` is
     the number of earlier threads still open on code that did not change.
+    ``recommendation`` is a line placed directly under the heading.
     """
     parts: list[str] = ["## AI Code Review Summary\n"]
+    if recommendation:
+        parts.append(_github_defuse(recommendation) + "\n")
     parts.append(_github_text(str(data.get("summary") or "No summary provided.")))
     raw_positives = data.get("positive_aspects")
     if isinstance(raw_positives, str):
@@ -1608,6 +1731,9 @@ def _github_post(args: argparse.Namespace) -> None:
         _error(f"Failed to parse review JSON: {e}")
         sys.exit(1)
 
+    plan_path = getattr(args, "deep_recommendation_plan", None)
+    recommendation = _github_recommendation(plan_path) if plan_path is not None else None
+
     # A path with a control character is never in a diff, and printing it
     # would let the model start a workflow command in the log.
     clean = [c for c in data["inline_comments"] if not _CONTROL_CHARS_RE.search(c["file"])]
@@ -1703,7 +1829,7 @@ def _github_post(args: argparse.Namespace) -> None:
         # come back instead of staying dropped as "unchanged code".
         summary_marker = review_marker if not (unanchored or failed) else _make_review_marker()
         summary_body = _github_build_summary_body(
-            data, summary_marker, ctx.run_url, unanchored, carried
+            data, summary_marker, ctx.run_url, unanchored, carried, recommendation
         )
         if _github_upsert_summary(session, ctx, summary_body, summary_id, verbose=verbose):
             _success(f"Summary posted to pull request #{ctx.number}")
@@ -2100,6 +2226,14 @@ def main() -> None:
             "github posts to the pull request named by the Actions event (never auto-detected)"
         ),
     )
+    post_parser.add_argument(
+        "--deep-recommendation-plan",
+        metavar="PATH",
+        help=(
+            "panel.py triage output; when its tier is deep, the summary recommends "
+            "a deep review (needs --platform github)"
+        ),
+    )
     post_parser.add_argument("--verbose", action="store_true", help="Verbose output")
     post_parser.set_defaults(func=cmd_post)
 
@@ -2114,6 +2248,12 @@ def main() -> None:
     suggest_parser.set_defaults(func=cmd_suggest_reviewers)
 
     args = parser.parse_args()
+    if (
+        args.command == "post"
+        and args.platform != "github"
+        and args.deep_recommendation_plan is not None
+    ):
+        post_parser.error("--deep-recommendation-plan needs --platform github")
     args.func(args)
 
 
