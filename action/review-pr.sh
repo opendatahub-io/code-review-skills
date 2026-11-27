@@ -454,10 +454,38 @@ percent_encode_path() {
     printf '%s\n' "$out"
 }
 
+# Every byte of TEXT outside the unreserved characters as %XX, as a URL's userinfo is sent.
+percent_encode_strict() {
+    local LC_ALL=C text="$1" out="" c i
+    for ((i = 0; i < ${#text}; i++)); do
+        c="${text:i:1}"
+        case "$c" in
+            [A-Za-z0-9._~-]) out+="$c" ;;
+            *) out+="$(printf '%%%02X' "'$c")" ;;
+        esac
+    done
+    printf '%s\n' "$out"
+}
+
+# Add a piece of a secret to MLFLOW_SECRETS with its percent-decoded and percent-encoded forms,
+# when it is at least 4 characters: a shorter piece would mask common text all over the output,
+# and the whole value it came from is masked anyway.
+add_secret_piece() {
+    local piece="$1" decoded
+    [ "${#piece}" -ge 4 ] || return 0
+    MLFLOW_SECRETS+=("$piece")
+    decoded="$(printf '%b' "${piece//%/\\x}" 2>/dev/null)" || decoded=""
+    [ -z "$decoded" ] || [ "$decoded" = "$piece" ] || MLFLOW_SECRETS+=("$decoded")
+    local encoded
+    encoded="$(percent_encode_strict "${decoded:-$piece}")"
+    [ "$encoded" = "$piece" ] || MLFLOW_SECRETS+=("$encoded")
+}
+
 # The values a tool's output must not show, longest first: the MLflow endpoint, its token, the
-# relay's deploy token and its user name, and the endpoint's host and path, which HTTP errors
-# print apart from the URL. urllib3 prints the host in lower case and requests the path
-# percent-encoded, so those forms are masked too. Sets MLFLOW_SECRETS.
+# relay's deploy token and its user name, every proxy value the export forwards with the
+# credentials of a proxy URL (user:password and the password alone), and the endpoint's host and
+# path, which HTTP errors print apart from the URL. urllib3 prints the host in lower case and
+# requests the path percent-encoded, so those forms are masked too. Sets MLFLOW_SECRETS.
 MLFLOW_SECRETS=()
 collect_mlflow_secrets() {
     local uri="${MLFLOW_TRACKING_URI:-}" rest host path encoded
@@ -466,6 +494,24 @@ collect_mlflow_secrets() {
     [ -z "${MLFLOW_TRACKING_TOKEN:-}" ] || MLFLOW_SECRETS+=("$MLFLOW_TRACKING_TOKEN")
     [ -z "${REVIEW_TELEMETRY_TOKEN:-}" ] || MLFLOW_SECRETS+=("$REVIEW_TELEMETRY_TOKEN")
     [ -z "${REVIEW_TELEMETRY_USERNAME:-}" ] || MLFLOW_SECRETS+=("$REVIEW_TELEMETRY_USERNAME")
+    # A proxy URL can carry credentials, and a tool that cannot parse it can print it, or a part.
+    local name value authority userinfo
+    for name in $TOOL_PROXY_VARS; do
+        value="${!name:-}"
+        [ -n "$value" ] || continue
+        MLFLOW_SECRETS+=("$value")
+        authority="${value#*://}"
+        authority="${authority%%[/?#]*}"
+        case "$authority" in
+            *@*)
+                userinfo="${authority%@*}"
+                add_secret_piece "$userinfo"
+                case "$userinfo" in
+                    *:*) add_secret_piece "${userinfo#*:}" ;;
+                esac
+                ;;
+        esac
+    done
     [ -n "$uri" ] || return 0
     rest="${uri#*://}"
     host="${rest%%[/?#]*}"

@@ -1094,6 +1094,26 @@ class ExportTests(UsageCollectionMixin, ScriptTestCase):
         self.assertEqual(mounts, [f"{self.usage_dir}:{self.usage_dir}:Z"])
         self.assertNotIn("proxy.example", " ".join(call["argv"]))
 
+    def test_forwarded_proxy_credentials_are_masked_in_the_output_and_the_warning(self):
+        proxy = "http://proxyuser:fake%40proxy-pass-0000@proxy.example:3128"
+        echo = (
+            f"ProxyError: cannot parse {proxy}\n"
+            "as proxyuser:fake@proxy-pass-0000 (fake@proxy-pass-0000, fake%40proxy-pass-0000)\n"
+        )
+        self.tool_config({"status": 1, "stdout": echo, "stderr": echo})
+        proc = self.export("my-reviews", HTTPS_PROXY=proxy, **MLFLOW_SECRETS)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        # Still forwarded by name only.
+        call = self.tool_calls()[0]
+        self.assertIn("HTTPS_PROXY", call["env_names"])
+        self.assertNotIn(proxy, " ".join(call["argv"]))
+        warnings = [line for line in proc.stdout.splitlines() if line.startswith("::warning::")]
+        self.assertEqual(len(warnings), 1, proc.stdout)
+        self.assertIn("ProxyError", warnings[0])
+        for secret in ("proxyuser:", "fake@proxy-pass", "fake%40proxy-pass", "fake%2540proxy"):
+            self.assertNotIn(secret, proc.stdout)
+            self.assertNotIn(secret, proc.stderr)
+
     def test_an_oversized_ca_bundle_is_not_passed(self):
         ca = os.path.join(self.tmp, "huge.pem")
         with open(ca, "wb") as f:
