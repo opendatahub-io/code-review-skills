@@ -117,6 +117,14 @@ on:
       suggest_reviewers:
         type: boolean
         default: false
+      # The MLflow experiment the caller's reviews go to. Empty exports nothing.
+      mlflow_experiment_name:
+        type: string
+        default: ''
+      # The review-telemetry relay's GitLab project id, from its maintainers.
+      review_telemetry_project:
+        type: string
+        default: ''
     # Every secret is optional and comes from the calling repository.
     secrets:
       OPENAI_API_KEY:
@@ -128,6 +136,16 @@ on:
       AI_REVIEW_APP_ID:
         required: false
       AI_REVIEW_APP_PRIVATE_KEY:
+        required: false
+      # The MLflow server and its optional bearer token, for mlflow_experiment_name.
+      MLFLOW_TRACKING_URI:
+        required: false
+      MLFLOW_TRACKING_TOKEN:
+        required: false
+      # The review-telemetry relay's deploy token, for mlflow_experiment_name.
+      REVIEW_TELEMETRY_USERNAME:
+        required: false
+      REVIEW_TELEMETRY_TOKEN:
         required: false
       # A fine-grained, read-only token scoped to the security-config repository alone,
       # for the org review rules fetch below. Optional: without it the fetch warns and
@@ -153,6 +171,14 @@ jobs:
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
       GCP_SERVICE_ACCOUNT_KEY: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
+      # Only the action's export and relay steps read these; the agent never sees them. Passed
+      # only to a caller that names an experiment: with organization secrets and secrets: inherit,
+      # every other caller would get the action's warning that the input is empty.
+      MLFLOW_TRACKING_URI: ${{ inputs.mlflow_experiment_name != '' && secrets.MLFLOW_TRACKING_URI || '' }}
+      MLFLOW_TRACKING_TOKEN: ${{ inputs.mlflow_experiment_name != '' && secrets.MLFLOW_TRACKING_TOKEN || '' }}
+      REVIEW_TELEMETRY_PROJECT: ${{ inputs.mlflow_experiment_name != '' && inputs.review_telemetry_project || '' }}
+      REVIEW_TELEMETRY_USERNAME: ${{ inputs.mlflow_experiment_name != '' && secrets.REVIEW_TELEMETRY_USERNAME || '' }}
+      REVIEW_TELEMETRY_TOKEN: ${{ inputs.mlflow_experiment_name != '' && secrets.REVIEW_TELEMETRY_TOKEN || '' }}
     steps:
       # The org-wide review rules, fetched here once with the org's read-only token, so the
       # action itself holds no token for them and every caller gets the same rules. The step
@@ -188,6 +214,7 @@ jobs:
           org_review_rules: ${{ steps.org_rules.outputs.path }}
           recommend_deep_review: ${{ inputs.recommend_deep_review }}
           suggest_reviewers: ${{ inputs.suggest_reviewers }}
+          mlflow_experiment_name: ${{ inputs.mlflow_experiment_name }}
           app_id: ${{ secrets.AI_REVIEW_APP_ID }}
           app_private_key: ${{ secrets.AI_REVIEW_APP_PRIVATE_KEY }}
 ```
@@ -200,6 +227,7 @@ Notes:
 - `runs-on: ubuntu-latest` suits the default `openshell` backend, which starts a privileged Docker container. On a self-hosted runner that container is root on the host. See [Backends](../README.md#backends) in the README for the backend choice and the `podman` fallback.
 - Pin the action by full commit SHA here, and have callers pin this workflow by full commit SHA too. A branch reference would let anyone who can push to the central repository run new code with every caller's secrets.
 - `ORG_RULES_TOKEN` is a fine-grained, read-only GitHub token scoped to the security-config repository alone. The example caller below passes its secrets with `secrets: inherit`, so an organization-level secret reaches the central workflow; a calling repository without access to it simply reviews without the org rules.
+- Sending traces to MLflow is optional. A caller that passes `mlflow_experiment_name` gets its reviews' traces in that experiment, through the review-telemetry relay when the caller passes `review_telemetry_project` and the `REVIEW_TELEMETRY_USERNAME` and `REVIEW_TELEMETRY_TOKEN` secrets reach it (Red Hat repositories on GitHub-hosted runners; keep the experiment name and the project id in repository or organization variables, such as `vars.MLFLOW_EXPERIMENT_NAME` and `vars.REVIEW_TELEMETRY_PROJECT`, and pass them as inputs), directly when the `MLFLOW_TRACKING_URI` secret does, or both. The job's `env:` maps these secrets only when the caller set `mlflow_experiment_name`, so with organization-level secrets and `secrets: inherit`, a caller that does not send traces gets no warning about them; a caller that sets the input without any of them gets one. A direct export needs a server the runner can reach (see [MLflow](../README.md#mlflow)).
 - The org review rules reach the review only with `harness: claude-code`. The default `codex` harness drops them with a runner warning until the codex images ship the updated `github-code-review` skill, so a workflow that keeps the default posts reviews without the rules in the meantime.
 
 ## The caller in each repository
@@ -238,6 +266,10 @@ jobs:
       deep_review_job: deep-review
       # The label in the deep job's if: below, which the recommendation names.
       deep_review_label: deep-review
+      # Optional: the MLflow experiment and the review relay's project, from repository or
+      # organization variables. Unset variables send no telemetry.
+      mlflow_experiment_name: ${{ vars.MLFLOW_EXPERIMENT_NAME }}
+      review_telemetry_project: ${{ vars.REVIEW_TELEMETRY_PROJECT }}
     secrets: inherit
 
   deep-review:
@@ -257,6 +289,10 @@ jobs:
     with:
       mode: deep
       deep_review_job: deep-review
+      # Optional: the MLflow experiment and the review relay's project, from repository or
+      # organization variables. Unset variables send no telemetry.
+      mlflow_experiment_name: ${{ vars.MLFLOW_EXPERIMENT_NAME }}
+      review_telemetry_project: ${{ vars.REVIEW_TELEMETRY_PROJECT }}
     secrets: inherit
 ```
 

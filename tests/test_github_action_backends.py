@@ -34,9 +34,10 @@ RUN_ID = "4242"
 RUN_ATTEMPT = "3"
 DIGEST = "sha256:" + "0123456789abcdef" * 4
 
-# Stands in for timeout: appends its own options and the command to FAKE_TIMEOUT_LOG as one JSON
-# line, then runs the command. With FAKE_TIMEOUT_STATUS set, the agent run (the call that starts
-# agentic-ci) exits with that status instead of running.
+# Stands in for timeout: appends its own options and the command to FAKE_TIMEOUT_LOG (or, without
+# it, to timeout-tools.jsonl next to this file) as one JSON line, then runs the command. With
+# FAKE_TIMEOUT_STATUS set, the agent run (the call that starts agentic-ci) exits with that status
+# instead of running.
 FAKE_TIMEOUT = """
 import json
 import os
@@ -44,7 +45,11 @@ import sys
 
 args = sys.argv[1:]
 cut = min(args.index(tool) for tool in ("docker", "podman", "uvx") if tool in args)
-with open(os.environ["FAKE_TIMEOUT_LOG"], "a", encoding="utf-8") as f:
+# The usage totals and the export run with a cut-down environment, so they log next to this file.
+log = os.environ.get("FAKE_TIMEOUT_LOG") or os.path.join(
+    os.path.dirname(os.path.abspath(sys.argv[0])), "timeout-tools.jsonl"
+)
+with open(log, "a", encoding="utf-8") as f:
     f.write(json.dumps({"limit": args[:cut], "command": args[cut:]}) + "\\n")
 status = os.environ.get("FAKE_TIMEOUT_STATUS")
 if status and "agentic-ci" in args:
@@ -168,6 +173,8 @@ class OpenShellReviewTestCase(ReviewTestCase):
             "/",
             "-e",
             "AGENT_ENABLED_PLUGINS",
+            "-e",
+            "GITHUB_WORKSPACE",
         ]
         for name in env_names:
             argv += ["-e", name]
@@ -183,7 +190,6 @@ class OpenShellReviewTestCase(ReviewTestCase):
             self.ai_dir,
             "--image",
             f"quay.io/aipcc/agentic-ci/{family}-sandbox:{VERIFIED_AGENTIC_CI_VERSION}",
-            "--no-otel",
             "--effort",
             script_constant("AGENT_EFFORT"),
         ]
@@ -398,7 +404,13 @@ class OpenShellReviewTests(OpenShellReviewTestCase):
         argv = self.agent_run()
         self.assertEqual(
             self.env_names(argv),
-            ["AGENT_ENABLED_PLUGINS", "ANTHROPIC_API_KEY", "GCP_PROJECT_ID", "CLOUD_ML_REGION"],
+            [
+                "AGENT_ENABLED_PLUGINS",
+                "GITHUB_WORKSPACE",
+                "ANTHROPIC_API_KEY",
+                "GCP_PROJECT_ID",
+                "CLOUD_ML_REGION",
+            ],
         )
         for name in self.env_names(argv):
             self.assertNotIn("=", name)
@@ -416,7 +428,8 @@ class OpenShellReviewTests(OpenShellReviewTestCase):
         )
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual(
-            self.env_names(self.agent_run()), ["AGENT_ENABLED_PLUGINS", "OPENAI_API_KEY"]
+            self.env_names(self.agent_run()),
+            ["AGENT_ENABLED_PLUGINS", "GITHUB_WORKSPACE", "OPENAI_API_KEY"],
         )
 
     def test_no_token_name_or_value_reaches_docker(self):
@@ -635,6 +648,7 @@ class GoogleCredentialFileTests(OpenShellReviewTestCase):
                         self.env_names(argv),
                         [
                             "AGENT_ENABLED_PLUGINS",
+                            "GITHUB_WORKSPACE",
                             "GCLOUD_CREDENTIALS",
                             "ANTHROPIC_VERTEX_PROJECT_ID",
                         ],
@@ -649,7 +663,12 @@ class GoogleCredentialFileTests(OpenShellReviewTestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual(
             self.env_names(self.agent_run()),
-            ["AGENT_ENABLED_PLUGINS", "GCP_SERVICE_ACCOUNT_KEY", "ANTHROPIC_VERTEX_PROJECT_ID"],
+            [
+                "AGENT_ENABLED_PLUGINS",
+                "GITHUB_WORKSPACE",
+                "GCP_SERVICE_ACCOUNT_KEY",
+                "ANTHROPIC_VERTEX_PROJECT_ID",
+            ],
         )
 
     def test_workload_identity_federation_fails_clearly(self):
@@ -693,7 +712,12 @@ class GoogleCredentialFileTests(OpenShellReviewTestCase):
                 argv = self.agent_run()
                 self.assertEqual(
                     self.env_names(argv),
-                    ["AGENT_ENABLED_PLUGINS", "GCLOUD_CREDENTIALS", "ANTHROPIC_VERTEX_PROJECT_ID"],
+                    [
+                        "AGENT_ENABLED_PLUGINS",
+                        "GITHUB_WORKSPACE",
+                        "GCLOUD_CREDENTIALS",
+                        "ANTHROPIC_VERTEX_PROJECT_ID",
+                    ],
                 )
                 env = self.agent_record()["env"]
                 self.assertEqual(env["GCLOUD_CREDENTIALS"], Path(path).read_text("utf-8"))
@@ -773,7 +797,6 @@ class BackendChoiceTests(OpenShellReviewTestCase):
                 self.ai_dir,
                 "--image",
                 image,
-                "--no-otel",
                 "--timeout",
                 str(25 * 60),
                 "--effort",

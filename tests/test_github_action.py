@@ -545,6 +545,8 @@ class ActionStaticTests(PanelTestCase):
                 "Review the pull request",
                 "Mint the posting token",
                 "Post the review",
+                "Export the telemetry to MLflow",
+                "Upload the telemetry to the review relay",
             ],
         )
         # The mint adds its own app_id condition, checked with its other options.
@@ -872,6 +874,34 @@ def write_fake_review_py(action_path: str, body: str) -> Path:
     return path
 
 
+# Stands in for agentic-ci's copy of its OTEL log to GITHUB_WORKSPACE, in the fake uvx and the
+# fake docker: FAKE_OTEL is the log's content, and FAKE_OTEL_SHAPE makes it a link to a file
+# elsewhere (link), the directory a link (dirlink) or a sparse file past the size cap (big).
+WRITE_OTEL = """
+def write_otel(env):
+    content = env.get("FAKE_OTEL")
+    if content is None or not env.get("GITHUB_WORKSPACE"):
+        return
+    target = env["GITHUB_WORKSPACE"]
+    shape = env.get("FAKE_OTEL_SHAPE", "")
+    if shape == "dirlink":
+        elsewhere = target + ".elsewhere"
+        os.makedirs(elsewhere, exist_ok=True)
+        os.rmdir(target)
+        os.symlink(elsewhere, target)
+    log = os.path.join(target, "claude-otel.jsonl")
+    if shape == "link":
+        elsewhere = os.path.join(os.path.dirname(target), "elsewhere.jsonl")
+        with open(elsewhere, "w", encoding="utf-8") as f:
+            f.write(content)
+        os.symlink(elsewhere, log)
+        return
+    with open(log, "w", encoding="utf-8") as f:
+        f.write(content)
+        if shape == "big":
+            f.truncate(64 * 1024 * 1024 + 1)
+"""
+
 # Stands in for podman, so no test touches a real container: records each call.
 FAKE_PODMAN = """
 import json
@@ -900,11 +930,14 @@ sys.exit(int(os.environ.get("FAKE_PODMAN_STATUS", "0")))
 # `ps` and `volume ls` with a label filter. A `run` of agentic-ci writes the review output when
 # FAKE_WRITE is 1, and a `run` of chown makes the workdir removable again. `info` exits
 # FAKE_DOCKER_INFO_STATUS, as when the daemon cannot be reached.
-FAKE_DOCKER = """
+FAKE_DOCKER = (
+    """
 import json
 import os
 import sys
-
+"""
+    + WRITE_OTEL
+    + """
 args = sys.argv[1:]
 log = os.environ.get("FAKE_DOCKER_LOG")
 if log:
@@ -941,6 +974,7 @@ elif args[:1] == ["run"] and "--entrypoint" in args:
     status("FAKE_DOCKER_CHOWN_STATUS")
 elif args[:1] == ["run"] and "agentic-ci" in args:
     agent = args[args.index("agentic-ci") :]
+    write_otel(os.environ)
     if os.environ.get("FAKE_WRITE") == "1":
         workdir = agent[agent.index("--workdir") + 1]
         with open(os.path.join(workdir, "out", "ai-review-output.json"), "w") as f:
@@ -949,6 +983,7 @@ elif args[:1] == ["run"] and "agentic-ci" in args:
 elif args[:1] == ["run"]:
     status("FAKE_DOCKER_PREPULL_STATUS")
 """
+)
 
 
 class ScriptTestCase(PanelTestCase):
@@ -1538,19 +1573,49 @@ class PrepareTests(PrepareTestCase):
         self.assertIn("GITHUB_ACTION_PATH is not set", proc.stdout)
 
 
-# Stands in for uvx: records what the script passed and, when asked, writes the review output
-# where agentic-ci would leave it, under the workdir's out/.
-FAKE_UVX = """
+# Stands in for uvx. The agent run (agentic-ci run) records what the script passed to FAKE_LOG,
+# writes the OTEL log when FAKE_OTEL is set and, when asked, writes the review output where
+# agentic-ci would leave it, under the workdir's out/. The usage totals (python) and the MLflow
+# export (agentic-ci mlflow-push) run with a cut-down environment, so they append their argv,
+# environment and working directory to uvx-tools.jsonl next to this file, and take their settings
+# from uvx-tools.json there: "stdout" and "stderr" to print, "status" to exit with, and "stub", a
+# directory with a stand-in agentic_ci package that usage.py runs against.
+FAKE_UVX = (
+    """
 import json
 import os
+import subprocess
 import sys
+"""
+    + WRITE_OTEL
+    + """
+args = sys.argv[1:]
+here = os.path.dirname(os.path.abspath(sys.argv[0]))
+if args[2:3] == ["python"] or args[2:4] == ["agentic-ci", "mlflow-push"]:
+    with open(os.path.join(here, "uvx-tools.jsonl"), "a", encoding="utf-8") as f:
+        f.write(json.dumps({"argv": args, "env": dict(os.environ), "cwd": os.getcwd()}) + "\\n")
+    config = {}
+    if os.path.exists(os.path.join(here, "uvx-tools.json")):
+        with open(os.path.join(here, "uvx-tools.json"), encoding="utf-8") as f:
+            config = json.load(f)
+    sys.stdout.write(config.get("stdout", ""))
+    sys.stderr.write(config.get("stderr", ""))
+    if "status" in config:
+        sys.exit(config["status"])
+    if args[2:3] == ["python"] and config.get("stub"):
+        # Drops -I, which would ignore PYTHONPATH and so the stand-in package.
+        rest = args[4:]
+        env = {**os.environ, "PYTHONPATH": config["stub"]}
+        sys.exit(subprocess.run([sys.executable, *rest], env=env, check=False).returncode)
+    sys.exit(0)
 
 env_keys = [
     "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GITHUB_TOKEN", "GH_TOKEN",
     "ACTIONS_ID_TOKEN_REQUEST_TOKEN", "ACTIONS_ID_TOKEN_REQUEST_URL", "UV_NO_CONFIG", "TMPDIR",
-    "AGENT_ENABLED_PLUGINS",
+    "AGENT_ENABLED_PLUGINS", "GITHUB_WORKSPACE", "MLFLOW_TRACKING_URI", "MLFLOW_TRACKING_TOKEN",
+    "REVIEW_TELEMETRY_PROJECT", "REVIEW_TELEMETRY_USERNAME", "REVIEW_TELEMETRY_TOKEN",
 ]
-args = sys.argv[1:]
+write_otel(os.environ)
 record = {
     "argv": args,
     "env": {k: os.environ.get(k) for k in env_keys},
@@ -1567,6 +1632,7 @@ if os.environ.get("FAKE_WRITE") == "1":
     with open(os.path.join(workdir, "out", "ai-review-output.json"), "w", encoding="utf-8") as f:
         f.write("{}")
 """
+)
 
 
 class ReviewTestCase(ScriptTestCase):
@@ -1650,7 +1716,6 @@ class ReviewTestCase(ScriptTestCase):
             self.ai_dir,
             "--image",
             self.IMAGE,
-            "--no-otel",
             "--timeout",
             str((minutes + 5) * 60),
             "--effort",

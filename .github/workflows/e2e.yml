@@ -37,6 +37,11 @@ jobs:
     timeout-minutes: 60
     env:
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      # This repository's runs go to the Red Hat MLflow through the review-telemetry relay. The
+      # upload only warns on failure, so the check below stays on the summary.
+      REVIEW_TELEMETRY_PROJECT: ${{ vars.REVIEW_TELEMETRY_PROJECT }}
+      REVIEW_TELEMETRY_USERNAME: ${{ secrets.REVIEW_TELEMETRY_USERNAME }}
+      REVIEW_TELEMETRY_TOKEN: ${{ secrets.REVIEW_TELEMETRY_TOKEN }}
     steps:
       - name: Check out the action
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -57,6 +62,7 @@ jobs:
         uses: ./
         with:
           recommend_deep_review: 'true'
+          mlflow_experiment_name: ${{ vars.MLFLOW_EXPERIMENT_NAME }}
           org_review_rules: ${{ runner.temp }}/org-rules.yaml
           # The deep job below also runs on Renovate pull requests, after this one. A name no job
           # has keeps this review from standing down for it, so both paths are tested on the
@@ -69,7 +75,9 @@ jobs:
           REPO: ${{ github.repository }}
           PR: ${{ github.event.pull_request.number }}
           SINCE: ${{ steps.start.outputs.time }}
-          EXPECT: ''
+          # The usage line proves the telemetry reached the runner and was totalled. The direct
+          # MLflow export stays off here: MLFLOW_TRACKING_URI is not set.
+          EXPECT: '<sub>Usage:'
         run: .github/e2e-check-summary.sh
 
   deep-review:
@@ -100,6 +108,11 @@ jobs:
     timeout-minutes: 120
     env:
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      # This repository's runs go to the Red Hat MLflow through the review-telemetry relay. The
+      # upload only warns on failure, so the check below stays on the summary.
+      REVIEW_TELEMETRY_PROJECT: ${{ vars.REVIEW_TELEMETRY_PROJECT }}
+      REVIEW_TELEMETRY_USERNAME: ${{ secrets.REVIEW_TELEMETRY_USERNAME }}
+      REVIEW_TELEMETRY_TOKEN: ${{ secrets.REVIEW_TELEMETRY_TOKEN }}
     steps:
       - name: Check out the action
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -114,6 +127,7 @@ jobs:
         uses: ./
         with:
           mode: deep
+          mlflow_experiment_name: ${{ vars.MLFLOW_EXPERIMENT_NAME }}
 
       - name: Check that the deep review was posted
         env:
@@ -121,5 +135,8 @@ jobs:
           REPO: ${{ github.repository }}
           PR: ${{ github.event.pull_request.number }}
           SINCE: ${{ steps.start.outputs.time }}
-          EXPECT: 'Mode: deep'
+          # One expected text per line.
+          EXPECT: |
+            Mode: deep
+            <sub>Usage:
         run: .github/e2e-check-summary.sh

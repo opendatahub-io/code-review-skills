@@ -169,7 +169,7 @@ What each part is for:
 - **The deep job's `if:`.** It skips drafts itself rather than leaving that to the action. In deep mode the action fails on a draft instead of skipping it: a skipped run would end in success, and a later standard review of the same commit would take it for a finished deep review and stand down with nothing posted. A failed deep job, or one skipped by `if:`, never counts, but the `if:` keeps a failed job off the pull request.
 - **The deep job's credentials.** Give the deep job the same model credentials as the standard job. A deep job without one fails with an error rather than skipping with a notice, for the same reason as a draft, so a missing secret shows as a failed job instead of passing silently. The standard review of that push can still stand down while the deep job is starting, so fix the secret and push again.
 - **The deep job's name and label.** The standard review finds the deep job by its display name, which the `deep_review_job` input gives (`deep-review` by default). Keep the job's `name:` and that input equal. The deep review recommendation in the summary tells people to add the label that the `deep_review_label` input names (`deep-review` by default), so keep it equal to the label in the deep job's `if:`.
-- **Timeouts.** A composite action cannot bound itself, so the jobs do: 45 minutes for the standard review (20 agent minutes by default) and 120 for the deep one (75 agent minutes). The rest covers the image pulls, about a minute in practice and at most 15 minutes each, and the checkout. When you raise `timeout_minutes`, raise the job's `timeout-minutes` with it.
+- **Timeouts.** A composite action cannot bound itself, so the jobs do: 45 minutes for the standard review (20 agent minutes by default) and 120 for the deep one (75 agent minutes). The rest covers the image pulls, about a minute in practice and at most 15 minutes each, the checkout, and the usage totals after the agent, a few seconds in practice and at most 5 minutes in the review step. With [MLflow](#mlflow) on, the direct export can take up to 10 minutes more, and the relay upload up to 5 minutes for each of its two files. When you raise `timeout_minutes`, raise the job's `timeout-minutes` with it.
 - **No checkout step.** The action checks out the pull request head itself.
 
 To run only the standard review, drop the `deep-review` job, `labeled` and `recommend_deep_review`, which leaves `types: [opened, synchronize, reopened, ready_for_review]`. To keep the deep review in a workflow file of its own, give that file the deep job and `types: [labeled, synchronize, reopened, ready_for_review]`, and drop `labeled` and the `if:` from the standard one. Run one standard and at most one deep copy of the action per pull request: two of the same kind fight over the same comments.
@@ -229,6 +229,7 @@ The steps that run on the runner always use the action's own copy: `review.py` p
 | `app_private_key` | -- | Private key of that App. Pass it from a secret. |
 | `github_token` | -- | A token to post with instead, such as one you minted or a fine-grained personal access token (see [Posting identity](#posting-identity)). |
 | `bot_login` | -- | The login `github_token` posts as: `<app-slug>[bot]` for an App token, or the user's login for a personal access token. Read only with `github_token`. A value that is neither fails the job before the review runs. |
+| `mlflow_experiment_name` | -- | The MLflow experiment this repository's reviews go to: through the Red Hat review-telemetry relay with `REVIEW_TELEMETRY_PROJECT`, `REVIEW_TELEMETRY_USERNAME` and `REVIEW_TELEMETRY_TOKEN` in the job's `env:`, or directly with `MLFLOW_TRACKING_URI` there, or both (see [MLflow](#mlflow)). Empty sends nothing. |
 
 `org_review_rules` carries org-wide policy, so the caller's workflow does the authenticated fetch and passes the path of the fetched file: the action needs no token or App installation on the rules repository, and the content never travels through a step environment, which the runner prints into viewable logs. A step can fetch it with `timeout 30 gh api --hostname github.com -H "Accept: application/vnd.github.raw" "repos/opendatahub-io/security-config/contents/configs/.coderabbit.yaml?ref=main" > "$RUNNER_TEMP/org-rules.yaml"`, publish the path as a step output only after a successful fetch, and pass `steps.<id>.outputs.path` to the input, which fixes the rules revision in the caller (the central workflow example in [docs/github-app.md](docs/github-app.md) does exactly that, and warns instead of publishing an over-cap path). A fetch step that warns and continues must leave the input empty: the path is absolute and resolves outside the workspace (the PR checkout lives there), the file must be a regular file of at most 100 KiB, and anything else fails the prepare step with a clear error. Fork pull requests are skipped before any review runs, so they post nothing at all; a same-repository review whose fetch warned, or whose harness does not apply the rules, still posts without them.
 
@@ -238,7 +239,7 @@ The steps that run on the runner always use the action's own copy: `review.py` p
 
 - Requirements: docker with privileged containers, as on GitHub-hosted Ubuntu runners. The image (about 300 MB) and the sandbox image (about 700 to 900 MB) are pulled before the agent starts, each under its own 15 minute limit, so neither counts against `timeout_minutes`.
 - Pinning: the image runs as root with the model credentials, and a tag can be moved to another image. To freeze it, set `agentic_ci_version` to the tag and its digest, `<tag>@sha256:<digest>`: the action then pulls and runs `quay.io/aipcc/agentic-ci/openshell:<tag>@sha256:<digest>`, for the agent and for the cleanup alike. Pin the sandbox image with the `image` input too.
-- Only `.ai-review` is mounted, at its own path, with a docker volume of the run for the nested image storage: never `RUNNER_TEMP`, the checkout or the docker socket. The container gets the harness credentials as `-e NAME`, and never `GITHUB_TOKEN`, `GH_TOKEN` or the OIDC variables.
+- Only `.ai-review` is mounted, at its own path, with a docker volume of the run for the nested image storage: never `RUNNER_TEMP`, the checkout or the docker socket. The container gets the harness credentials as `-e NAME`, and never `GITHUB_TOKEN`, `GH_TOKEN`, the OIDC variables, the MLflow endpoint and token or the relay's deploy token. Its agentic-ci copies the telemetry log to `.ai-review/telemetry`, which the review step then copies to the runner (see [Usage and cost](#usage-and-cost)).
 - agentic-ci's `--timeout` does not bound an OpenShell run, so `timeout_minutes` is enforced from outside: the agent gets SIGINT, then SIGKILL 60 seconds later.
 - The download back into `.ai-review` leaves files owned by root, so a short container gives them back to the runner user after every run. The cleanup step removes the run's labelled containers and volume, also after a cancelled run.
 - Each run gets a fresh docker volume for the nested image storage, on purpose: concurrent jobs on one runner never share a nested Podman store. So every run pulls the sandbox, supervisor and runtime images again, and the cleanup step deletes them.
@@ -379,6 +380,67 @@ The line names the label that `deep_review_label` gives, `deep-review` by defaul
 ### Reviewer suggestions
 
 With `suggest_reviewers: 'true'`, a standard review that posted then comments once on the pull request with up to five reviewers, @mentioned so they are notified. They are the most frequent authors in the base branch's history of the files the pull request changes, leaving out the pull request's author, bots and accounts not linked to a GitHub user. A review that stands down or finds that the pull request moved to a newer commit posts nothing, so it suggests nobody either. A run that finds that comment already posted adds none, so each pull request gets one. A suggestion that fails only warns and never fails the step. It reads the history through the GraphQL API, which needs `contents: read`.
+
+### Usage and cost
+
+Every review that posts adds one line under the summary's footer, with no setup:
+
+```text
+<sub>Usage: 1,234,567 input (85% cached) • 12,345 output • est. $1.23</sub>
+```
+
+The input count includes the cached prompt tokens, and the line covers every model call of the run, the deep review's subagents included. agentic-ci collects the agent's OpenTelemetry data, and the review step totals it with the same agentic-ci release, through `uvx` with no credential or token in its environment, and its price map. The cost is `unavailable` when a model has no known price. The job log of the review step shows the totals too, with the cache reads and writes apart.
+
+The totals and the [direct MLflow export](#direct-export-to-your-own-mlflow) run `agentic-ci==<version>` from PyPI through `uvx`, with both backends: the runner needs PyPI access, on `backend: openshell` too. With a digest pin (`<tag>@sha256:<digest>`) they use that tag's PyPI release, and a tag that is not on PyPI gives no usage line, with a warning.
+
+The telemetry log comes from where the agent could write, so the review step copies it to the runner only when it is a regular file of at most 64 MiB, and reads only numbers from it. A missing or refused log, or totals that cannot be made, leave the line out with a notice or a warning that names the reason: usage never fails the review. A review that stands down posts nothing, so it shows no usage either.
+
+agentic-ci starts its telemetry collector before the agent and stops the run when the collector cannot start, so that failure now fails the review step, as it does in the GitLab job.
+
+### MLflow
+
+Each review's traces can also go to MLflow, under the experiment that `mlflow_experiment_name` names. There are two ways, independent of each other, and a repository can use either or both:
+
+- **[Relay to the Red Hat MLflow](#relay-to-the-red-hat-mlflow)**, for Red Hat repositories on GitHub-hosted runners: the Red Hat MLflow is on an internal network that those runners cannot reach, so the action uploads the telemetry to a GitLab package registry, and the review-telemetry relay pushes it from inside.
+- **[Direct export to your own MLflow](#direct-export-to-your-own-mlflow)**, for a repository whose runners can reach its MLflow server.
+
+Both run in their own steps after the post, after a failed review too, whenever the review left a telemetry log, and not after a stand-down, which runs no agent, or after a cancel. Their traces carry a `code-review-usage` span with the job (`ci.job.name`, the job's id from `GITHUB_JOB` and the mode, such as `review-standard`, as in the relay's package version), the mode and the totals, so runs can be grouped. Use one route per MLflow server: the direct export and the relay against the same server push each run twice. A failure in either only warns and never fails the job. Their credentials reach only their own step: the agent never sees them. With `mlflow_experiment_name` set and neither way's variables, the export step warns that the telemetry went nowhere.
+
+#### Relay to the Red Hat MLflow
+
+Ask the relay's maintainers for the project id of the review-telemetry relay, an experiment name it accepts and a deploy token. Keep the project id and the experiment in repository variables and the token in secrets, and give them to the job:
+
+```yaml
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      REVIEW_TELEMETRY_PROJECT: ${{ vars.REVIEW_TELEMETRY_PROJECT }}
+      REVIEW_TELEMETRY_USERNAME: ${{ secrets.REVIEW_TELEMETRY_USERNAME }}
+      REVIEW_TELEMETRY_TOKEN: ${{ secrets.REVIEW_TELEMETRY_TOKEN }}
+    steps:
+      - uses: opendatahub-io/code-review-skills@<full commit sha>
+        with:
+          mlflow_experiment_name: ${{ vars.MLFLOW_EXPERIMENT_NAME }}
+```
+
+The token is a GitLab deploy token with the `write_package_registry` scope on the relay's project. The step uploads two files to that project's generic package `github-review-otel`, version `<run id>.<run attempt>.<job key>-<mode>` (for example `123.1.review-standard`), so a standard and a deep review that a reusable workflow runs under the same job key in one run never overwrite each other. Two runs with the same job key and mode in one run attempt, such as the jobs of a matrix or one reusable workflow called twice in the same mode, share a version, and the relay keeps only the newest upload, so give such jobs distinct job keys. It uploads the telemetry log, then a `meta.json` that names the repository, the run, the job, the mode, the experiment and the agentic-ci release. The relay then pushes the traces to the Red Hat MLflow. The host (gitlab.com), the package and the file format are fixed in the action, and `REVIEW_TELEMETRY_PROJECT` must be a numeric project id, so the token only ever goes to a gitlab.com project. It reaches `curl` on its standard input, never on a command line or in the log. A run whose job key with its mode (at most 100 letters, digits, `_` or `-`) or attempt does not fit the relay's format, or whose log is over 64 MiB, warns and uploads nothing. With only some of `REVIEW_TELEMETRY_PROJECT`, `REVIEW_TELEMETRY_USERNAME`, `REVIEW_TELEMETRY_TOKEN` and `mlflow_experiment_name` set, the step warns once, naming what is missing, and uploads nothing. Each upload has a 5 minute limit.
+
+#### Direct export to your own MLflow
+
+Set `mlflow_experiment_name` to an experiment on your server and give the job `MLFLOW_TRACKING_URI`, plus `MLFLOW_TRACKING_TOKEN` when the server needs a bearer token, from secrets like the model key:
+
+```yaml
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
+      # Optional.
+      MLFLOW_TRACKING_TOKEN: ${{ secrets.MLFLOW_TRACKING_TOKEN }}
+    steps:
+      - uses: opendatahub-io/code-review-skills@<full commit sha>
+        with:
+          mlflow_experiment_name: my-reviews
+```
+
+The step runs `agentic-ci mlflow-push` with the `agentic_ci_version` release. The experiment must exist on the server. agentic-ci exits 0 even when the experiment lookup fails, the experiment does not exist or only some payloads were pushed, so the step reads its output: only a push of every payload counts, and anything else is one warning that names the reason. With `MLFLOW_TRACKING_URI` but no `mlflow_experiment_name`, the step warns and exports nothing. The endpoint must be reachable from the runner, so an MLflow server on an internal network needs a self-hosted runner that can reach it, or the relay.
 
 ### What the agent sees
 

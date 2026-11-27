@@ -56,6 +56,7 @@ Usage:
   review.py post review.json --platform github [--deep-recommendation-plan PATH]
                                [--mode standard|deep] [--deep-job NAME]
                                [--deep-label=LABEL] [--posted-flag PATH]
+                               [--usage-file PATH]
   review.py stand-down --platform github --mode standard|deep [--deep-job NAME]
   review.py display review.json [--chill|--no-chill] [--inline-fixes|--no-inline-fixes]
   review.py suggest-reviewers [--verbose]
@@ -71,6 +72,7 @@ from __future__ import annotations
 import argparse
 import html
 import json
+import math
 import os
 import re
 import shutil
@@ -998,6 +1000,12 @@ _MENTION_RE = re.compile(r"(?<![A-Za-z0-9])(@|&#0*64;|&#[xX]0*40;|&commat;)(?=[A
 # The deep-review recommendation reads panel.py triage output. Paths come from the
 # pull request, so each is bounded and the number of categories shown is capped.
 _PLAN_MAX_BYTES = 1024 * 1024
+# The usage file the action writes from the run's telemetry: four token counts and a cost.
+_USAGE_MAX_BYTES = 4096
+_USAGE_TOKEN_KEYS = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens")
+# Bounds that no real run reaches, so a value past them is not a count.
+_USAGE_MAX_TOKENS = 10**15
+_USAGE_MAX_COST = 10**9
 # DOTALL: a path may hold a newline, and its category still comes last.
 _EVIDENCE_RE = re.compile(r"^(.*?) \(([^()]*)\)$", re.DOTALL)
 _EVIDENCE_MORE_RE = re.compile(r"^and (\d{1,9}) more$")
@@ -1928,44 +1936,92 @@ def _github_reason_summary(evidence: list[str]) -> str:
     return "; ".join(parts)
 
 
-def _github_read_plan(path: str) -> dict[str, Any] | None:
-    """Read a triage plan file, or warn and return None when it is unusable."""
+def _github_read_json_file(path: str, max_bytes: int, size_text: str) -> tuple[Any, str | None]:
+    """Read a small JSON file the action wrote, without following a link.
+
+    Returns ``(value, None)``, or ``(None, reason)`` with why the file cannot be used.
+    """
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     try:
         fd = os.open(path, flags)
     except OSError as e:
-        reason = "does not exist" if isinstance(e, FileNotFoundError) else "is unreadable"
-        _github_annotation("warning", f"No deep-review recommendation: the triage plan {reason}")
-        return None
+        return None, "does not exist" if isinstance(e, FileNotFoundError) else "is unreadable"
     try:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode):
-            reason = "is not a regular file"
-        elif info.st_size > _PLAN_MAX_BYTES:
-            reason = "is larger than 1 MiB"
-        else:
-            with os.fdopen(fd, "rb") as f:
-                fd = -1
-                raw = f.read(_PLAN_MAX_BYTES + 1)
-            if len(raw) > _PLAN_MAX_BYTES:
-                reason = "is larger than 1 MiB"
-            else:
-                try:
-                    # json.loads would also take UTF-16 and UTF-32 bytes; panel.py writes UTF-8.
-                    # utf-8-sig still accepts a UTF-8 plan that starts with a BOM.
-                    plan = json.loads(raw.decode("utf-8-sig"))
-                except (ValueError, RecursionError):
-                    reason = "is not valid JSON"
-                else:
-                    if isinstance(plan, dict):
-                        return plan
-                    reason = "is not a JSON object"
+            return None, "is not a regular file"
+        if info.st_size > max_bytes:
+            return None, f"is larger than {size_text}"
+        with os.fdopen(fd, "rb") as f:
+            fd = -1
+            raw = f.read(max_bytes + 1)
+        if len(raw) > max_bytes:
+            return None, f"is larger than {size_text}"
+        try:
+            # json.loads would also take UTF-16 and UTF-32 bytes; the action writes UTF-8.
+            # utf-8-sig still accepts a UTF-8 file that starts with a BOM.
+            return json.loads(raw.decode("utf-8-sig")), None
+        except (ValueError, RecursionError):
+            return None, "is not valid JSON"
     except OSError:
-        reason = "is unreadable"
+        return None, "is unreadable"
     finally:
         if fd >= 0:
             os.close(fd)
+
+
+def _github_read_plan(path: str) -> dict[str, Any] | None:
+    """Read a triage plan file, or warn and return None when it is unusable."""
+    plan, reason = _github_read_json_file(path, _PLAN_MAX_BYTES, "1 MiB")
+    if reason is None:
+        if isinstance(plan, dict):
+            return plan
+        reason = "is not a JSON object"
     _github_annotation("warning", f"No deep-review recommendation: the triage plan {reason}")
+    return None
+
+
+def _usage_count(value: Any, limit: float) -> float | None:
+    """A finite number from 0 to ``limit``, or None. Booleans are not counts."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    # NaN and the infinities parse from JSON; a huge int does not fit math.isfinite.
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value if 0 <= value <= limit else None
+
+
+def _format_usage_line(
+    input_tokens: int, output_tokens: int, cache_read: int, cache_write: int, cost: float | None
+) -> str:
+    """The summary's usage line: every prompt token, the cached share, output and cost."""
+    total_input = input_tokens + cache_read + cache_write
+    cached_pct = round(100 * cache_read / total_input) if total_input else 0
+    cost_text = f"${cost:.2f}" if cost is not None else "unavailable"
+    return (
+        f"<sub>Usage: {total_input:,} input ({cached_pct}% cached)"
+        f" • {output_tokens:,} output • est. {cost_text}</sub>"
+    )
+
+
+def _github_usage_line(path: str) -> str | None:
+    """Build the summary's usage line from the action's usage file, or warn and return None.
+
+    The action computes the file from the run's telemetry, which the agent could write, so
+    every value is checked: whole token counts and a cost or null, nothing else is read.
+    """
+    usage, reason = _github_read_json_file(path, _USAGE_MAX_BYTES, "4 KiB")
+    if reason is None:
+        reason = "has an unexpected shape"
+        if isinstance(usage, dict):
+            counts = [usage.get(key) for key in _USAGE_TOKEN_KEYS]
+            cost = usage.get("estimated_cost_usd")
+            if all(
+                isinstance(c, int) and _usage_count(c, _USAGE_MAX_TOKENS) is not None
+                for c in counts
+            ) and (cost is None or _usage_count(cost, _USAGE_MAX_COST) is not None):
+                return _format_usage_line(*counts, cost)
+    _github_annotation("warning", f"No usage line in the summary: the usage file {reason}")
     return None
 
 
@@ -2115,6 +2171,7 @@ def _github_build_summary_body(
     carried: int = 0,
     recommendation: str | None = None,
     mode: str | None = None,
+    usage_line: str | None = None,
 ) -> str:
     """Build the markdown summary body for the PR comment.
 
@@ -2123,7 +2180,8 @@ def _github_build_summary_body(
     the number of earlier threads still open on code that did not change.
     ``recommendation`` is a line placed directly under the heading. With ``mode``
     ``deep`` the counts are headed as inline comments, since the panel's own summary
-    counts every finding, and the footer names the mode.
+    counts every finding, and the footer names the mode. ``usage_line`` goes on its own line
+    right after the footer, as the GitLab job puts it.
     """
     parts: list[str] = ["## AI Code Review Summary\n"]
     if recommendation:
@@ -2159,6 +2217,8 @@ def _github_build_summary_body(
         "*Generated by [Code Review](https://github.com/opendatahub-io/code-review-skills)"
         f"{run}{_footer_facts()}{' • Mode: deep' if deep else ''}*"
     )
+    if usage_line:
+        footer += f"\n\n{usage_line}"
     # Most severe first, so the cap leaves out the least severe findings.
     ranked = sorted(
         unanchored or [],
@@ -2263,6 +2323,8 @@ def _github_post(args: argparse.Namespace) -> None:
     recommendation = (
         _github_recommendation(plan_path, deep_label) if plan_path is not None else None
     )
+    usage_path = getattr(args, "usage_file", None)
+    usage_line = _github_usage_line(usage_path) if usage_path is not None else None
 
     # A path with a control character is never in a diff, and printing it
     # would let the model start a workflow command in the log.
@@ -2357,7 +2419,7 @@ def _github_post(args: argparse.Namespace) -> None:
         # come back instead of staying dropped as "unchanged code".
         summary_marker = review_marker if not (unanchored or failed) else _make_review_marker()
         summary_body = _github_build_summary_body(
-            data, summary_marker, ctx.run_url, unanchored, carried, recommendation, mode
+            data, summary_marker, ctx.run_url, unanchored, carried, recommendation, mode, usage_line
         )
         # The inline comments are already up; a review that should win replaces them.
         if mode and _github_stands_down(session, ctx, mode, deep_job):
@@ -3058,6 +3120,14 @@ def main() -> None:
             "down or the head moved (needs --platform github)"
         ),
     )
+    post_parser.add_argument(
+        "--usage-file",
+        metavar="PATH",
+        help=(
+            "the action's token usage totals; the summary gets a usage line after its footer "
+            "(needs --platform github)"
+        ),
+    )
     post_parser.add_argument("--verbose", action="store_true", help="Verbose output")
     post_parser.set_defaults(func=cmd_post)
 
@@ -3104,6 +3174,7 @@ def main() -> None:
             ("--deep-job", args.deep_job),
             ("--deep-label", args.deep_label),
             ("--posted-flag", args.posted_flag),
+            ("--usage-file", args.usage_file),
         ):
             if value is not None:
                 post_parser.error(f"{flag} needs --platform github")
