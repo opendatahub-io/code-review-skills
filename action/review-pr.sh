@@ -182,6 +182,8 @@ USAGE_TIMEOUT=5m
 MLFLOW_TIMEOUT=10m
 # The largest CA bundle the export copies into its container, in bytes.
 MAX_CA_BYTES=10485760
+# The proxy variables the tool containers get: the runner's own for the export, empty otherwise.
+TOOL_PROXY_VARS="HTTP_PROXY HTTPS_PROXY NO_PROXY FTP_PROXY ALL_PROXY http_proxy https_proxy no_proxy ftp_proxy all_proxy"
 # The upload contract of the review-telemetry relay (its README's "Upload contract"), which pushes
 # the uploads to the Red Hat MLflow. It is shared with that project: change both together. The
 # host is part of it, so the deploy token only ever goes to gitlab.com; the project id comes from
@@ -401,10 +403,20 @@ run_agentic_ci_tool() {
     fi
     args+=(--user "$(id -u):$(id -g)" -v "$dir:$dir:Z" --workdir "$dir")
     args+=(--entrypoint "$entrypoint")
+    # Podman copies the host's proxy variables into every container unless told not to, and docker
+    # can add the proxies of its client config: every proxy variable is set here instead, to the
+    # runner's own value by name for the export, and to empty everywhere else.
+    [ "$TOOL_ENGINE" != podman ] || args+=(--http-proxy=false)
+    for name in $TOOL_PROXY_VARS; do
+        if [ "$network" = network ] && [ -n "${!name:-}" ]; then
+            args+=(-e "$name")
+        else
+            args+=(-e "$name=")
+        fi
+    done
     if [ "$network" = network ]; then
-        for name in HTTP_PROXY HTTPS_PROXY NO_PROXY http_proxy https_proxy no_proxy; do
-            [ -z "${!name:-}" ] || args+=(-e "$name")
-        done
+        # The host's network, so an MLflow server or proxy on the runner itself is reachable.
+        args+=(--network host)
         for name in REQUESTS_CA_BUNDLE SSL_CERT_FILE; do
             if ca="$(tool_ca_file "$dir" "$name")"; then
                 args+=(-e "$name=$ca")
@@ -543,6 +555,20 @@ with open(sys.argv[1], encoding="utf-8", errors="replace") as lines:
 print(count)' "$1"
 }
 
+# Warn once when the image's agentic-ci, which usage.py reports, is not the agentic_ci_version
+# release: with Podman the agent runs that release from PyPI, but the totals and the export use
+# the runner image, whose release is its own. The usage line is still shown, priced by the
+# image's release.
+#
+# Usage: check_tool_version VERSION OUTPUT
+check_tool_version() {
+    local wanted found
+    wanted="$(agentic_ci_package_version "$1")" || return 0
+    found="$(sed -n 's/^agentic-ci version: \([0-9][0-9A-Za-z.+!-]*\)$/\1/p' -- "$2" | tail -n 1)"
+    [ -n "$found" ] && [ "$found" != "$wanted" ] || return 0
+    warning "The agentic-ci image $TOOL_IMAGE has agentic-ci $found, while agentic_ci_version is $wanted: the usage line was priced, and the MLflow export runs, with agentic-ci $found. Set the image input to the runner image of $wanted to match."
+}
+
 # Copy the agent run's OTEL log to the usage directory and total its tokens and cost into
 # usage.json there, for the summary and the job log. The log comes from where the agent could
 # write, so a link, anything but a regular file or a log over MAX_OTEL_LOG_BYTES is refused, and
@@ -615,6 +641,7 @@ collect_usage() {
         124) warning "The usage totals did not finish within $USAGE_TIMEOUT, $no_line" ;;
         *) warning "Could not total the review's usage (exit $status: $(tool_reason "$output")), $no_line" ;;
     esac
+    check_tool_version "$version" "$output"
     # A partial file from a failed run is not the run's usage. After the timeout, the container is
     # gone by now, so it cannot write the file again.
     [ "$status" -eq 0 ] || rm -f -- "${totals:?}"

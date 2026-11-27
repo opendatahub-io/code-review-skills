@@ -42,6 +42,9 @@ from tests.test_github_action_backends import DIGEST, OpenShellReviewTestCase
 from tests.test_github_action_post_extras import FAKE_REVIEW_PY
 from tests.test_github_review import GitHubTestCase, marker, review, review_data
 
+# Every proxy variable a tool container gets explicitly.
+TOOL_PROXY_VARS = script_constant("TOOL_PROXY_VARS").strip('"').split()
+
 USAGE_PY = REPO_ROOT / "action/usage.py"
 GITLAB_FORMAT_EXAMPLE = "<sub>Usage: 135 input (22% cached) • 20 output • est. $0.01</sub>"
 ROOT_TRACE = "c" * 32
@@ -515,8 +518,26 @@ class UsageCollectionMixin:
             return []
         return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
 
+    def proxy_env(self, runner: dict | None = None) -> list[str]:
+        """Every proxy variable: the runner's by name for the export, else empty."""
+        return [
+            name if runner is not None and runner.get(name) else f"{name}="
+            for name in TOOL_PROXY_VARS
+        ]
+
+    def named_env(self, call: dict) -> list[str]:
+        """The -e entries of a tool run besides the proxy variables."""
+        return [e for e in call["env_names"] if e.split("=", 1)[0] not in TOOL_PROXY_VARS]
+
     def expected_tool_run(
-        self, engine: str, image: str, entrypoint: str, command: list[str], network: bool = False
+        self,
+        engine: str,
+        image: str,
+        entrypoint: str,
+        command: list[str],
+        network: bool = False,
+        runner: dict | None = None,
+        env: tuple[str, ...] = (),
     ) -> list[str]:
         """The container run of a tool: only the usage directory, the runner's user, no pull.
 
@@ -538,8 +559,16 @@ class UsageCollectionMixin:
             "--entrypoint",
             entrypoint,
         ]
-        if not network:
+        if engine == "podman":
+            argv.append("--http-proxy=false")
+        for value in self.proxy_env(runner if network else None):
+            argv += ["-e", value]
+        if network:
+            argv += ["--network", "host"]
+        else:
             argv += ["--network", "none"]
+        for value in env:
+            argv += ["-e", value]
         return argv, image, command
 
     def expected_usage_run(self, engine: str, image: str, mode: str = "standard"):
@@ -609,7 +638,7 @@ class PodmanUsageTests(UsageCollectionMixin, ReviewTestCase):
         for name in TELEMETRY_SECRETS:
             self.assertEqual(env[name], "", name)
         # Nor the usage totals' container, which gets no variable at all.
-        self.assertEqual(self.tool_calls()[0]["env_names"], [])
+        self.assertEqual(self.named_env(self.tool_calls()[0]), [])
 
     def test_the_totals_reach_the_runner_and_the_job_log(self):
         proc = self.review_with_otel()
@@ -653,7 +682,8 @@ class PodmanUsageTests(UsageCollectionMixin, ReviewTestCase):
         )
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         call = self.tool_calls()[0]
-        self.assertEqual(call["env_names"], [])
+        self.assertEqual(self.named_env(call), [])
+        self.assertEqual(call["env_names"], self.proxy_env())
         joined = " ".join(call["argv"])
         for value in ("sk-oai", "sk-ant", "ghs_secret"):
             self.assertNotIn(value, joined)
@@ -694,6 +724,45 @@ class PodmanUsageTests(UsageCollectionMixin, ReviewTestCase):
                 self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
                 self.assertIn(message, proc.stdout)
                 self.assertIsNone(self.usage_written())
+
+    def test_the_hosts_proxies_never_reach_the_totals(self):
+        # Podman would copy them in by default; every proxy variable is set to empty instead.
+        proc = self.review_with_otel(
+            HTTPS_PROXY="http://user:pass@proxy.example:3128", ALL_PROXY="socks5://p.example"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        call = self.tool_calls()[0]
+        self.assertIn("--http-proxy=false", call["argv"])
+        self.assertEqual(call["env_names"], self.proxy_env())
+        self.assertNotIn("proxy.example", " ".join(call["argv"]))
+
+    def test_an_image_of_another_release_warns_once_and_keeps_the_line(self):
+        version_dir = os.path.join(self.tmp, "stub", "agentic_ci-0.5.15.dist-info")
+        write(version_dir, "METADATA", "Metadata-Version: 2.1\nName: agentic-ci\nVersion: 0.5.15\n")
+        proc = self.review_with_otel()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        warnings = [line for line in proc.stdout.splitlines() if line.startswith("::warning::")]
+        self.assertEqual(len(warnings), 1, proc.stdout)
+        self.assertIn(
+            f"has agentic-ci 0.5.15, while agentic_ci_version is {self.VERSION}", warnings[0]
+        )
+        self.assertIn(
+            "the usage line was priced, and the MLflow export runs, with agentic-ci 0.5.15",
+            warnings[0],
+        )
+        self.assertIsNotNone(self.usage_written())
+
+    def test_an_image_of_the_same_release_does_not_warn(self):
+        version_dir = os.path.join(self.tmp, "stub", f"agentic_ci-{self.VERSION}.dist-info")
+        write(
+            version_dir,
+            "METADATA",
+            f"Metadata-Version: 2.1\nName: agentic-ci\nVersion: {self.VERSION}\n",
+        )
+        proc = self.review_with_otel()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertNotIn("::warning::", proc.stdout)
+        self.assertIn(f"agentic-ci version: {self.VERSION}", proc.stdout)
 
     def test_a_timed_out_container_is_removed_before_its_usage_file(self):
         for status in (124, 137):
@@ -778,7 +847,7 @@ class OpenShellUsageTests(UsageCollectionMixin, OpenShellReviewTestCase):
         self.assertEqual(len(calls), 1, calls)
         self.assertEqual(calls[0]["engine"], "docker")
         self.assert_tool_run(calls[0], self.expected_usage_run("docker", self.openshell_image()))
-        self.assertEqual(calls[0]["env_names"], [])
+        self.assertEqual(self.named_env(calls[0]), [])
         self.assertIsNotNone(self.usage_written())
         last = self.timeouts()[-1]
         self.assertEqual(
@@ -786,6 +855,13 @@ class OpenShellUsageTests(UsageCollectionMixin, OpenShellReviewTestCase):
         )
         # No uvx at all with openshell.
         self.assertFalse(os.path.exists(self.log))
+
+    def test_docker_blanks_the_proxies_its_client_config_could_add(self):
+        proc = self.review_with_otel(HTTPS_PROXY="http://user:pass@proxy.example:3128")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        call = self.tool_calls()[0]
+        self.assertNotIn("--http-proxy=false", call["argv"])
+        self.assertEqual(call["env_names"], self.proxy_env())
 
     def test_a_digest_pin_totals_in_the_pinned_image(self):
         self.VERSION = f"{VERIFIED_AGENTIC_CI_VERSION}@{DIGEST}"
@@ -963,19 +1039,18 @@ class ExportTests(UsageCollectionMixin, ScriptTestCase):
                 calls = self.tool_calls()
                 self.assertEqual(len(calls), 1)
                 # The openshell image, with the network, and the MLflow variables by name only.
+                names = ["MLFLOW_TRACKING_URI"] + (["MLFLOW_TRACKING_TOKEN"] if with_token else [])
                 expected = self.expected_tool_run(
                     "docker",
                     f"quay.io/aipcc/agentic-ci/openshell:{VERIFIED_AGENTIC_CI_VERSION}",
                     "agentic-ci",
                     ["mlflow-push", self.log, "--experiment=my-reviews"],
                     network=True,
+                    runner={},
+                    env=tuple(names),
                 )
-                names = ["MLFLOW_TRACKING_URI"] + (["MLFLOW_TRACKING_TOKEN"] if with_token else [])
-                options = list(expected[0])
-                for name in names:
-                    options += ["-e", name]
-                self.assert_tool_run(calls[0], (options, *expected[1:]))
-                self.assertEqual(calls[0]["env_names"], names)
+                self.assert_tool_run(calls[0], expected)
+                self.assertEqual(self.named_env(calls[0]), names)
                 for value in MLFLOW_SECRETS.values():
                     self.assertNotIn(value, " ".join(calls[0]["argv"]))
                 self.assertFalse(self.uvx_mark.exists())
@@ -998,19 +1073,22 @@ class ExportTests(UsageCollectionMixin, ScriptTestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         call = self.tool_calls()[0]
         copy = os.path.join(self.usage_dir, "ca-REQUESTS_CA_BUNDLE.pem")
-        # Proxies by name; the CA bundle as a copy in the mounted directory, the variable set to
-        # it; a missing file is not passed.
-        self.assertEqual(
-            call["env_names"],
-            [
-                "HTTPS_PROXY",
-                "NO_PROXY",
-                "https_proxy",
-                f"REQUESTS_CA_BUNDLE={copy}",
-                "MLFLOW_TRACKING_URI",
-                "MLFLOW_TRACKING_TOKEN",
-            ],
+        # The runner's proxies by name and the others blanked; the CA bundle as a copy in the
+        # mounted directory, the variable set to it; a missing file is not passed.
+        self.assert_tool_run(
+            call,
+            self.expected_tool_run(
+                "docker",
+                f"quay.io/aipcc/agentic-ci/openshell:{VERIFIED_AGENTIC_CI_VERSION}",
+                "agentic-ci",
+                ["mlflow-push", self.log, "--experiment=my-reviews"],
+                network=True,
+                runner=proxies,
+                env=(f"REQUESTS_CA_BUNDLE={copy}", "MLFLOW_TRACKING_URI", "MLFLOW_TRACKING_TOKEN"),
+            ),
         )
+        self.assertIn("HTTPS_PROXY", call["env_names"])
+        self.assertIn("HTTP_PROXY=", call["env_names"])
         self.assertEqual(Path(copy).read_text(encoding="utf-8"), Path(ca).read_text("utf-8"))
         mounts = [call["argv"][i + 1] for i, a in enumerate(call["argv"]) if a == "-v"]
         self.assertEqual(mounts, [f"{self.usage_dir}:{self.usage_dir}:Z"])
@@ -1023,7 +1101,7 @@ class ExportTests(UsageCollectionMixin, ScriptTestCase):
         proc = self.export("my-reviews", REQUESTS_CA_BUNDLE=ca, **MLFLOW_SECRETS)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual(
-            self.tool_calls()[0]["env_names"], ["MLFLOW_TRACKING_URI", "MLFLOW_TRACKING_TOKEN"]
+            self.named_env(self.tool_calls()[0]), ["MLFLOW_TRACKING_URI", "MLFLOW_TRACKING_TOKEN"]
         )
 
     def test_a_timed_out_push_removes_its_container(self):
@@ -1067,7 +1145,18 @@ class ExportTests(UsageCollectionMixin, ScriptTestCase):
                 self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
                 call = self.tool_calls()[0]
                 self.assertEqual((call["engine"], call["image"]), ("podman", expected))
-                self.assertNotIn("--network", call["argv"])
+                self.assert_tool_run(
+                    call,
+                    self.expected_tool_run(
+                        "podman",
+                        expected,
+                        "agentic-ci",
+                        ["mlflow-push", self.log, "--experiment=my-reviews"],
+                        network=True,
+                        runner={},
+                        env=("MLFLOW_TRACKING_URI", "MLFLOW_TRACKING_TOKEN"),
+                    ),
+                )
                 self.assertFalse(self.uvx_mark.exists())
 
     def test_no_image_to_export_with_only_warns(self):

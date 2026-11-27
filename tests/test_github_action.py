@@ -854,6 +854,9 @@ def script_env(**overrides: str) -> dict[str, str]:
                 ("ANTHROPIC_", "CLAUDE_CODE_", "AI_REVIEW_", "AGENT_", "OPENAI_", "GCLOUD_", "GCP_")
             )
             or key in ("GH_TOKEN", "UV_NO_CONFIG", "UV_PYTHON")
+            # The proxies and CA bundles of the machine running the tests reach the export.
+            or key.lower().endswith("_proxy")
+            or key in ("REQUESTS_CA_BUNDLE", "SSL_CERT_FILE")
             or key in SCRIPT_CREDENTIAL_VARS
         ):
             del env[key]
