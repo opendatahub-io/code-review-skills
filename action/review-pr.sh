@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Steps of the GitHub Action in ../action.yml, kept here so shellcheck covers them.
 #
-# Usage: review-pr.sh {check|prepare|standdown|review|post|cleanup}
+# Usage: review-pr.sh {check|prepare|standdown|review|post|export|relay|cleanup}
 #
 # The agent step holds no write token. By default (backend openshell) the openshell image runs
 # as a privileged docker container, and agentic-ci inside it runs the agent in an OpenShell
@@ -13,6 +13,10 @@
 # The standdown step also holds the token, only to read the Actions API: it skips the review when
 # a review that should win makes it redundant (a deep review of the same head for a standard
 # review, a newer head for a deep review). The post step checks again before it writes.
+# agentic-ci collects the agent's OpenTelemetry data. The review step copies the log to the runner
+# and totals its tokens and cost with the same agentic-ci release, the post step adds that usage
+# line to the summary, the export step pushes the log to the caller's MLflow when asked, and the
+# relay step uploads it to the review-telemetry relay, which pushes it to the Red Hat MLflow.
 #
 # Environment (set by action.yml):
 #   AI_REVIEW_EVENT               github.event_name (check)
@@ -21,7 +25,7 @@
 #   AI_REVIEW_TRIGGERING_ACTOR    github.triggering_actor (check)
 #   AI_REVIEW_HARNESS             harness input (check, review, post)
 #   AI_REVIEW_MODE                mode input: standard or deep (check, prepare, standdown,
-#                                 review, post)
+#                                 review, post, relay)
 #   AI_REVIEW_DEEP_JOB            deep_review_job input (standdown, post)
 #   AI_REVIEW_DEEP_LABEL          deep_review_label input (check, post)
 #   AI_REVIEW_RECOMMEND_DEEP      recommend_deep_review input (check, prepare, post)
@@ -39,16 +43,26 @@
 #                                 file (prepare)
 #   AI_REVIEW_MODEL               model input (review)
 #   AI_REVIEW_TIMEOUT_MINUTES     timeout_minutes input (review)
-#   AI_REVIEW_AGENTIC_CI_VERSION  agentic_ci_version input (review, cleanup): a PyPI version for
-#                                 podman, an openshell image tag, optionally <tag>@sha256:<digest>,
-#                                 for openshell
+#   AI_REVIEW_AGENTIC_CI_VERSION  agentic_ci_version input (review, export, relay, cleanup): a PyPI
+#                                 version for podman, an openshell image tag, optionally
+#                                 <tag>@sha256:<digest>, for openshell
 #   AI_REVIEW_IMAGE               image input (review)
+#   AI_REVIEW_MLFLOW_EXPERIMENT   mlflow_experiment_name input (export, relay)
+#   MLFLOW_TRACKING_URI, MLFLOW_TRACKING_TOKEN
+#                                 the MLflow endpoint and its optional token, from the job
+#                                 environment (export only: the review step blanks them)
+#   REVIEW_TELEMETRY_PROJECT, REVIEW_TELEMETRY_USERNAME, REVIEW_TELEMETRY_TOKEN
+#                                 the relay's GitLab project id and deploy token, from the job
+#                                 environment (relay only; export reads only whether they are
+#                                 set; the review step blanks them)
 #   GITHUB_OUTPUT, GITHUB_REPOSITORY, GITHUB_WORKSPACE, GITHUB_ACTION_PATH, GITHUB_RUN_ID,
-#   GITHUB_RUN_ATTEMPT:           set by the runner
+#   GITHUB_RUN_ATTEMPT, GITHUB_JOB: set by the runner (GITHUB_REPOSITORY, the run id and attempt
+#                                 and the job also name the relay's package)
 #   RUNNER_TEMP                   set by the runner (review: parent of the agent's private TMPDIR,
 #                                 post: parent of the copy of the output and of the flag that the
 #                                 summary was posted, prepare and post: parent of the triage plan,
-#                                 standdown: its working directory)
+#                                 review, post, export and relay: parent of the usage
+#                                 directory, standdown, export and relay: their working directory)
 #   GITHUB_TOKEN                  github.token (standdown); the github_token input, else a
 #                                 minted App token, else github.token (post); no other step
 #                                 gets one
@@ -67,13 +81,21 @@
 #   org-rules.yaml                the org review rules, in both modes
 #   plugin/                       a copy of this action, loaded with --plugin-dir
 #   out/                          the only place the review writes
+#   telemetry/                    where the openshell container's agentic-ci copies its OTEL log
 #
 # The triage plan of the deep-review recommendation is $RUNNER_TEMP/ai-review-triage/plan.json,
 # outside the mount, written by prepare before any agent runs and read only by post.
 #
+# The usage directory is $RUNNER_TEMP/ai-review-usage (mode 700), outside the mount: the review
+# step copies the OTEL log there once the agent has stopped and writes usage.json next to it, the
+# post step passes usage.json to review.py, the export step pushes the log copy to MLflow, and the
+# relay step writes meta.json there and uploads both.
+# With podman, agentic-ci copies the log into a private $RUNNER_TEMP/ai-review-otel.* directory
+# instead of the checkout, and the review step removes it.
+#
 # prepare and post run in .ai-review-head. standdown runs in RUNNER_TEMP, before the checkout
-# exists. review runs in .ai-review, not in a checkout, so uvx does not read a uv config that
-# arrives with the PR. check and cleanup run anywhere.
+# exists, and export and relay run there too. review runs in .ai-review, not in a checkout, so uvx does not
+# read a uv config that arrives with the PR. check and cleanup run anywhere.
 
 set -euo pipefail
 
@@ -133,6 +155,7 @@ MAX_OUTPUT_BYTES=1048576
 # is about 63 KB; a bigger input means the caller pointed org_review_rules at the wrong file.
 MAX_RULES_BYTES=102400
 REVIEW_PY_REL="skills/gitlab-code-review/scripts/review.py"
+USAGE_PY_REL="action/usage.py"
 PANEL_PY_REL="skills/code-review-panel/scripts/panel.py"
 # The directory under RUNNER_TEMP that holds the triage plan, and the plan's largest size in bytes,
 # which is also what review.py reads.
@@ -140,6 +163,36 @@ TRIAGE_DIR_NAME="ai-review-triage"
 MAX_PLAN_BYTES=1048576
 # The wall-clock limit of the triage, which reads only git metadata and the diff.
 TRIAGE_TIMEOUT=60s
+# The OTEL log agentic-ci copies out of its run directory, under agentic-ci's own file name, and
+# the directory of the mount that the openshell container's agentic-ci copies it to: not out/,
+# whose one file the post step reads as the review.
+OTEL_LOG_NAME="claude-otel.jsonl"
+TELEMETRY_DIR="$AI_DIR/telemetry"
+# The directory under RUNNER_TEMP that holds the runner's copy of the OTEL log and usage.json.
+USAGE_DIR_NAME="ai-review-usage"
+# The largest OTEL log the action reads, in bytes: 64 of the collector's largest exports (1 MiB
+# each). That leaves room for a long deep review, while it bounds the copy and the memory the
+# usage totals take on the runner, since the log comes from where the agent could write.
+MAX_OTEL_LOG_BYTES=67108864
+# The exit status of usage.py when the log holds no token data.
+NO_USAGE_EXIT=3
+# The wall-clock limits of the usage totals and of the MLflow export. Both can first fetch
+# agentic-ci into uv's cache, and the export makes one request per trace payload.
+USAGE_TIMEOUT=5m
+MLFLOW_TIMEOUT=10m
+# The upload contract of the review-telemetry relay (its README's "Upload contract"), which pushes
+# the uploads to the Red Hat MLflow. It is shared with that project: change both together. The
+# host is part of it, so the deploy token only ever goes to gitlab.com; the project id comes from
+# REVIEW_TELEMETRY_PROJECT, which the relay's maintainers give out with the token.
+RELAY_API="https://gitlab.com/api/v4"
+RELAY_PACKAGE="github-review-otel"
+RELAY_META_NAME="meta.json"
+# The relay's RELAY_MAX_BYTES default and its meta.json limit, in bytes.
+RELAY_MAX_LOG_BYTES=67108864
+RELAY_MAX_META_BYTES=65536
+# The wall-clock limit of each upload, in seconds, and of connecting.
+RELAY_MAX_TIME=300
+RELAY_CONNECT_TIMEOUT=30
 # The deep_review_job input's default, which review.py also uses.
 DEFAULT_DEEP_JOB="deep-review"
 # The deep_review_label input's default, which review.py also uses.
@@ -148,6 +201,10 @@ DEFAULT_DEEP_LABEL="deep-review"
 STANDDOWN_EXIT=10
 # The private TMPDIR of the review step, which the EXIT trap removes.
 REVIEW_TMP=""
+# The private directory agentic-ci copies its OTEL log to with podman, which the EXIT trap removes.
+OTEL_TMP=""
+# Where the agent run's OTEL log lands, set by the backend's run function.
+AGENT_OTEL_LOG=""
 # The scratch directory of the prepare step's git calls, which the EXIT trap removes.
 PREPARE_TMP=""
 # standard or deep, set by require_mode.
@@ -260,6 +317,244 @@ triage_dir() {
         /?*) echo "$RUNNER_TEMP/$TRIAGE_DIR_NAME" ;;
         *) return 1 ;;
     esac
+}
+
+# The usage directory. Fails when RUNNER_TEMP is not an absolute path, like triage_dir.
+usage_dir() {
+    case "${RUNNER_TEMP:-}" in
+        /?*) echo "$RUNNER_TEMP/$USAGE_DIR_NAME" ;;
+        *) return 1 ;;
+    esac
+}
+
+# The agentic-ci package version for an agentic_ci_version: an openshell tag pinned to a digest
+# is that tag's release. Fails on anything that is not a package version.
+agentic_ci_package_version() {
+    local LC_ALL=C version="${1%%@*}"
+    [[ "$version" =~ ^[0-9][0-9A-Za-z.+!-]*$ ]] || return 1
+    echo "$version"
+}
+
+# Run an agentic-ci command, or python with agentic-ci importable, from PyPI through uvx: the
+# release that ran the agent, so the totals and the price map are the agent run's, and one way
+# for both backends (the openshell image does not mount RUNNER_TEMP). The environment is cut
+# down to what uv needs to find its cache, a Python and the index, plus the names given: no model
+# credential, GitHub token or agentic-ci setting reaches it, and no secret is on a command line.
+# It runs in DIR, which the action owns, so no uv config or .python-version of the PR steers it.
+#
+# Usage: run_agentic_ci_tool DIR "EXTRA_NAMES" VERSION LIMIT COMMAND ARGS...
+run_agentic_ci_tool() {
+    local dir="$1" extra=" $2 " version="$3" limit="$4" var
+    shift 4
+    (
+        for var in $(compgen -e); do
+            case "$var" in
+                PATH | HOME | LANG | LC_ALL | TZ | XDG_CACHE_HOME | XDG_DATA_HOME | UV_* \
+                    | HTTP_PROXY | HTTPS_PROXY | NO_PROXY | http_proxy | https_proxy | no_proxy \
+                    | SSL_CERT_FILE | SSL_CERT_DIR | REQUESTS_CA_BUNDLE) ;;
+                *)
+                    case "$extra" in
+                        *" $var "*) ;;
+                        *) unset "$var" 2>/dev/null || true ;;
+                    esac
+                    ;;
+            esac
+        done
+        # Local to this subshell on purpose.
+        # shellcheck disable=SC2030
+        export UV_NO_CONFIG=1
+        cd -- "$dir" || exit 1
+        exec timeout "$limit" uvx --from "agentic-ci==$version" "$@" </dev/null
+    )
+}
+
+# A URL path as requests sends and prints it: every byte outside the characters it leaves alone
+# as %XX, so a space shows as %20.
+percent_encode_path() {
+    local LC_ALL=C text="$1" out="" c i
+    local safe="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~/!\$&'()*+,;=:@%"
+    for ((i = 0; i < ${#text}; i++)); do
+        c="${text:i:1}"
+        if [[ "$safe" == *"$c"* ]]; then
+            out+="$c"
+        else
+            out+="$(printf '%%%02X' "'$c")"
+        fi
+    done
+    printf '%s\n' "$out"
+}
+
+# The values a tool's output must not show, longest first: the MLflow endpoint, its token, the
+# relay's deploy token and its user name, and the endpoint's host and path, which HTTP errors
+# print apart from the URL. urllib3 prints the host in lower case and requests the path
+# percent-encoded, so those forms are masked too. Sets MLFLOW_SECRETS.
+MLFLOW_SECRETS=()
+collect_mlflow_secrets() {
+    local uri="${MLFLOW_TRACKING_URI:-}" rest host path encoded
+    MLFLOW_SECRETS=()
+    [ -z "$uri" ] || MLFLOW_SECRETS+=("$uri")
+    [ -z "${MLFLOW_TRACKING_TOKEN:-}" ] || MLFLOW_SECRETS+=("$MLFLOW_TRACKING_TOKEN")
+    [ -z "${REVIEW_TELEMETRY_TOKEN:-}" ] || MLFLOW_SECRETS+=("$REVIEW_TELEMETRY_TOKEN")
+    [ -z "${REVIEW_TELEMETRY_USERNAME:-}" ] || MLFLOW_SECRETS+=("$REVIEW_TELEMETRY_USERNAME")
+    [ -n "$uri" ] || return 0
+    rest="${uri#*://}"
+    host="${rest%%[/?#]*}"
+    host="${host#*@}"
+    host="${host%%:*}"
+    if [ -n "$host" ]; then
+        MLFLOW_SECRETS+=("$host")
+        [ "${host,,}" = "$host" ] || MLFLOW_SECRETS+=("${host,,}")
+    fi
+    case "$rest" in
+        */?*)
+            path="/${rest#*/}"
+            path="${path%%[?#]*}"
+            path="${path%/}"
+            if [ -n "${path#/}" ]; then
+                MLFLOW_SECRETS+=("$path")
+                encoded="$(percent_encode_path "$path")"
+                [ "$encoded" = "$path" ] || MLFLOW_SECRETS+=("$encoded")
+            fi
+            ;;
+    esac
+}
+
+# A line with every MLflow value collect_mlflow_secrets found replaced by ***.
+mask_mlflow() {
+    local line="$1" secret
+    for secret in ${MLFLOW_SECRETS[@]+"${MLFLOW_SECRETS[@]}"}; do
+        line="${line//"$secret"/***}"
+    done
+    printf '%s\n' "$line"
+}
+
+# Print a tool's captured output to the job log with the MLflow values masked and workflow
+# commands off, since it can quote what a server or the telemetry said, then turn them back on.
+print_tool_output() {
+    [ -s "$1" ] || return 0
+    local token line
+    token="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+    collect_mlflow_secrets
+    echo "::stop-commands::$token"
+    # The last line can lack its newline; read still returns it.
+    while IFS= read -r line || [ -n "$line" ]; do
+        mask_mlflow "$line"
+    done <"$1"
+    echo "::$token::"
+}
+
+# A short reason from a tool's captured output for a warning: its last non-empty lines on one
+# line, without control characters and with anything secret-looking masked. The MLflow endpoint,
+# its host and path and the token never appear, whether or not GitHub masks them.
+tool_reason() {
+    local line reason=""
+    collect_mlflow_secrets
+    while IFS= read -r line; do
+        line="${line//[[:cntrl:]]/ }"
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        reason+="${reason:+ | }$(mask_mlflow "$line")"
+    done < <(grep -v '^[[:space:]]*$' -- "$1" 2>/dev/null | tail -n 3)
+    # Credentials in a header or a URL, and long opaque strings that look like keys.
+    reason="$(sed -E 's#(Bearer|Basic|[Tt]oken|[Kk]ey|[Pp]assword)([=: ]+)[^ |]+#\1\2***#g; s#://[^/@ ]*@#://***@#g; s#[A-Za-z0-9_+/=-]{32,}#***#g' <<<"$reason")"
+    # % would start an escape in the workflow command.
+    reason="${reason//%/%25}"
+    echo "${reason:0:400}"
+}
+
+# The number of records agentic-ci mlflow-push sends from a log, selected as it selects them:
+# JSON lines whose path contains /v1/traces and whose payload is not empty. Fails when the log
+# cannot be read.
+count_trace_records() {
+    env -i "PATH=$PATH" python3 -I -c 'import json, sys
+count = 0
+with open(sys.argv[1], encoding="utf-8", errors="replace") as lines:
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except (ValueError, RecursionError):
+            continue
+        if not isinstance(record, dict):
+            continue
+        path = record.get("path", "")
+        if isinstance(path, str) and "/v1/traces" in path and record.get("payload"):
+            count += 1
+print(count)' "$1"
+}
+
+# Copy the agent run's OTEL log to the usage directory and total its tokens and cost into
+# usage.json there, for the summary and the job log. The log comes from where the agent could
+# write, so a link, anything but a regular file or a log over MAX_OTEL_LOG_BYTES is refused, and
+# usage.py reads only numbers from it. Usage only informs, so this never fails the step: a missing
+# or refused log, or totals that cannot be made, mean no usage line.
+#
+# Usage: collect_usage VERSION LOG
+collect_usage() {
+    local version="$1" log="$2" dir parent size status=0 package
+    local no_line="so the summary will not show the review's token usage."
+    if ! dir="$(usage_dir)"; then
+        warning "RUNNER_TEMP is not set, $no_line"
+        return 0
+    fi
+    if [ -z "$log" ]; then
+        notice "agentic-ci left no telemetry log, $no_line"
+        return 0
+    fi
+    parent="${log%/*}"
+    if [ -L "$parent" ] || [ -L "$log" ]; then
+        warning "The telemetry log or its directory is a symlink, $no_line"
+        return 0
+    fi
+    if [ ! -e "$log" ]; then
+        notice "agentic-ci left no telemetry log, $no_line"
+        return 0
+    fi
+    if [ ! -f "$log" ]; then
+        warning "The telemetry log is not a regular file, $no_line"
+        return 0
+    fi
+    size="$(wc -c <"$log")" || size=-1
+    if [ "$size" -lt 0 ] || [ "$size" -gt "$MAX_OTEL_LOG_BYTES" ]; then
+        warning "The telemetry log is over $MAX_OTEL_LOG_BYTES bytes or unreadable, $no_line"
+        return 0
+    fi
+    local copy="${dir:?}/$OTEL_LOG_NAME" totals="${dir:?}/usage.json"
+    # head keeps one byte past the limit, so a log that grew since the check shows as too big.
+    if ! { mkdir -m 700 -- "$dir" && head -c "$((MAX_OTEL_LOG_BYTES + 1))" <"$log" >"$copy"; }; then
+        warning "Could not copy the telemetry log to $dir, $no_line"
+        return 0
+    fi
+    if [ "$(wc -c <"$copy")" -gt "$MAX_OTEL_LOG_BYTES" ]; then
+        rm -f -- "${copy:?}"
+        warning "The telemetry log is over $MAX_OTEL_LOG_BYTES bytes, $no_line"
+        return 0
+    fi
+    if ! package="$(agentic_ci_package_version "$version")"; then
+        warning "agentic_ci_version '$version' is not a package version, $no_line"
+        return 0
+    fi
+    local script="${GITHUB_ACTION_PATH:-}/$USAGE_PY_REL"
+    if [ ! -f "$script" ]; then
+        warning "$script is missing, $no_line"
+        return 0
+    fi
+    local output="${dir:?}/usage-output.log"
+    run_agentic_ci_tool "$dir" "" "$package" "$USAGE_TIMEOUT" \
+        python -I "$script" "$copy" "$totals" \
+        "--job-name=${GITHUB_JOB:+$GITHUB_JOB-$REVIEW_MODE}" "--mode=$REVIEW_MODE" \
+        >"$output" 2>&1 || status=$?
+    print_tool_output "$output"
+    case "$status" in
+        0) ;;
+        "$NO_USAGE_EXIT") notice "The telemetry holds no token data, $no_line" ;;
+        124) warning "The usage totals did not finish within $USAGE_TIMEOUT, $no_line" ;;
+        *) warning "Could not total the review's usage (exit $status: $(tool_reason "$output")), $no_line" ;;
+    esac
+    # A partial file from a failed run is not the run's usage.
+    [ "$status" -eq 0 ] || rm -f -- "${totals:?}"
 }
 
 # Older runners can ship a git that lacks the fetch options build_container_repo needs.
@@ -667,8 +962,10 @@ run_openshell_agent() {
     local name="ai-review-$suffix" volume="ai-review-store-$suffix"
     local label="$WORKDIR_LABEL=$AI_DIR"
 
-    # Nothing that can write to the repository or mint tokens reaches docker, not even empty.
-    unset GITHUB_TOKEN GH_TOKEN
+    # Nothing that can write to the repository or mint tokens reaches docker, not even empty,
+    # and neither does the MLflow endpoint, its token or anything of the relay.
+    unset GITHUB_TOKEN GH_TOKEN MLFLOW_TRACKING_URI MLFLOW_TRACKING_TOKEN \
+        REVIEW_TELEMETRY_PROJECT REVIEW_TELEMETRY_USERNAME REVIEW_TELEMETRY_TOKEN
     local var
     for var in $(compgen -e); do
         case "$var" in
@@ -683,8 +980,9 @@ run_openshell_agent() {
     else
         names="$CODEX_CREDENTIAL_VARS"
     fi
-    # cmd_review sets it for both backends.
-    local env_args=(-e AGENT_ENABLED_PLUGINS)
+    # cmd_review sets AGENT_ENABLED_PLUGINS for both backends. agentic-ci copies its OTEL log to
+    # GITHUB_WORKSPACE, which the agent run below sets to the telemetry directory of the mount.
+    local env_args=(-e AGENT_ENABLED_PLUGINS -e GITHUB_WORKSPACE)
     for var in $names; do
         if [ -n "${!var:-}" ]; then
             env_args+=(-e "$var")
@@ -714,11 +1012,17 @@ run_openshell_agent() {
         error "Could not pull the sandbox images into the OpenShell container's storage"
     fi
 
+    # The telemetry directory exists before the upload, so the copy lands in it rather than in a
+    # file of its name. The agent can replace it in the sandbox, so collect_usage checks it again.
+    rm -rf -- "${TELEMETRY_DIR:?}"
+    mkdir -- "$TELEMETRY_DIR" || error "Could not create $TELEMETRY_DIR"
+    AGENT_OTEL_LOG="$TELEMETRY_DIR/$OTEL_LOG_NAME"
+
     # agentic-ci is the direct child of the init process, which forwards the timeout's SIGINT to
     # it, so it deletes the sandbox and stops the gateway before it exits. No -i or -t: the
     # OpenShell CLI reads a non-terminal stdin to its end before each command it sends.
     AGENT_STATUS=0
-    timeout -s INT --kill-after=60s "${minutes}m" \
+    GITHUB_WORKSPACE="$TELEMETRY_DIR" timeout -s INT --kill-after=60s "${minutes}m" \
         docker run --rm --privileged --init --pull never \
         --name "$name" --label "$label" \
         -v "$volume:/var/lib/containers" \
@@ -863,14 +1167,15 @@ cmd_review() {
 
     # The container is the sandbox: agentic-ci runs the agent with every tool enabled, so a
     # tool allowlist would not hold. The container never mounts the checkout's .git, and the
-    # post step reads one validated file from the mount.
+    # post step reads one validated file from the mount. OTEL stays on: agentic-ci collects the
+    # agent's telemetry for the usage line and the MLflow export. Its collector starts before the
+    # agent, and agentic-ci stops the run when it cannot start, as in the GitLab job.
     local args=(
         run
         --harness "$harness"
         --backend "$backend"
         --workdir "$AI_DIR"
         --image "$image"
-        --no-otel
     )
     # OpenShell ignores --timeout, so the outer limit is its only one. Podman's has a margin over
     # it, so the outer one fires first.
@@ -890,11 +1195,19 @@ cmd_review() {
     # it from its environment: openshell passes it into the container, and with podman the uvx
     # run inherits it, like the credentials.
     export AGENT_ENABLED_PLUGINS="$ENABLED_PLUGINS"
+    # Usage from an earlier run must not reach this run's summary or MLflow.
+    local usage
+    if usage="$(usage_dir)"; then
+        rm -rf -- "${usage:?}"
+    fi
     if [ "$backend" = "openshell" ]; then
         run_openshell_agent "$harness" "$image" "$version" "$minutes" "${args[@]}"
     else
         run_podman_agent "$image" "$version" "$minutes" "${args[@]}"
     fi
+    # Before the status checks, so a failed or timed-out review still leaves its telemetry for
+    # the MLflow export.
+    collect_usage "$version" "$AGENT_OTEL_LOG"
 
     # 124 is the timeout. 137 is the kill after the grace period, when the agent ignores the first
     # signal; it is also what an out-of-memory kill looks like. Any other failure is the agent's.
@@ -929,17 +1242,25 @@ run_podman_agent() {
     shift 3
 
     # The agent's credentials arrive from the job environment, the keys agentic-ci reads.
-    # Nothing that can write to the repository or mint tokens reaches the agent.
+    # Nothing that can write to the repository or mint tokens reaches the agent, and neither does
+    # the MLflow endpoint, its token or anything of the relay.
     export GITHUB_TOKEN='' GH_TOKEN=''
     export ACTIONS_ID_TOKEN_REQUEST_TOKEN='' ACTIONS_ID_TOKEN_REQUEST_URL=''
+    export MLFLOW_TRACKING_URI='' MLFLOW_TRACKING_TOKEN=''
+    export REVIEW_TELEMETRY_PROJECT='' REVIEW_TELEMETRY_USERNAME='' REVIEW_TELEMETRY_TOKEN=''
     # uvx runs in the workdir, but no uv config should steer it.
+    # shellcheck disable=SC2031 # set here for the agent run, apart from the usage subshell
     export UV_NO_CONFIG=1
 
     # agentic-ci writes the resolved cloud credentials into a temp directory and never deletes
     # it, so its run gets its own under RUNNER_TEMP and the trap removes it on every exit. Only
     # that run uses it: the image pull keeps the default, which may have more room.
     REVIEW_TMP="$(mktemp -d "$RUNNER_TEMP/ai-review-tmp.XXXXXX")"
-    trap 'rm -rf -- "$REVIEW_TMP"' EXIT
+    # agentic-ci copies its OTEL log to GITHUB_WORKSPACE, the checkout's parent on the runner, so
+    # its run gets a private directory instead, which the agent's container does not mount.
+    OTEL_TMP="$(mktemp -d "$RUNNER_TEMP/ai-review-otel.XXXXXX")"
+    trap 'rm -rf -- "${REVIEW_TMP:?}" "${OTEL_TMP:?}"' EXIT
+    AGENT_OTEL_LOG="$OTEL_TMP/$OTEL_LOG_NAME"
 
     # The pull is about 1.3 GB, so it gets its own limit and stays out of the agent's minutes.
     # A local build (localhost/...) is not in a registry, and agentic-ci skips the pull for it too.
@@ -950,7 +1271,8 @@ run_podman_agent() {
 
     # SIGINT makes agentic-ci stop its container before it exits.
     AGENT_STATUS=0
-    TMPDIR="$REVIEW_TMP" timeout -s INT --kill-after=60s "${minutes}m" \
+    TMPDIR="$REVIEW_TMP" GITHUB_WORKSPACE="$OTEL_TMP" \
+        timeout -s INT --kill-after=60s "${minutes}m" \
         uvx --from "agentic-ci==$version" agentic-ci "$@" || AGENT_STATUS=$?
 }
 
@@ -1027,6 +1349,14 @@ cmd_post() {
         fi
     fi
 
+    # The usage totals the review step wrote outside the mount, in both modes. A link or anything
+    # but a file there was not written by it.
+    local usage
+    if usage="$(usage_dir)" && [ ! -L "$usage" ] && [ -d "$usage" ] \
+        && [ ! -L "$usage/usage.json" ] && [ -f "$usage/usage.json" ]; then
+        args+=(--usage-file "$usage/usage.json")
+    fi
+
     # uv must ignore config and .python-version files that arrive with the PR.
     local status=0
     UV_NO_CONFIG=1 UV_LOCKED=1 UV_PYTHON="$(command -v python3)" \
@@ -1078,6 +1408,220 @@ cmd_standdown() {
             error "Could not check for a review that should win (review.py exit $status)"
             ;;
     esac
+}
+
+# Push the review's OTEL log to MLflow with agentic-ci mlflow-push, when the caller set both the
+# mlflow_experiment_name input and MLFLOW_TRACKING_URI. Runs after a failed review too, whenever
+# the review step left a log. The endpoint and the token reach agentic-ci only through its
+# environment, never a command line, and it never prints the token. Telemetry is optional, so
+# every problem only warns and the step always succeeds.
+cmd_export() {
+    local experiment="${AI_REVIEW_MLFLOW_EXPERIMENT:-}" dir log package status=0
+    if [ -z "$experiment" ] && [ -z "${MLFLOW_TRACKING_URI:-}" ]; then
+        return 0
+    fi
+    if [ -z "$experiment" ]; then
+        warning "MLFLOW_TRACKING_URI is set but the mlflow_experiment_name input is empty, so the review's telemetry was not exported to MLflow. Set mlflow_experiment_name to export it."
+        return 0
+    fi
+    if [ -z "${MLFLOW_TRACKING_URI:-}" ]; then
+        # The relay step uploads for an experiment with relay settings, and warns about them.
+        if [ -n "${REVIEW_TELEMETRY_PROJECT:-}" ] || [ -n "${REVIEW_TELEMETRY_USERNAME:-}" ] \
+            || [ -n "${REVIEW_TELEMETRY_TOKEN:-}" ]; then
+            return 0
+        fi
+        warning "mlflow_experiment_name is set but neither MLFLOW_TRACKING_URI (a direct export to your MLflow) nor REVIEW_TELEMETRY_PROJECT, REVIEW_TELEMETRY_USERNAME and REVIEW_TELEMETRY_TOKEN (the review relay) are set in the job environment, so the review's telemetry went nowhere. Pass them in the job's env:."
+        return 0
+    fi
+    # agentic-ci prints the name, so a control character could start a workflow command.
+    if [[ "$experiment" == *[[:cntrl:]]* ]]; then
+        warning "mlflow_experiment_name contains a control character, so the review's telemetry was not exported to MLflow."
+        return 0
+    fi
+    if ! dir="$(usage_dir)"; then
+        warning "RUNNER_TEMP is not set, so the review's telemetry was not exported to MLflow."
+        return 0
+    fi
+    log="$dir/$OTEL_LOG_NAME"
+    # Only the review step writes here, outside the mount: a link was not written by it.
+    if [ -L "$dir" ] || [ ! -d "$dir" ] || [ -L "$log" ] || [ ! -f "$log" ]; then
+        notice "The review left no telemetry log, so nothing was exported to MLflow."
+        return 0
+    fi
+    if ! package="$(agentic_ci_package_version "${AI_REVIEW_AGENTIC_CI_VERSION:-}")"; then
+        warning "agentic_ci_version is not a package version, so the review's telemetry was not exported to MLflow."
+        return 0
+    fi
+    local traces
+    if ! traces="$(count_trace_records "$log")" || [[ ! "$traces" =~ ^[0-9]+$ ]]; then
+        warning "Could not read the review's telemetry log, so nothing was exported to MLflow."
+        return 0
+    fi
+    if [ "$traces" -eq 0 ]; then
+        notice "The review's telemetry holds no traces, so there was nothing to export to MLflow."
+        return 0
+    fi
+
+    # One argument, so argparse never takes a name that starts with '-' for a flag.
+    local output="${dir:?}/mlflow-push.log" unaffected="The review itself is unaffected."
+    run_agentic_ci_tool "$dir" "MLFLOW_TRACKING_URI MLFLOW_TRACKING_TOKEN" "$package" \
+        "$MLFLOW_TIMEOUT" agentic-ci mlflow-push "$log" "--experiment=$experiment" \
+        >"$output" 2>&1 || status=$?
+    print_tool_output "$output"
+    case "$status" in
+        0) ;;
+        124)
+            warning "The MLflow export did not finish within $MLFLOW_TIMEOUT. $unaffected"
+            return 0
+            ;;
+        *)
+            warning "Could not export the review's telemetry to MLflow (exit $status: $(tool_reason "$output")). $unaffected"
+            return 0
+            ;;
+    esac
+
+    # agentic-ci 0.5.16 exits 0 when the experiment lookup fails, when the experiment does not
+    # exist and when only some payloads were pushed, so only its summary line with no failure
+    # proves the export. The rule is the review-telemetry relay's.
+    local pushed_re='^[[:space:]]*Pushed ([0-9]+) payload\(s\) covering .* \(0 failed\)[[:space:]]*$'
+    local partial_re='Pushed ([0-9]+) payload\(s\) covering .* \(([0-9]+) failed\)'
+    # Only the last line counts: agentic-ci prints its summary there, and earlier lines (the trace
+    # and session ids) are strings from the telemetry, which could imitate it.
+    local last reason=""
+    last="$(grep -v '^[[:space:]]*$' -- "$output" | tail -n 1)" || last=""
+    if [[ "$last" =~ $pushed_re ]] && [ "${BASH_REMATCH[1]}" -gt 0 ]; then
+        echo "Exported the review's telemetry to MLflow."
+        return 0
+    fi
+    if [[ "$last" =~ $partial_re ]] && [ "${BASH_REMATCH[2]}" -gt 0 ]; then
+        reason="only ${BASH_REMATCH[1]} payload(s) were pushed and ${BASH_REMATCH[2]} failed"
+    elif grep -q "Experiment lookup failed" -- "$output"; then
+        reason="the experiment lookup failed: the server could not be reached, refused the token or failed TLS"
+    elif grep -q "not found -- skipping trace push" -- "$output"; then
+        reason="the experiment was not found, and it must exist on the MLflow server before the export"
+    else
+        reason="agentic-ci exited 0 without pushing all $traces trace record(s)"
+    fi
+    warning "The review's telemetry was not fully exported to MLflow: $reason ($(tool_reason "$output")). $unaffected"
+}
+
+# PUT one file of the relay package with the deploy token, which reaches curl on its standard
+# input as config, never on its command line. Only HTTPS, no redirect, a bounded time. -q comes
+# first, so no .curlrc on the runner can loosen any of that. Warns and fails on any error.
+#
+# Usage: relay_put FILE URL OUTPUT
+relay_put() {
+    local file="$1" url="$2" output="$3" status=0
+    curl -q --config - --silent --show-error --fail-with-body --proto =https \
+        --connect-timeout "$RELAY_CONNECT_TIMEOUT" --max-time "$RELAY_MAX_TIME" \
+        --upload-file "$file" "$url" >"$output" 2>&1 \
+        <<<"user = \"$REVIEW_TELEMETRY_USERNAME:$REVIEW_TELEMETRY_TOKEN\"" || status=$?
+    [ "$status" -ne 0 ] || return 0
+    warning "Could not upload ${file##*/} to the review relay (curl exit $status: $(tool_reason "$output")). The review itself is unaffected."
+    return 1
+}
+
+# Upload the review's OTEL log and its meta.json to the review-telemetry relay, which pushes them
+# to the Red Hat MLflow, when the caller set mlflow_experiment_name, the relay's project and both
+# deploy token variables. The package and meta.json follow the relay's upload contract exactly, and a value
+# that would not match it skips the upload with a warning. Runs after a failed review too.
+# Telemetry is optional, so every problem only warns and the step always succeeds.
+cmd_relay() {
+    local experiment="${AI_REVIEW_MLFLOW_EXPERIMENT:-}" project="${REVIEW_TELEMETRY_PROJECT:-}"
+    local user="${REVIEW_TELEMETRY_USERNAME:-}" token="${REVIEW_TELEMETRY_TOKEN:-}"
+    local skip="so the review's telemetry was not uploaded to the review relay."
+    # Without any relay setting the caller does not use the relay; the export step warns about an
+    # experiment that goes nowhere.
+    if [ -z "$project" ] && [ -z "$user" ] && [ -z "$token" ]; then
+        return 0
+    fi
+    local missing=() var
+    for var in REVIEW_TELEMETRY_PROJECT REVIEW_TELEMETRY_USERNAME REVIEW_TELEMETRY_TOKEN; do
+        [ -n "${!var:-}" ] || missing+=("$var")
+    done
+    if [ -z "$experiment" ]; then
+        missing+=("the mlflow_experiment_name input")
+    fi
+    if [ "${#missing[@]}" -gt 0 ]; then
+        local list
+        list="$(IFS=,; echo "${missing[*]}")"
+        warning "The review relay is partly set up, $skip Missing: ${list//,/, }."
+        return 0
+    fi
+    # A project id only: it goes into the upload URL.
+    if [[ ! "$project" =~ ^[0-9]{1,12}$ ]]; then
+        warning "REVIEW_TELEMETRY_PROJECT must be a numeric GitLab project id, $skip"
+        return 0
+    fi
+    # The credentials go into curl's config, where a quote, a backslash or a control character
+    # would change it.
+    if [[ "$user$token" == *[[:cntrl:]\"\\]* ]]; then
+        warning "REVIEW_TELEMETRY_USERNAME or REVIEW_TELEMETRY_TOKEN contains a quote, a backslash or a control character, $skip"
+        return 0
+    fi
+
+    # The relay's patterns (relay.py VERSION_RE and META_STRING_FIELDS), on plain ASCII ranges.
+    local LC_ALL=C mode="${AI_REVIEW_MODE:-standard}" package
+    package="$(agentic_ci_package_version "${AI_REVIEW_AGENTIC_CI_VERSION:-}")" || package=""
+    # The job part names the mode too: under one reusable workflow the standard and the deep
+    # caller run the same job key in the same run, and the relay keeps only the newest file of a
+    # name, so one version per job and mode keeps both reviews. Checked after the mode.
+    local job="${GITHUB_JOB:+$GITHUB_JOB-$mode}"
+    local name value pattern
+    for name in repository run_id run_attempt mode job experiment agentic_ci_version; do
+        case "$name" in
+            repository) value="${GITHUB_REPOSITORY:-}" pattern='^[A-Za-z0-9-]{1,39}/[A-Za-z0-9._-]{1,100}$' ;;
+            run_id) value="${GITHUB_RUN_ID:-}" pattern='^[0-9]{1,20}$' ;;
+            run_attempt) value="${GITHUB_RUN_ATTEMPT:-}" pattern='^[0-9]{1,6}$' ;;
+            job) value="$job" pattern='^[A-Za-z0-9_-]{1,100}$' ;;
+            mode) value="$mode" pattern='^(standard|deep)$' ;;
+            experiment) value="$experiment" pattern='^[A-Za-z0-9._-]{1,100}$' ;;
+            agentic_ci_version) value="$package" pattern='^[0-9]{1,6}\.[0-9]{1,6}\.[0-9]{1,6}$' ;;
+        esac
+        if [[ ! "$value" =~ $pattern ]]; then
+            warning "The relay's $name must match $pattern, $skip"
+            return 0
+        fi
+    done
+
+    local dir log meta
+    if ! dir="$(usage_dir)"; then
+        warning "RUNNER_TEMP is not set, $skip"
+        return 0
+    fi
+    log="${dir:?}/$OTEL_LOG_NAME"
+    meta="${dir:?}/$RELAY_META_NAME"
+    # Only the review step writes here, outside the mount: a link was not written by it.
+    if [ -L "$dir" ] || [ ! -d "$dir" ] || [ -L "$log" ] || [ ! -f "$log" ]; then
+        notice "The review left no telemetry log, so nothing was uploaded to the review relay."
+        return 0
+    fi
+    local size
+    size="$(wc -c <"$log")" || size=-1
+    if [ "$size" -lt 0 ] || [ "$size" -gt "$RELAY_MAX_LOG_BYTES" ]; then
+        warning "The telemetry log is over the relay's $RELAY_MAX_LOG_BYTES bytes or unreadable, $skip"
+        return 0
+    fi
+    # Every value matched a pattern without quotes or backslashes, so it needs no JSON escaping.
+    rm -f -- "$meta"
+    if ! printf '{"version": 1, "repository": "%s", "run_id": "%s", "run_attempt": "%s", "job": "%s", "mode": "%s", "experiment": "%s", "agentic_ci_version": "%s"}\n' \
+        "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$job" "$mode" \
+        "$experiment" "$package" >"$meta"; then
+        warning "Could not write $meta, $skip"
+        return 0
+    fi
+    if [ "$(wc -c <"$meta")" -gt "$RELAY_MAX_META_BYTES" ]; then
+        warning "meta.json is over the relay's $RELAY_MAX_META_BYTES bytes, $skip"
+        return 0
+    fi
+
+    # The log first and meta.json last: meta.json marks the upload complete.
+    local version="$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT.$job"
+    local base="$RELAY_API/projects/$project/packages/generic/$RELAY_PACKAGE/$version"
+    local output="${dir:?}/relay-put.log"
+    relay_put "$log" "$base/$OTEL_LOG_NAME" "$output" || return 0
+    relay_put "$meta" "$base/$RELAY_META_NAME" "$output" || return 0
+    notice "Uploaded the review's telemetry to the review relay as $RELAY_PACKAGE $version."
 }
 
 # agentic-ci stops its container only when it exits normally. A SIGKILL (the timeout's kill
@@ -1175,11 +1719,15 @@ cmd_cleanup() {
     if dir="$(triage_dir)"; then
         rm -rf -- "$dir" || failed=1
     fi
+    if dir="$(usage_dir)"; then
+        rm -rf -- "${dir:?}" || failed=1
+    fi
 
-    # A review step that was killed before its trap ran leaves its private TMPDIR behind, and the
-    # post step leaves its copy of the review output.
+    # A review step that was killed before its trap ran leaves its private TMPDIR and OTEL
+    # directory behind, and the post step leaves its copy of the review output.
     if [ -n "${RUNNER_TEMP:-}" ]; then
-        for dir in "$RUNNER_TEMP"/ai-review-tmp.* "$RUNNER_TEMP"/ai-review-post.*; do
+        for dir in "$RUNNER_TEMP"/ai-review-tmp.* "$RUNNER_TEMP"/ai-review-otel.* \
+            "$RUNNER_TEMP"/ai-review-post.*; do
             if [ -d "$dir" ] && [ ! -L "$dir" ]; then
                 rm -rf -- "$dir" || failed=1
             fi
@@ -1196,9 +1744,11 @@ main() {
         standdown) cmd_standdown ;;
         review) cmd_review ;;
         post) cmd_post ;;
+        export) cmd_export ;;
+        relay) cmd_relay ;;
         cleanup) cmd_cleanup ;;
         *)
-            echo "Usage: $0 {check|prepare|standdown|review|post|cleanup}" >&2
+            echo "Usage: $0 {check|prepare|standdown|review|post|export|relay|cleanup}" >&2
             exit 2
             ;;
     esac

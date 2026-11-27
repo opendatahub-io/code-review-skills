@@ -135,6 +135,17 @@ inputs:
       when github_token is set.
     required: false
     default: ''
+  mlflow_experiment_name:
+    description: >-
+      The MLflow experiment this repository's reviews go to. Each review sends
+      its OpenTelemetry traces there: directly, with MLFLOW_TRACKING_URI (and
+      the optional MLFLOW_TRACKING_TOKEN) in the job environment, or through
+      the Red Hat review-telemetry relay, with REVIEW_TELEMETRY_PROJECT,
+      REVIEW_TELEMETRY_USERNAME and REVIEW_TELEMETRY_TOKEN there; the tokens
+      come from secrets, like the model key. Empty sends nothing; a failure
+      only warns.
+    required: false
+    default: ''
 
 runs:
   using: composite
@@ -232,6 +243,13 @@ runs:
         GH_TOKEN: ''
         ACTIONS_ID_TOKEN_REQUEST_TOKEN: ''
         ACTIONS_ID_TOKEN_REQUEST_URL: ''
+        # Nor the MLflow endpoint and token, or anything of the relay: only the export and relay
+        # steps read them.
+        MLFLOW_TRACKING_URI: ''
+        MLFLOW_TRACKING_TOKEN: ''
+        REVIEW_TELEMETRY_PROJECT: ''
+        REVIEW_TELEMETRY_USERNAME: ''
+        REVIEW_TELEMETRY_TOKEN: ''
 
     - name: Mint the posting token
       id: app-token
@@ -273,6 +291,36 @@ runs:
         AI_REVIEW_RECOMMEND_DEEP: ${{ inputs.recommend_deep_review }}
         AI_REVIEW_DEEP_LABEL: ${{ inputs.deep_review_label }}
         AI_REVIEW_SUGGEST_REVIEWERS: ${{ inputs.suggest_reviewers }}
+
+    # After a failed review too, like the GitLab job's after_script, but not after a cancel or a
+    # stand-down, which ran no agent. It exports only when mlflow_experiment_name and
+    # MLFLOW_TRACKING_URI are both set, and only a telemetry log the review step left. It never
+    # fails the job.
+    - name: Export the telemetry to MLflow
+      if: ${{ !cancelled() && steps.check.outputs.skip != 'true' && steps.standdown.outputs.stand_down != 'true' }}
+      shell: bash
+      # Not the workspace, which can hold the PR's files.
+      working-directory: ${{ runner.temp }}
+      run: '"$GITHUB_ACTION_PATH/action/review-pr.sh" export'
+      env:
+        AI_REVIEW_MLFLOW_EXPERIMENT: ${{ inputs.mlflow_experiment_name }}
+        # The agentic-ci release that ran the agent pushes its log.
+        AI_REVIEW_AGENTIC_CI_VERSION: ${{ inputs.agentic_ci_version }}
+
+    # The same conditions as the export, which it runs apart from: a repository can use either or
+    # both. It uploads only when mlflow_experiment_name and the three REVIEW_TELEMETRY_* variables
+    # are set, to gitlab.com only, and never fails the job.
+    - name: Upload the telemetry to the review relay
+      if: ${{ !cancelled() && steps.check.outputs.skip != 'true' && steps.standdown.outputs.stand_down != 'true' }}
+      shell: bash
+      # Not the workspace, which can hold the PR's files.
+      working-directory: ${{ runner.temp }}
+      run: '"$GITHUB_ACTION_PATH/action/review-pr.sh" relay'
+      env:
+        AI_REVIEW_MLFLOW_EXPERIMENT: ${{ inputs.mlflow_experiment_name }}
+        # meta.json names the release that ran the agent.
+        AI_REVIEW_AGENTIC_CI_VERSION: ${{ inputs.agentic_ci_version }}
+        AI_REVIEW_MODE: ${{ inputs.mode }}
 
     # Composite actions have no post hook, so this step always runs.
     - name: Remove the checkout
