@@ -215,7 +215,9 @@ class DeepReviewTests(ReviewTestCase):
         self.assertEqual(self.record()["argv"], self.deep_argv(harness="claude-code"))
 
     def test_deep_argv_for_codex(self):
-        proc = self.review(AI_REVIEW_MODE="deep", AI_REVIEW_HARNESS="codex", OPENAI_API_KEY="k")
+        proc = self.review(
+            AI_REVIEW_MODE="deep", AI_REVIEW_HARNESS="codex", OPENAI_API_KEY="fake-openai-key-0000"
+        )
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual(self.record()["argv"], self.deep_argv(harness="codex"))
 
@@ -245,7 +247,11 @@ class DeepReviewTests(ReviewTestCase):
     def test_the_deep_prompt_is_one_line(self):
         for harness in ("claude-code", "codex"):
             with self.subTest(harness):
-                self.review(AI_REVIEW_MODE="deep", AI_REVIEW_HARNESS=harness, OPENAI_API_KEY="k")
+                self.review(
+                    AI_REVIEW_MODE="deep",
+                    AI_REVIEW_HARNESS=harness,
+                    OPENAI_API_KEY="fake-openai-key-0000",
+                )
                 argv = self.record()["argv"]
                 prompt = argv[argv.index("--effort") + 2]
                 self.assertNotIn("\n", prompt)
@@ -285,7 +291,9 @@ class DeepReviewTests(ReviewTestCase):
 
     def test_codex_deep_prompt_does_not_get_the_org_rules_sentence(self):
         write(self.ai_dir, "org-rules.yaml", "tone_instructions: Be brief.\n")
-        proc = self.review(AI_REVIEW_MODE="deep", AI_REVIEW_HARNESS="codex", OPENAI_API_KEY="k")
+        proc = self.review(
+            AI_REVIEW_MODE="deep", AI_REVIEW_HARNESS="codex", OPENAI_API_KEY="fake-openai-key-0000"
+        )
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual(self.record()["argv"], self.deep_argv(harness="codex"))
         prompt = self.deep_prompt_from_record()
@@ -313,7 +321,9 @@ class DeepReviewTests(ReviewTestCase):
         for harness in ("claude-code", "codex"):
             with self.subTest(harness):
                 proc = self.review(
-                    AI_REVIEW_MODE="standard", AI_REVIEW_HARNESS=harness, OPENAI_API_KEY="k"
+                    AI_REVIEW_MODE="standard",
+                    AI_REVIEW_HARNESS=harness,
+                    OPENAI_API_KEY="fake-openai-key-0000",
                 )
                 self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
                 self.assertEqual(self.record()["argv"], self.expected_argv(harness=harness))

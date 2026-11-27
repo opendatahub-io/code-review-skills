@@ -32,6 +32,7 @@ from tests.test_github_action import (
     input_default,
     run_text,
     script_constant,
+    script_function,
     step_env_value,
     step_names,
     write_executable,
@@ -506,40 +507,76 @@ class UsageCollectionMixin:
         self.usage_dir = os.path.join(self.runner_temp, "ai-review-usage")
 
     def tool_config(self, config: dict) -> None:
-        Path(self.bin, "uvx-tools.json").write_text(json.dumps(config), encoding="utf-8")
+        Path(self.bin, "tools.json").write_text(json.dumps(config), encoding="utf-8")
 
     def tool_calls(self) -> list[dict]:
-        path = Path(self.bin, "uvx-tools.jsonl")
+        path = Path(self.bin, "tools.jsonl")
         if not path.exists():
             return []
         return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
 
-    def expected_usage_call(self, mode: str = "standard", package=VERIFIED_AGENTIC_CI_VERSION):
-        return [
-            "--from",
-            f"agentic-ci=={package}",
-            "python",
-            "-I",
-            str(USAGE_PY),
-            os.path.join(self.usage_dir, "claude-otel.jsonl"),
-            os.path.join(self.usage_dir, "usage.json"),
-            # The relay upload's job part, so MLflow groups both routes alike.
-            f"--job-name=review-{mode}",
-            f"--mode={mode}",
+    def expected_tool_run(
+        self, engine: str, image: str, entrypoint: str, command: list[str], network: bool = False
+    ) -> list[str]:
+        """The container run of a tool: only the usage directory, the runner's user, no pull.
+
+        NAME stands for the container's own random name, which assert_tool_run checks.
+        """
+        ai_dir = os.path.join(self.workspace, ".ai-review")
+        argv = ["run", "--rm", "--init", "--pull", "never", "--name", "NAME"]
+        argv += ["--label", f"ai-review.workdir={ai_dir}"]
+        if engine == "podman" and os.getuid() != 0:
+            argv.append("--userns=keep-id")
+        argv += [
+            "--user",
+            f"{os.getuid()}:{os.getgid()}",
+            "-v",
+            # Relabeled for SELinux, private to this container.
+            f"{self.usage_dir}:{self.usage_dir}:Z",
+            "--workdir",
+            self.usage_dir,
+            "--entrypoint",
+            entrypoint,
         ]
+        if not network:
+            argv += ["--network", "none"]
+        return argv, image, command
+
+    def expected_usage_run(self, engine: str, image: str, mode: str = "standard"):
+        return self.expected_tool_run(
+            engine,
+            image,
+            "python3",
+            [
+                "-E",
+                "-P",
+                os.path.join(self.usage_dir, "usage.py"),
+                os.path.join(self.usage_dir, "claude-otel.jsonl"),
+                os.path.join(self.usage_dir, "usage.json"),
+                # The relay upload's job part, so MLflow groups both routes alike.
+                f"--job-name=review-{mode}",
+                f"--mode={mode}",
+            ],
+        )
+
+    def tool_name(self, call: dict) -> str:
+        name = call["argv"][call["argv"].index("--name") + 1]
+        self.assertRegex(name, r"^ai-review-tool-[0-9a-f]{12}$")
+        return name
+
+    def assert_tool_run(self, call: dict, expected) -> None:
+        options, image, command = expected
+        options = [self.tool_name(call) if o == "NAME" else o for o in options]
+        self.assertEqual(call["argv"], [*options, image, *command])
+        self.assertEqual(call["image"], image)
+        for forbidden in ("--privileged", "-i", "-t", "--interactive", "--tty", "--mount"):
+            self.assertNotIn(forbidden, call["argv"])
+        mounts = [call["argv"][i + 1] for i, a in enumerate(call["argv"]) if a == "-v"]
+        self.assertEqual(mounts, [f"{self.usage_dir}:{self.usage_dir}:Z"])
 
     def usage_written(self) -> dict | None:
         path = os.path.join(self.usage_dir, "usage.json")
         return json.loads(Path(path).read_text(encoding="utf-8")) if os.path.exists(path) else None
-
-    def assert_tool_env_is_cut_down(self, env: dict, extra: tuple[str, ...] = ()) -> None:
-        allowed = re.compile(
-            r"^(PATH|HOME|LANG|LC_ALL|TZ|XDG_CACHE_HOME|XDG_DATA_HOME|UV_.*|HTTPS?_PROXY|NO_PROXY"
-            r"|https?_proxy|no_proxy|SSL_CERT_FILE|SSL_CERT_DIR|REQUESTS_CA_BUNDLE|PWD|SHLVL|_)$"
-        )
-        unexpected = sorted(k for k in env if not allowed.match(k) and k not in extra)
-        self.assertEqual(unexpected, [])
-        self.assertEqual(env["UV_NO_CONFIG"], "1")
 
 
 class PodmanUsageTests(UsageCollectionMixin, ReviewTestCase):
@@ -571,18 +608,20 @@ class PodmanUsageTests(UsageCollectionMixin, ReviewTestCase):
         env = self.record()["env"]
         for name in TELEMETRY_SECRETS:
             self.assertEqual(env[name], "", name)
-        # Nor the usage totals' tool run.
-        tool_env = self.tool_calls()[0]["env"]
-        for name in TELEMETRY_SECRETS:
-            self.assertNotIn(name, tool_env)
+        # Nor the usage totals' container, which gets no variable at all.
+        self.assertEqual(self.tool_calls()[0]["env_names"], [])
 
     def test_the_totals_reach_the_runner_and_the_job_log(self):
         proc = self.review_with_otel()
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         calls = self.tool_calls()
         self.assertEqual(len(calls), 1, calls)
-        self.assertEqual(calls[0]["argv"], self.expected_usage_call())
-        self.assertEqual(calls[0]["cwd"], self.usage_dir)
+        # The runner image the Podman agent ran in, through podman: no package index.
+        self.assertEqual(calls[0]["engine"], "podman")
+        self.assert_tool_run(calls[0], self.expected_usage_run("podman", self.IMAGE))
+        self.assertEqual(Path(self.usage_dir, "usage.py").read_bytes(), USAGE_PY.read_bytes())
+        # Only the agent ran through uvx.
+        self.assertEqual(self.record()["argv"][2:4], ["agentic-ci", "run"])
         self.assertEqual(
             self.usage_written(),
             {
@@ -602,12 +641,19 @@ class PodmanUsageTests(UsageCollectionMixin, ReviewTestCase):
         self.assertEqual(span_attributes(span)["ci.job.name"], {"stringValue": "review-standard"})
 
     def test_no_credential_token_or_mlflow_setting_reaches_the_totals(self):
+        ca = os.path.join(self.tmp, "ca.pem")
+        Path(ca).write_text("ca\n", encoding="utf-8")
         proc = self.review_with_otel(
-            OPENAI_API_KEY="sk-oai", ANTHROPIC_API_KEY="sk-ant", AGENTIC_CI_LITELLM_COST_MAP="/x"
+            OPENAI_API_KEY="sk-oai",
+            ANTHROPIC_API_KEY="sk-ant",
+            AGENTIC_CI_LITELLM_COST_MAP="/x",
+            # The totals have no network, so no proxy or CA either.
+            HTTPS_PROXY="http://proxy.example:3128",
+            REQUESTS_CA_BUNDLE=ca,
         )
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         call = self.tool_calls()[0]
-        self.assert_tool_env_is_cut_down(call["env"])
+        self.assertEqual(call["env_names"], [])
         joined = " ".join(call["argv"])
         for value in ("sk-oai", "sk-ant", "ghs_secret"):
             self.assertNotIn(value, joined)
@@ -636,17 +682,32 @@ class PodmanUsageTests(UsageCollectionMixin, ReviewTestCase):
 
     def test_failed_totals_only_warn_and_leave_no_usage_file(self):
         cases = (
-            (1, "Could not total the review's usage (exit 1: x No solution found for agentic-ci"),
+            (1, "Could not total the review's usage (exit 1: ModuleNotFoundError: agentic_ci"),
             (124, "did not finish within 5m"),
         )
         for status, message in cases:
             with self.subTest(status=status):
                 self.tool_config(
-                    {"status": status, "stderr": "  x No solution found for agentic-ci==9\n"}
+                    {"status": status, "stderr": "  ModuleNotFoundError: agentic_ci\n"}
                 )
                 proc = self.review_with_otel()
                 self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
                 self.assertIn(message, proc.stdout)
+                self.assertIsNone(self.usage_written())
+
+    def test_a_timed_out_container_is_removed_before_its_usage_file(self):
+        for status in (124, 137):
+            with self.subTest(status=status):
+                Path(self.bin, "tools.jsonl").unlink(missing_ok=True)
+                Path(self.podman_log).unlink(missing_ok=True)
+                # The container writes usage.json and the client times out: the late write must
+                # not survive, and the container must not keep running.
+                late = os.path.join(self.usage_dir, "usage.json")
+                self.tool_config({"status": status, "touch": late})
+                proc = self.review_with_otel()
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                name = self.tool_name(self.tool_calls()[0])
+                self.assertIn(f"rm -f {name}", self.podman_calls())
                 self.assertIsNone(self.usage_written())
 
     def test_no_token_data_is_a_notice(self):
@@ -672,7 +733,15 @@ class PodmanUsageTests(UsageCollectionMixin, ReviewTestCase):
         os.makedirs(os.path.join(self.repo_dir, ".git"))
         proc = self.review_with_otel(AI_REVIEW_MODE="deep")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertEqual(self.tool_calls()[0]["argv"], self.expected_usage_call("deep"))
+        self.assert_tool_run(
+            self.tool_calls()[0], self.expected_usage_run("podman", self.IMAGE, "deep")
+        )
+
+    def test_a_custom_image_totals_in_that_image(self):
+        image = "quay.io/example/codex-runner@sha256:" + "ab" * 32
+        proc = self.review_with_otel(AI_REVIEW_IMAGE=image)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(self.tool_calls()[0]["image"], image)
 
 
 class OpenShellUsageTests(UsageCollectionMixin, OpenShellReviewTestCase):
@@ -700,21 +769,32 @@ class OpenShellUsageTests(UsageCollectionMixin, OpenShellReviewTestCase):
         for value in TELEMETRY_SECRETS.values():
             self.assertNotIn(value, joined)
 
-    def test_the_totals_come_from_uvx_not_another_container(self):
+    def test_the_totals_run_in_the_openshell_image_without_network(self):
         proc = self.review_with_otel()
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertEqual(len(self.runs()), 3)
-        self.assertEqual([c["argv"] for c in self.tool_calls()], [self.expected_usage_call()])
+        # The pull, the agent, the give-back and the totals.
+        self.assertEqual(len(self.runs()), 4)
+        calls = self.tool_calls()
+        self.assertEqual(len(calls), 1, calls)
+        self.assertEqual(calls[0]["engine"], "docker")
+        self.assert_tool_run(calls[0], self.expected_usage_run("docker", self.openshell_image()))
+        self.assertEqual(calls[0]["env_names"], [])
         self.assertIsNotNone(self.usage_written())
-        self.assert_tool_env_is_cut_down(self.tool_calls()[0]["env"])
-        limits = json.loads(Path(self.bin, "timeout-tools.jsonl").read_text().splitlines()[-1])
-        self.assertEqual(limits["limit"], ["5m"])
+        last = self.timeouts()[-1]
+        self.assertEqual(
+            (last["limit"], last["command"][:2]), (["--kill-after=30s", "5m"], ["docker", "run"])
+        )
+        # No uvx at all with openshell.
+        self.assertFalse(os.path.exists(self.log))
 
-    def test_a_digest_pin_totals_with_its_tags_release(self):
+    def test_a_digest_pin_totals_in_the_pinned_image(self):
         self.VERSION = f"{VERIFIED_AGENTIC_CI_VERSION}@{DIGEST}"
         proc = self.review_with_otel()
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertEqual([c["argv"] for c in self.tool_calls()], [self.expected_usage_call()])
+        self.assertEqual(
+            self.tool_calls()[0]["image"],
+            f"quay.io/aipcc/agentic-ci/openshell:{VERIFIED_AGENTIC_CI_VERSION}@{DIGEST}",
+        )
 
     def test_a_telemetry_dir_replaced_by_a_link_is_refused(self):
         proc = self.review_with_otel(FAKE_OTEL_SHAPE="dirlink")
@@ -760,7 +840,7 @@ class PostUsageFileTests(ScriptTestCase):
             self.repo,
             GITHUB_ACTION_PATH=self.action_path,
             FAKE_LOG=self.log,
-            GITHUB_TOKEN="ghs_x",
+            GITHUB_TOKEN="ghs_fake-github-token-0000",
             **env,
         )
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
@@ -808,7 +888,12 @@ class PostUsageFileTests(ScriptTestCase):
 class ExportTests(UsageCollectionMixin, ScriptTestCase):
     def setUp(self):
         super().setUp()
-        write_executable(Path(self.bin, "uvx"), FAKE_UVX)
+        # Nothing may come from a package index: a uvx call would leave this mark.
+        self.uvx_mark = Path(self.bin, "uvx.called")
+        write_executable(
+            Path(self.bin, "uvx"),
+            f"open({str(self.uvx_mark)!r}, 'w').close()\nraise SystemExit(1)\n",
+        )
         self.log = os.path.join(self.usage_dir, "claude-otel.jsonl")
         write(self.usage_dir, "claude-otel.jsonl", CLAUDE_LOG)
         self.tool_config({"stdout": PUSHED_ALL})
@@ -818,7 +903,7 @@ class ExportTests(UsageCollectionMixin, ScriptTestCase):
             AI_REVIEW_MLFLOW_EXPERIMENT=experiment,
             AI_REVIEW_AGENTIC_CI_VERSION=VERIFIED_AGENTIC_CI_VERSION,
             OPENAI_API_KEY="sk-oai",
-            GITHUB_TOKEN="ghs_x",
+            GITHUB_TOKEN="ghs_fake-github-token-0000",
         )
         defaults.update(env)
         return self.run_script("export", self.runner_temp, **defaults)
@@ -838,7 +923,7 @@ class ExportTests(UsageCollectionMixin, ScriptTestCase):
                 "neither MLFLOW_TRACKING_URI (a direct export to your MLflow) nor "
                 "REVIEW_TELEMETRY_PROJECT, REVIEW_TELEMETRY_USERNAME and REVIEW_TELEMETRY_TOKEN",
             ),
-            "only the token": ("", {"MLFLOW_TRACKING_TOKEN": "t"}, None),
+            "only the token": ("", {"MLFLOW_TRACKING_TOKEN": "fake-mlflow-token-0000"}, None),
             # The relay step uploads, or warns about its own variables.
             "the input with the relay": ("my-reviews", RELAY_SETTINGS, None),
             "the input with only the relay project": (
@@ -848,13 +933,13 @@ class ExportTests(UsageCollectionMixin, ScriptTestCase):
             ),
             "the input with half the relay": (
                 "my-reviews",
-                {"REVIEW_TELEMETRY_TOKEN": "t"},
+                {"REVIEW_TELEMETRY_TOKEN": "fake-relay-token-0000"},
                 None,
             ),
         }
         for name, (experiment, env, warning) in cases.items():
             with self.subTest(name):
-                Path(self.bin, "uvx-tools.jsonl").unlink(missing_ok=True)
+                Path(self.bin, "tools.jsonl").unlink(missing_ok=True)
                 proc = self.export(experiment, **env)
                 self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
                 self.assertEqual(self.tool_calls(), [])
@@ -867,7 +952,7 @@ class ExportTests(UsageCollectionMixin, ScriptTestCase):
     def test_both_set_pushes_with_the_endpoint_and_token_in_the_environment_only(self):
         for with_token in (True, False):
             with self.subTest(with_token=with_token):
-                Path(self.bin, "uvx-tools.jsonl").unlink(missing_ok=True)
+                Path(self.bin, "tools.jsonl").unlink(missing_ok=True)
                 secrets = dict(MLFLOW_SECRETS)
                 if not with_token:
                     secrets["MLFLOW_TRACKING_TOKEN"] = ""
@@ -877,28 +962,79 @@ class ExportTests(UsageCollectionMixin, ScriptTestCase):
                 self.assertIn("Exported the review's telemetry to MLflow.", proc.stdout)
                 calls = self.tool_calls()
                 self.assertEqual(len(calls), 1)
-                self.assertEqual(
-                    calls[0]["argv"],
-                    [
-                        "--from",
-                        f"agentic-ci=={VERIFIED_AGENTIC_CI_VERSION}",
-                        "agentic-ci",
-                        "mlflow-push",
-                        self.log,
-                        "--experiment=my-reviews",
-                    ],
+                # The openshell image, with the network, and the MLflow variables by name only.
+                expected = self.expected_tool_run(
+                    "docker",
+                    f"quay.io/aipcc/agentic-ci/openshell:{VERIFIED_AGENTIC_CI_VERSION}",
+                    "agentic-ci",
+                    ["mlflow-push", self.log, "--experiment=my-reviews"],
+                    network=True,
                 )
-                env = calls[0]["env"]
-                self.assertEqual(env["MLFLOW_TRACKING_URI"], MLFLOW_SECRETS["MLFLOW_TRACKING_URI"])
-                self.assertEqual(env["MLFLOW_TRACKING_TOKEN"], secrets["MLFLOW_TRACKING_TOKEN"])
-                self.assert_tool_env_is_cut_down(
-                    env, extra=("MLFLOW_TRACKING_URI", "MLFLOW_TRACKING_TOKEN")
-                )
-                self.assertEqual(calls[0]["cwd"], self.usage_dir)
+                names = ["MLFLOW_TRACKING_URI"] + (["MLFLOW_TRACKING_TOKEN"] if with_token else [])
+                options = list(expected[0])
+                for name in names:
+                    options += ["-e", name]
+                self.assert_tool_run(calls[0], (options, *expected[1:]))
+                self.assertEqual(calls[0]["env_names"], names)
                 for value in MLFLOW_SECRETS.values():
                     self.assertNotIn(value, " ".join(calls[0]["argv"]))
+                self.assertFalse(self.uvx_mark.exists())
 
-    def test_a_digest_pin_pushes_with_its_tags_release(self):
+    def test_the_export_gets_the_runners_proxy_and_ca_bundles(self):
+        ca = os.path.join(self.tmp, "corp-ca.pem")
+        Path(ca).write_text("-----BEGIN CERTIFICATE-----\nfake\n", encoding="utf-8")
+        proxies = {
+            "HTTPS_PROXY": "http://proxy.example:3128",
+            "https_proxy": "http://proxy.example:3128",
+            "NO_PROXY": "localhost",
+        }
+        proc = self.export(
+            "my-reviews",
+            REQUESTS_CA_BUNDLE=ca,
+            SSL_CERT_FILE=os.path.join(self.tmp, "missing.pem"),
+            **proxies,
+            **MLFLOW_SECRETS,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        call = self.tool_calls()[0]
+        copy = os.path.join(self.usage_dir, "ca-REQUESTS_CA_BUNDLE.pem")
+        # Proxies by name; the CA bundle as a copy in the mounted directory, the variable set to
+        # it; a missing file is not passed.
+        self.assertEqual(
+            call["env_names"],
+            [
+                "HTTPS_PROXY",
+                "NO_PROXY",
+                "https_proxy",
+                f"REQUESTS_CA_BUNDLE={copy}",
+                "MLFLOW_TRACKING_URI",
+                "MLFLOW_TRACKING_TOKEN",
+            ],
+        )
+        self.assertEqual(Path(copy).read_text(encoding="utf-8"), Path(ca).read_text("utf-8"))
+        mounts = [call["argv"][i + 1] for i, a in enumerate(call["argv"]) if a == "-v"]
+        self.assertEqual(mounts, [f"{self.usage_dir}:{self.usage_dir}:Z"])
+        self.assertNotIn("proxy.example", " ".join(call["argv"]))
+
+    def test_an_oversized_ca_bundle_is_not_passed(self):
+        ca = os.path.join(self.tmp, "huge.pem")
+        with open(ca, "wb") as f:
+            f.truncate(10 * 1024 * 1024 + 1)
+        proc = self.export("my-reviews", REQUESTS_CA_BUNDLE=ca, **MLFLOW_SECRETS)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(
+            self.tool_calls()[0]["env_names"], ["MLFLOW_TRACKING_URI", "MLFLOW_TRACKING_TOKEN"]
+        )
+
+    def test_a_timed_out_push_removes_its_container(self):
+        self.tool_config({"status": 124})
+        proc = self.export("my-reviews", **MLFLOW_SECRETS)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("did not finish within 10m", proc.stdout)
+        name = self.tool_name(self.tool_calls()[0])
+        self.assertIn(["rm", "-f", name], self.docker_calls())
+
+    def test_a_digest_pin_pushes_from_the_pinned_image(self):
         proc = self.export(
             "my-reviews",
             AI_REVIEW_AGENTIC_CI_VERSION=f"{VERIFIED_AGENTIC_CI_VERSION}@{DIGEST}",
@@ -906,8 +1042,41 @@ class ExportTests(UsageCollectionMixin, ScriptTestCase):
         )
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual(
-            self.tool_calls()[0]["argv"][1], f"agentic-ci=={VERIFIED_AGENTIC_CI_VERSION}"
+            self.tool_calls()[0]["image"],
+            f"quay.io/aipcc/agentic-ci/openshell:{VERIFIED_AGENTIC_CI_VERSION}@{DIGEST}",
         )
+
+    def test_podman_pushes_from_the_agents_runner_image(self):
+        cases = {
+            ("codex", ""): f"quay.io/aipcc/agentic-ci/codex-runner:{VERIFIED_AGENTIC_CI_VERSION}",
+            ("claude-code", ""): (
+                f"quay.io/aipcc/agentic-ci/claude-runner:{VERIFIED_AGENTIC_CI_VERSION}"
+            ),
+            ("codex", "localhost/my-runner:dev"): "localhost/my-runner:dev",
+        }
+        for (harness, image), expected in cases.items():
+            with self.subTest(harness=harness, image=image):
+                Path(self.bin, "tools.jsonl").unlink(missing_ok=True)
+                proc = self.export(
+                    "my-reviews",
+                    AI_REVIEW_BACKEND="podman",
+                    AI_REVIEW_HARNESS=harness,
+                    AI_REVIEW_IMAGE=image,
+                    **MLFLOW_SECRETS,
+                )
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                call = self.tool_calls()[0]
+                self.assertEqual((call["engine"], call["image"]), ("podman", expected))
+                self.assertNotIn("--network", call["argv"])
+                self.assertFalse(self.uvx_mark.exists())
+
+    def test_no_image_to_export_with_only_warns(self):
+        proc = self.export(
+            "my-reviews", AI_REVIEW_AGENTIC_CI_VERSION="not a version", **MLFLOW_SECRETS
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("No agentic-ci image to export with", proc.stdout)
+        self.assertEqual(self.tool_calls(), [])
 
     def warnings(self, stdout: str) -> list[str]:
         return [line for line in stdout.splitlines() if line.startswith("::warning::")]
@@ -1070,8 +1239,8 @@ class ExportTests(UsageCollectionMixin, ScriptTestCase):
     def test_bad_experiment_names_and_versions_only_warn(self):
         for experiment, version, message in (
             ("a\nb", VERIFIED_AGENTIC_CI_VERSION, "control character"),
-            ("my-reviews", "", "not a package version"),
-            ("my-reviews", "x;id", "not a package version"),
+            ("my-reviews", "", "No agentic-ci image to export with"),
+            ("my-reviews", "x;id", "No agentic-ci image to export with"),
         ):
             with self.subTest(experiment=experiment, version=version):
                 proc = self.export(
@@ -1082,9 +1251,9 @@ class ExportTests(UsageCollectionMixin, ScriptTestCase):
                 self.assertEqual(self.tool_calls(), [])
 
     def test_an_experiment_name_that_looks_like_a_flag_stays_one_argument(self):
-        proc = self.export("--token=x", **MLFLOW_SECRETS)
+        proc = self.export("--token=not-a-token", **MLFLOW_SECRETS)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertEqual(self.tool_calls()[0]["argv"][-1], "--experiment=--token=x")
+        self.assertEqual(self.tool_calls()[0]["argv"][-1], "--experiment=--token=not-a-token")
 
 
 # ---------------------------------------------------------------------------
@@ -1414,11 +1583,11 @@ class RelayTests(ScriptTestCase):
                 self.assertEqual(self.curl_calls(), [])
 
     def test_credentials_that_would_change_curls_config_are_refused(self):
-        for token in ('a"b', "a\\b", "a\nb"):
+        for token in ('fake-relay"token-0000', "fake-relay\\token-0000", "fake-relay\ntoken-0000"):
             with self.subTest(token=token):
                 proc = self.relay(
                     REVIEW_TELEMETRY_PROJECT=RELAY_PROJECT,
-                    REVIEW_TELEMETRY_USERNAME="u",
+                    REVIEW_TELEMETRY_USERNAME="gitlab+deploy-token-0000",
                     REVIEW_TELEMETRY_TOKEN=token,
                 )
                 self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
@@ -1444,6 +1613,18 @@ class RelayTests(ScriptTestCase):
 
 
 class UsageCleanupTests(ScriptTestCase):
+    def test_cleanup_removes_the_labelled_podman_tool_containers_of_this_workdir(self):
+        labelled = {"tool1": self.ai_dir, "other": "/elsewhere/.ai-review"}
+        proc = self.run_script(
+            "cleanup",
+            self.tmp,
+            AI_REVIEW_BACKEND="podman",
+            FAKE_PODMAN_LABELLED=json.dumps(labelled),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        removed = [c for c in self.podman_calls() if c.startswith("rm ")]
+        self.assertEqual(removed, ["rm -f tool1"])
+
     def test_cleanup_removes_the_usage_dir_and_leftover_otel_dirs(self):
         write(self.runner_temp, "ai-review-usage/claude-otel.jsonl", "{}\n")
         write(self.runner_temp, "ai-review-usage/usage.json", "{}")
@@ -1566,6 +1747,14 @@ class UsageStaticTests(PanelTestCase):
         for name in RELAY_SECRETS:
             self.assertEqual(workflow.count(f"{name}: ${{{{ secrets.{name} }}}}"), 2, name)
         self.assertNotRegex(workflow, r"(?m)^\s*MLFLOW_TRACKING_\w+:")
+
+    def test_the_tools_never_come_from_a_package_index(self):
+        for function in ("run_agentic_ci_tool", "collect_usage", "cmd_export"):
+            text = script_function(function)
+            self.assertNotIn("uvx", text, function)
+            self.assertNotIn("--privileged", text, function)
+        readme = README.read_text(encoding="utf-8")
+        self.assertNotIn("PyPI access", readme)
 
     def test_the_usage_script_imports_agentic_ci_at_module_level(self):
         text = USAGE_PY.read_text(encoding="utf-8")

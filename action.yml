@@ -304,8 +304,12 @@ runs:
       run: '"$GITHUB_ACTION_PATH/action/review-pr.sh" export'
       env:
         AI_REVIEW_MLFLOW_EXPERIMENT: ${{ inputs.mlflow_experiment_name }}
-        # The agentic-ci release that ran the agent pushes its log.
+        # The agentic-ci image the review pulled pushes the log: the openshell image of this
+        # version, or with Podman the agent's image.
         AI_REVIEW_AGENTIC_CI_VERSION: ${{ inputs.agentic_ci_version }}
+        AI_REVIEW_BACKEND: ${{ inputs.backend }}
+        AI_REVIEW_HARNESS: ${{ inputs.harness }}
+        AI_REVIEW_IMAGE: ${{ inputs.image }}
 
     # The same conditions as the export, which it runs apart from: a repository can use either or
     # both. It uploads only when mlflow_experiment_name and the three REVIEW_TELEMETRY_* variables
