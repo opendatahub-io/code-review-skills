@@ -349,7 +349,9 @@ class OpenShellReviewTests(OpenShellReviewTestCase):
         for harness in ("codex", "claude-code"):
             with self.subTest(harness):
                 Path(self.docker_log).unlink(missing_ok=True)
-                self.openshell_review(AI_REVIEW_HARNESS=harness, ANTHROPIC_API_KEY="k")
+                self.openshell_review(
+                    AI_REVIEW_HARNESS=harness, ANTHROPIC_API_KEY="fake-anthropic-key-0000"
+                )
                 argv = self.agent_run()
                 prompt = argv[argv.index("--effort") + 2]
                 self.assertEqual(prompt, self.expected_prompt(harness, "standard", True))
@@ -361,7 +363,9 @@ class OpenShellReviewTests(OpenShellReviewTestCase):
 
     def test_the_org_rules_path_is_a_sandbox_path(self):
         write(self.ai_dir, "org-rules.yaml", "tone_instructions: Be brief.\n")
-        proc = self.openshell_review(AI_REVIEW_HARNESS="claude-code", ANTHROPIC_API_KEY="k")
+        proc = self.openshell_review(
+            AI_REVIEW_HARNESS="claude-code", ANTHROPIC_API_KEY="fake-anthropic-key-0000"
+        )
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         argv = self.agent_run()
         prompt = argv[argv.index("--effort") + 2]
@@ -373,7 +377,9 @@ class OpenShellReviewTests(OpenShellReviewTestCase):
         # must substitute the backend's container dir too.
         write(self.ai_dir, "org-rules.yaml", "tone_instructions: Be brief.\n")
         proc = self.openshell_review(
-            AI_REVIEW_MODE="deep", AI_REVIEW_HARNESS="claude-code", ANTHROPIC_API_KEY="k"
+            AI_REVIEW_MODE="deep",
+            AI_REVIEW_HARNESS="claude-code",
+            ANTHROPIC_API_KEY="fake-anthropic-key-0000",
         )
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         argv = self.agent_run()

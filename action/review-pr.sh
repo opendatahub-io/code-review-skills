@@ -94,8 +94,8 @@
 # instead of the checkout, and the review step removes it.
 #
 # prepare and post run in .ai-review-head. standdown runs in RUNNER_TEMP, before the checkout
-# exists, and export and relay run there too. review runs in .ai-review, not in a checkout, so uvx does not
-# read a uv config that arrives with the PR. check and cleanup run anywhere.
+# exists, and export and relay run there too. review runs in .ai-review, not in a checkout, so
+# uvx does not read a uv config that arrives with the PR. check and cleanup run anywhere.
 
 set -euo pipefail
 
@@ -180,6 +180,10 @@ NO_USAGE_EXIT=3
 # agentic-ci into uv's cache, and the export makes one request per trace payload.
 USAGE_TIMEOUT=5m
 MLFLOW_TIMEOUT=10m
+# The largest CA bundle the export copies into its container, in bytes.
+MAX_CA_BYTES=10485760
+# The proxy variables the tool containers get: the runner's own for the export, empty otherwise.
+TOOL_PROXY_VARS="HTTP_PROXY HTTPS_PROXY NO_PROXY FTP_PROXY ALL_PROXY http_proxy https_proxy no_proxy ftp_proxy all_proxy"
 # The upload contract of the review-telemetry relay (its README's "Upload contract"), which pushes
 # the uploads to the Red Hat MLflow. It is shared with that project: change both together. The
 # host is part of it, so the deploy token only ever goes to gitlab.com; the project id comes from
@@ -319,9 +323,11 @@ triage_dir() {
     esac
 }
 
-# The usage directory. Fails when RUNNER_TEMP is not an absolute path, like triage_dir.
+# The usage directory. Fails when RUNNER_TEMP is not an absolute path, like triage_dir, or holds
+# a character the tool container's mount cannot carry.
 usage_dir() {
     case "${RUNNER_TEMP:-}" in
+        *[[:space:]:,]*) return 1 ;;
         /?*) echo "$RUNNER_TEMP/$USAGE_DIR_NAME" ;;
         *) return 1 ;;
     esac
@@ -335,37 +341,101 @@ agentic_ci_package_version() {
     echo "$version"
 }
 
-# Run an agentic-ci command, or python with agentic-ci importable, from PyPI through uvx: the
-# release that ran the agent, so the totals and the price map are the agent run's, and one way
-# for both backends (the openshell image does not mount RUNNER_TEMP). The environment is cut
-# down to what uv needs to find its cache, a Python and the index, plus the names given: no model
-# credential, GitHub token or agentic-ci setting reaches it, and no secret is on a command line.
-# It runs in DIR, which the action owns, so no uv config or .python-version of the PR steers it.
+# The pinned agentic-ci image that the review pulled, and the engine that runs it, for the usage
+# totals and the MLflow export: the openshell image of agentic_ci_version (tag or digest) with
+# docker, or the runner image the Podman agent ran in with podman. Both ship python3 and
+# agentic-ci, so nothing is fetched from a package index at run time. Sets TOOL_ENGINE and
+# TOOL_IMAGE; fails when there is no such image or engine.
 #
-# Usage: run_agentic_ci_tool DIR "EXTRA_NAMES" VERSION LIMIT COMMAND ARGS...
+# Usage: resolve_tool_image BACKEND VERSION AGENT_IMAGE
+TOOL_ENGINE=""
+TOOL_IMAGE=""
+resolve_tool_image() {
+    case "$1" in
+        openshell)
+            TOOL_ENGINE=docker
+            TOOL_IMAGE="$(openshell_image_ref "$2")" || return 1
+            ;;
+        podman)
+            TOOL_ENGINE=podman
+            TOOL_IMAGE="$3"
+            ;;
+        *) return 1 ;;
+    esac
+    [ -n "$TOOL_IMAGE" ] && [[ "$TOOL_IMAGE" != *[[:space:]]* ]] \
+        && command -v "$TOOL_ENGINE" >/dev/null 2>&1
+}
+
+# Copy the CA bundle that the variable NAME points at into DIR, which the tool container mounts,
+# and print the copy's path. A copy, not a mount of its own: relabeling a host CA file for SELinux
+# would change its label on the host. Fails without a regular readable file of at most 10 MiB.
+#
+# Usage: tool_ca_file DIR NAME
+tool_ca_file() {
+    local dir="$1" name="$2" file
+    file="${!name:-}"
+    [ -n "$file" ] && [ -f "$file" ] && [ -r "$file" ] || return 1
+    [ "$(wc -c <"$file")" -le "$MAX_CA_BYTES" ] || return 1
+    cp -- "$file" "$dir/ca-$name.pem" || return 1
+    echo "$dir/ca-$name.pem"
+}
+
+# Run usage.py (ENTRYPOINT python3) or agentic-ci (ENTRYPOINT agentic-ci) in TOOL_IMAGE with
+# TOOL_ENGINE, never pulling it. The container mounts only DIR, the usage directory, at its own
+# path, relabeled for SELinux as private to it (:Z); it runs as the runner's user, so its files
+# stay the runner's; it gets only the variables ENV_NAMES lists that are set, by name (-e NAME),
+# so no secret is on a command line; it is never privileged; it has an init that forwards
+# signals; and it carries the workdir label, so cleanup removes it after a kill. Without network
+# unless NETWORK is "network", which also passes the proxy variables by name and the CA bundles
+# REQUESTS_CA_BUNDLE and SSL_CERT_FILE name, as copies in DIR. A client that times out leaves
+# its --rm container running, so the container, which has a name of its own, is removed then.
+#
+# Usage: run_agentic_ci_tool DIR "ENV_NAMES" NETWORK LIMIT ENTRYPOINT ARGS...
 run_agentic_ci_tool() {
-    local dir="$1" extra=" $2 " version="$3" limit="$4" var
-    shift 4
-    (
-        for var in $(compgen -e); do
-            case "$var" in
-                PATH | HOME | LANG | LC_ALL | TZ | XDG_CACHE_HOME | XDG_DATA_HOME | UV_* \
-                    | HTTP_PROXY | HTTPS_PROXY | NO_PROXY | http_proxy | https_proxy | no_proxy \
-                    | SSL_CERT_FILE | SSL_CERT_DIR | REQUESTS_CA_BUNDLE) ;;
-                *)
-                    case "$extra" in
-                        *" $var "*) ;;
-                        *) unset "$var" 2>/dev/null || true ;;
-                    esac
-                    ;;
-            esac
+    local dir="$1" names="$2" network="$3" limit="$4" entrypoint="$5" name ca status=0
+    shift 5
+    local container
+    container="ai-review-tool-$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')"
+    local args=(run --rm --init --pull never --name "$container" --label "$WORKDIR_LABEL=$AI_DIR")
+    # Rootless Podman maps the runner's user into the container only with keep-id.
+    if [ "$TOOL_ENGINE" = podman ] && [ "$(id -u)" -ne 0 ]; then
+        args+=(--userns=keep-id)
+    fi
+    args+=(--user "$(id -u):$(id -g)" -v "$dir:$dir:Z" --workdir "$dir")
+    args+=(--entrypoint "$entrypoint")
+    # Podman copies the host's proxy variables into every container unless told not to, and docker
+    # can add the proxies of its client config: every proxy variable is set here instead, to the
+    # runner's own value by name for the export, and to empty everywhere else.
+    [ "$TOOL_ENGINE" != podman ] || args+=(--http-proxy=false)
+    for name in $TOOL_PROXY_VARS; do
+        if [ "$network" = network ] && [ -n "${!name:-}" ]; then
+            args+=(-e "$name")
+        else
+            args+=(-e "$name=")
+        fi
+    done
+    if [ "$network" = network ]; then
+        # The host's network, so an MLflow server or proxy on the runner itself is reachable.
+        args+=(--network host)
+        for name in REQUESTS_CA_BUNDLE SSL_CERT_FILE; do
+            if ca="$(tool_ca_file "$dir" "$name")"; then
+                args+=(-e "$name=$ca")
+            fi
         done
-        # Local to this subshell on purpose.
-        # shellcheck disable=SC2030
-        export UV_NO_CONFIG=1
-        cd -- "$dir" || exit 1
-        exec timeout "$limit" uvx --from "agentic-ci==$version" "$@" </dev/null
-    )
+    else
+        args+=(--network none)
+    fi
+    for name in $names; do
+        [ -z "${!name:-}" ] || args+=(-e "$name")
+    done
+    timeout --kill-after=30s "$limit" "$TOOL_ENGINE" "${args[@]}" "$TOOL_IMAGE" "$@" </dev/null \
+        || status=$?
+    # 124 is the timeout, 137 its kill. Either leaves the container behind, still able to write
+    # usage.json or push with the token.
+    if [ "$status" -eq 124 ] || [ "$status" -eq 137 ]; then
+        timeout 1m "$TOOL_ENGINE" rm -f "$container" >/dev/null 2>&1 || true
+    fi
+    return "$status"
 }
 
 # A URL path as requests sends and prints it: every byte outside the characters it leaves alone
@@ -384,10 +454,38 @@ percent_encode_path() {
     printf '%s\n' "$out"
 }
 
+# Every byte of TEXT outside the unreserved characters as %XX, as a URL's userinfo is sent.
+percent_encode_strict() {
+    local LC_ALL=C text="$1" out="" c i
+    for ((i = 0; i < ${#text}; i++)); do
+        c="${text:i:1}"
+        case "$c" in
+            [A-Za-z0-9._~-]) out+="$c" ;;
+            *) out+="$(printf '%%%02X' "'$c")" ;;
+        esac
+    done
+    printf '%s\n' "$out"
+}
+
+# Add a piece of a secret to MLFLOW_SECRETS with its percent-decoded and percent-encoded forms,
+# when it is at least 4 characters: a shorter piece would mask common text all over the output,
+# and the whole value it came from is masked anyway.
+add_secret_piece() {
+    local piece="$1" decoded
+    [ "${#piece}" -ge 4 ] || return 0
+    MLFLOW_SECRETS+=("$piece")
+    decoded="$(printf '%b' "${piece//%/\\x}" 2>/dev/null)" || decoded=""
+    [ -z "$decoded" ] || [ "$decoded" = "$piece" ] || MLFLOW_SECRETS+=("$decoded")
+    local encoded
+    encoded="$(percent_encode_strict "${decoded:-$piece}")"
+    [ "$encoded" = "$piece" ] || MLFLOW_SECRETS+=("$encoded")
+}
+
 # The values a tool's output must not show, longest first: the MLflow endpoint, its token, the
-# relay's deploy token and its user name, and the endpoint's host and path, which HTTP errors
-# print apart from the URL. urllib3 prints the host in lower case and requests the path
-# percent-encoded, so those forms are masked too. Sets MLFLOW_SECRETS.
+# relay's deploy token and its user name, every proxy value the export forwards with the
+# credentials of a proxy URL (user:password and the password alone), and the endpoint's host and
+# path, which HTTP errors print apart from the URL. urllib3 prints the host in lower case and
+# requests the path percent-encoded, so those forms are masked too. Sets MLFLOW_SECRETS.
 MLFLOW_SECRETS=()
 collect_mlflow_secrets() {
     local uri="${MLFLOW_TRACKING_URI:-}" rest host path encoded
@@ -396,6 +494,24 @@ collect_mlflow_secrets() {
     [ -z "${MLFLOW_TRACKING_TOKEN:-}" ] || MLFLOW_SECRETS+=("$MLFLOW_TRACKING_TOKEN")
     [ -z "${REVIEW_TELEMETRY_TOKEN:-}" ] || MLFLOW_SECRETS+=("$REVIEW_TELEMETRY_TOKEN")
     [ -z "${REVIEW_TELEMETRY_USERNAME:-}" ] || MLFLOW_SECRETS+=("$REVIEW_TELEMETRY_USERNAME")
+    # A proxy URL can carry credentials, and a tool that cannot parse it can print it, or a part.
+    local name value authority userinfo
+    for name in $TOOL_PROXY_VARS; do
+        value="${!name:-}"
+        [ -n "$value" ] || continue
+        MLFLOW_SECRETS+=("$value")
+        authority="${value#*://}"
+        authority="${authority%%[/?#]*}"
+        case "$authority" in
+            *@*)
+                userinfo="${authority%@*}"
+                add_secret_piece "$userinfo"
+                case "$userinfo" in
+                    *:*) add_secret_piece "${userinfo#*:}" ;;
+                esac
+                ;;
+        esac
+    done
     [ -n "$uri" ] || return 0
     rest="${uri#*://}"
     host="${rest%%[/?#]*}"
@@ -456,7 +572,7 @@ tool_reason() {
         reason+="${reason:+ | }$(mask_mlflow "$line")"
     done < <(grep -v '^[[:space:]]*$' -- "$1" 2>/dev/null | tail -n 3)
     # Credentials in a header or a URL, and long opaque strings that look like keys.
-    reason="$(sed -E 's#(Bearer|Basic|[Tt]oken|[Kk]ey|[Pp]assword)([=: ]+)[^ |]+#\1\2***#g; s#://[^/@ ]*@#://***@#g; s#[A-Za-z0-9_+/=-]{32,}#***#g' <<<"$reason")"
+    reason="$(sed -E 's#(Bearer|Basic|[Tt]oken|[Kk]ey|[Pp]assword)([=: ]+)[^ |]+#\1\2***#g; s#://[^/@ ]*@#://***@#g; s#[A-Za-z0-9_+=-]{32,}#***#g' <<<"$reason")"
     # % would start an escape in the workflow command.
     reason="${reason//%/%25}"
     echo "${reason:0:400}"
@@ -485,18 +601,33 @@ with open(sys.argv[1], encoding="utf-8", errors="replace") as lines:
 print(count)' "$1"
 }
 
+# Warn once when the image's agentic-ci, which usage.py reports, is not the agentic_ci_version
+# release: with Podman the agent runs that release from PyPI, but the totals and the export use
+# the runner image, whose release is its own. The usage line is still shown, priced by the
+# image's release.
+#
+# Usage: check_tool_version VERSION OUTPUT
+check_tool_version() {
+    local wanted found
+    wanted="$(agentic_ci_package_version "$1")" || return 0
+    found="$(sed -n 's/^agentic-ci version: \([0-9][0-9A-Za-z.+!-]*\)$/\1/p' -- "$2" | tail -n 1)"
+    [ -n "$found" ] && [ "$found" != "$wanted" ] || return 0
+    warning "The agentic-ci image $TOOL_IMAGE has agentic-ci $found, while agentic_ci_version is $wanted: the usage line was priced, and the MLflow export runs, with agentic-ci $found. Set the image input to the runner image of $wanted to match."
+}
+
 # Copy the agent run's OTEL log to the usage directory and total its tokens and cost into
 # usage.json there, for the summary and the job log. The log comes from where the agent could
 # write, so a link, anything but a regular file or a log over MAX_OTEL_LOG_BYTES is refused, and
-# usage.py reads only numbers from it. Usage only informs, so this never fails the step: a missing
-# or refused log, or totals that cannot be made, mean no usage line.
+# usage.py reads only numbers from it, in the pinned agentic-ci image without network. Usage only
+# informs, so this never fails the step: a missing or refused log, or totals that cannot be made,
+# mean no usage line.
 #
-# Usage: collect_usage VERSION LOG
+# Usage: collect_usage BACKEND VERSION AGENT_IMAGE LOG
 collect_usage() {
-    local version="$1" log="$2" dir parent size status=0 package
+    local backend="$1" version="$2" agent_image="$3" log="$4" dir parent size status=0
     local no_line="so the summary will not show the review's token usage."
     if ! dir="$(usage_dir)"; then
-        warning "RUNNER_TEMP is not set, $no_line"
+        warning "RUNNER_TEMP is not set or holds a character a container mount cannot carry, $no_line"
         return 0
     fi
     if [ -z "$log" ]; then
@@ -532,18 +663,21 @@ collect_usage() {
         warning "The telemetry log is over $MAX_OTEL_LOG_BYTES bytes, $no_line"
         return 0
     fi
-    if ! package="$(agentic_ci_package_version "$version")"; then
-        warning "agentic_ci_version '$version' is not a package version, $no_line"
+    if ! resolve_tool_image "$backend" "$version" "$agent_image"; then
+        warning "No agentic-ci image to total the usage in, $no_line"
         return 0
     fi
+    # The container mounts only the usage directory, so the script goes there. -E -P, not -I: the
+    # images' RHEL Python finds agentic-ci under /usr/local only outside isolated mode, and -E -P
+    # still ignore PYTHON* variables and keep the script's directory off the import path.
     local script="${GITHUB_ACTION_PATH:-}/$USAGE_PY_REL"
-    if [ ! -f "$script" ]; then
+    if [ ! -f "$script" ] || ! cp -- "$script" "$dir/usage.py"; then
         warning "$script is missing, $no_line"
         return 0
     fi
     local output="${dir:?}/usage-output.log"
-    run_agentic_ci_tool "$dir" "" "$package" "$USAGE_TIMEOUT" \
-        python -I "$script" "$copy" "$totals" \
+    run_agentic_ci_tool "$dir" "" none "$USAGE_TIMEOUT" \
+        python3 -E -P "$dir/usage.py" "$copy" "$totals" \
         "--job-name=${GITHUB_JOB:+$GITHUB_JOB-$REVIEW_MODE}" "--mode=$REVIEW_MODE" \
         >"$output" 2>&1 || status=$?
     print_tool_output "$output"
@@ -553,7 +687,9 @@ collect_usage() {
         124) warning "The usage totals did not finish within $USAGE_TIMEOUT, $no_line" ;;
         *) warning "Could not total the review's usage (exit $status: $(tool_reason "$output")), $no_line" ;;
     esac
-    # A partial file from a failed run is not the run's usage.
+    check_tool_version "$version" "$output"
+    # A partial file from a failed run is not the run's usage. After the timeout, the container is
+    # gone by now, so it cannot write the file again.
     [ "$status" -eq 0 ] || rm -f -- "${totals:?}"
 }
 
@@ -1207,7 +1343,7 @@ cmd_review() {
     fi
     # Before the status checks, so a failed or timed-out review still leaves its telemetry for
     # the MLflow export.
-    collect_usage "$version" "$AGENT_OTEL_LOG"
+    collect_usage "$backend" "$version" "$image" "$AGENT_OTEL_LOG"
 
     # 124 is the timeout. 137 is the kill after the grace period, when the agent ignores the first
     # signal; it is also what an out-of-memory kill looks like. Any other failure is the agent's.
@@ -1249,7 +1385,6 @@ run_podman_agent() {
     export MLFLOW_TRACKING_URI='' MLFLOW_TRACKING_TOKEN=''
     export REVIEW_TELEMETRY_PROJECT='' REVIEW_TELEMETRY_USERNAME='' REVIEW_TELEMETRY_TOKEN=''
     # uvx runs in the workdir, but no uv config should steer it.
-    # shellcheck disable=SC2031 # set here for the agent run, apart from the usage subshell
     export UV_NO_CONFIG=1
 
     # agentic-ci writes the resolved cloud credentials into a temp directory and never deletes
@@ -1416,7 +1551,7 @@ cmd_standdown() {
 # environment, never a command line, and it never prints the token. Telemetry is optional, so
 # every problem only warns and the step always succeeds.
 cmd_export() {
-    local experiment="${AI_REVIEW_MLFLOW_EXPERIMENT:-}" dir log package status=0
+    local experiment="${AI_REVIEW_MLFLOW_EXPERIMENT:-}" dir log status=0
     if [ -z "$experiment" ] && [ -z "${MLFLOW_TRACKING_URI:-}" ]; then
         return 0
     fi
@@ -1448,8 +1583,13 @@ cmd_export() {
         notice "The review left no telemetry log, so nothing was exported to MLflow."
         return 0
     fi
-    if ! package="$(agentic_ci_package_version "${AI_REVIEW_AGENTIC_CI_VERSION:-}")"; then
-        warning "agentic_ci_version is not a package version, so the review's telemetry was not exported to MLflow."
+    # The image the review step pulled: the openshell image, or the Podman agent's image.
+    local backend="${AI_REVIEW_BACKEND:-openshell}" agent_image="${AI_REVIEW_IMAGE:-}"
+    if [ "$backend" = podman ] && [ -z "$agent_image" ]; then
+        agent_image="$(default_image "${AI_REVIEW_HARNESS:-codex}" podman)" || agent_image=""
+    fi
+    if ! resolve_tool_image "$backend" "${AI_REVIEW_AGENTIC_CI_VERSION:-}" "$agent_image"; then
+        warning "No agentic-ci image to export with, so the review's telemetry was not exported to MLflow."
         return 0
     fi
     local traces
@@ -1464,7 +1604,7 @@ cmd_export() {
 
     # One argument, so argparse never takes a name that starts with '-' for a flag.
     local output="${dir:?}/mlflow-push.log" unaffected="The review itself is unaffected."
-    run_agentic_ci_tool "$dir" "MLFLOW_TRACKING_URI MLFLOW_TRACKING_TOKEN" "$package" \
+    run_agentic_ci_tool "$dir" "MLFLOW_TRACKING_URI MLFLOW_TRACKING_TOKEN" network \
         "$MLFLOW_TIMEOUT" agentic-ci mlflow-push "$log" "--experiment=$experiment" \
         >"$output" 2>&1 || status=$?
     print_tool_output "$output"
@@ -1629,7 +1769,13 @@ cmd_relay() {
 # credentials, so remove any agentic-ci container that mounts this run's workdir.
 remove_review_containers() {
     command -v podman >/dev/null 2>&1 || return 0
-    local id source failed=0
+    local id source failed=0 ids
+    # The usage and export tool containers carry the workdir label instead.
+    ids="$(podman ps -aq --filter "label=$WORKDIR_LABEL=$AI_DIR" 2>/dev/null)" || ids=""
+    while IFS= read -r id; do
+        [ -n "$id" ] || continue
+        podman rm -f "$id" >/dev/null || failed=1
+    done <<<"$ids"
     while IFS= read -r id; do
         [ -n "$id" ] || continue
         while IFS= read -r source; do

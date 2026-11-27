@@ -623,8 +623,9 @@ class ActionStaticTests(PanelTestCase):
     def test_codex_is_the_default_harness(self):
         self.assertEqual(input_default("harness"), "codex")
         script = SCRIPT.read_text(encoding="utf-8")
-        self.assertEqual(len(re.findall(r"AI_REVIEW_HARNESS:-", script)), 3)
-        self.assertEqual(len(re.findall(r"AI_REVIEW_HARNESS:-codex\}", script)), 3)
+        # check, review and the export's image lookup.
+        self.assertEqual(len(re.findall(r"AI_REVIEW_HARNESS:-", script)), 4)
+        self.assertEqual(len(re.findall(r"AI_REVIEW_HARNESS:-codex\}", script)), 4)
 
     def test_the_action_description_names_no_harness_vendor(self):
         text = ACTION_YML.read_text(encoding="utf-8")
@@ -853,6 +854,9 @@ def script_env(**overrides: str) -> dict[str, str]:
                 ("ANTHROPIC_", "CLAUDE_CODE_", "AI_REVIEW_", "AGENT_", "OPENAI_", "GCLOUD_", "GCP_")
             )
             or key in ("GH_TOKEN", "UV_NO_CONFIG", "UV_PYTHON")
+            # The proxies and CA bundles of the machine running the tests reach the export.
+            or key.lower().endswith("_proxy")
+            or key in ("REQUESTS_CA_BUNDLE", "SSL_CERT_FILE")
             or key in SCRIPT_CREDENTIAL_VARS
         ):
             del env[key]
@@ -902,8 +906,63 @@ def write_otel(env):
             f.truncate(64 * 1024 * 1024 + 1)
 """
 
+# Stands in for a container run of the usage totals (--entrypoint python3) or the MLflow export
+# (--entrypoint agentic-ci) in the fake docker and the fake podman: appends the engine, its argv,
+# the image, the command, the names passed with -e and the working directory to tools.jsonl next
+# to the fake, and takes its settings from tools.json there: "stdout" and "stderr" to print,
+# "touch", a file to write first, "status" to exit with, and "stub", a directory with a stand-in
+# agentic_ci package that usage.py runs against on the host.
+RUN_TOOL = """
+def is_tool_run(args):
+    if args[:1] != ["run"] or "--entrypoint" not in args:
+        return False
+    return args[args.index("--entrypoint") + 1] in ("python3", "agentic-ci")
+
+
+def run_tool(engine, args):
+    import subprocess
+
+    value_flags = {"--label", "-v", "--workdir", "--entrypoint", "--user", "--network", "-e",
+                   "--pull", "--name"}
+    i = 1
+    while i < len(args) and args[i].startswith("-"):
+        i += 2 if args[i] in value_flags else 1
+    image, rest = args[i], args[i + 1:]
+    entrypoint = args[args.index("--entrypoint") + 1]
+    here = os.path.dirname(os.path.abspath(sys.argv[0]))
+    record = {
+        "engine": engine,
+        "argv": args,
+        "image": image,
+        "command": [entrypoint, *rest],
+        "env_names": [args[j + 1] for j, a in enumerate(args) if a == "-e"],
+        "cwd": os.getcwd(),
+    }
+    with open(os.path.join(here, "tools.jsonl"), "a", encoding="utf-8") as f:
+        f.write(json.dumps(record) + "\\n")
+    config = {}
+    if os.path.exists(os.path.join(here, "tools.json")):
+        with open(os.path.join(here, "tools.json"), encoding="utf-8") as f:
+            config = json.load(f)
+    sys.stdout.write(config.get("stdout", ""))
+    sys.stderr.write(config.get("stderr", ""))
+    sys.stdout.flush()
+    if config.get("touch"):
+        with open(config["touch"], "w", encoding="utf-8") as f:
+            f.write("{}")
+    if "status" in config:
+        sys.exit(config["status"])
+    if entrypoint == "python3" and config.get("stub"):
+        # The image's interpreter flags go; PYTHONPATH brings the stand-in package.
+        script = [a for a in rest if not a.startswith("-") or a.startswith("--")]
+        env = {**os.environ, "PYTHONPATH": config["stub"]}
+        sys.exit(subprocess.run([sys.executable, *script], env=env, check=False).returncode)
+    sys.exit(0)
+"""
+
 # Stands in for podman, so no test touches a real container: records each call.
-FAKE_PODMAN = """
+FAKE_PODMAN = (
+    """
 import json
 import os
 import sys
@@ -912,9 +971,20 @@ with open(os.environ["FAKE_PODMAN_LOG"], "a", encoding="utf-8") as f:
     f.write(" ".join(sys.argv[1:]) + "\\n")
 with open(os.environ["FAKE_PODMAN_LOG"] + ".tmpdir", "a", encoding="utf-8") as f:
     f.write(os.environ.get("TMPDIR", "") + "\\n")
-# FAKE_PODMAN_CONTAINERS maps container IDs to their mount sources, for ps and inspect.
+"""
+    + RUN_TOOL
+    + """
+if is_tool_run(sys.argv[1:]):
+    run_tool("podman", sys.argv[1:])
+# FAKE_PODMAN_CONTAINERS maps container IDs to their mount sources, for ps and inspect, and
+# FAKE_PODMAN_LABELLED maps container IDs to their ai-review.workdir label, for ps with a label
+# filter.
 containers = json.loads(os.environ.get("FAKE_PODMAN_CONTAINERS", "{}"))
-if sys.argv[1:2] == ["ps"]:
+labelled = json.loads(os.environ.get("FAKE_PODMAN_LABELLED", "{}"))
+if sys.argv[1:2] == ["ps"] and any(a.startswith("label=") for a in sys.argv):
+    wanted = next(a for a in sys.argv if a.startswith("label="))
+    print("\\n".join(k for k, v in labelled.items() if wanted == f"label=ai-review.workdir={v}"))
+elif sys.argv[1:2] == ["ps"]:
     print("\\n".join(containers))
 elif sys.argv[1:2] == ["inspect"]:
     print("\\n".join(containers.get(sys.argv[-1], [])))
@@ -922,6 +992,7 @@ elif sys.argv[1:3] == ["rm", "-f"]:
     sys.exit(int(os.environ.get("FAKE_PODMAN_RM_STATUS", "0")))
 sys.exit(int(os.environ.get("FAKE_PODMAN_STATUS", "0")))
 """
+)
 
 
 # Stands in for docker, so no test touches a real container: appends each call's argv and
@@ -937,6 +1008,7 @@ import os
 import sys
 """
     + WRITE_OTEL
+    + RUN_TOOL
     + """
 args = sys.argv[1:]
 log = os.environ.get("FAKE_DOCKER_LOG")
@@ -963,6 +1035,8 @@ elif args[:2] == ["volume", "ls"]:
     labelled("FAKE_DOCKER_VOLUMES")
 elif args[:2] == ["volume", "rm"] or args[:1] == ["rm"]:
     status("FAKE_DOCKER_RM_STATUS")
+elif is_tool_run(args):
+    run_tool("docker", args)
 elif args[:2] == ["image", "inspect"]:
     sys.exit(0 if os.environ.get("FAKE_DOCKER_IMAGE_PRESENT") == "1" else 1)
 elif args[:1] == ["pull"]:
@@ -1133,7 +1207,9 @@ class CheckTests(CheckTestCase):
         for harness in ({}, {"AI_REVIEW_HARNESS": ""}):
             with self.subTest(harness=harness):
                 Path(self.output).unlink(missing_ok=True)
-                proc = self.check(OPENAI_API_KEY="", ANTHROPIC_API_KEY="sk-a", **harness)
+                proc = self.check(
+                    OPENAI_API_KEY="", ANTHROPIC_API_KEY="fake-anthropic-key-0000", **harness
+                )
                 self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
                 self.assertEqual(self.github_output(), {"skip": "true"})
                 self.assertIn(
@@ -1575,40 +1651,17 @@ class PrepareTests(PrepareTestCase):
 
 # Stands in for uvx. The agent run (agentic-ci run) records what the script passed to FAKE_LOG,
 # writes the OTEL log when FAKE_OTEL is set and, when asked, writes the review output where
-# agentic-ci would leave it, under the workdir's out/. The usage totals (python) and the MLflow
-# export (agentic-ci mlflow-push) run with a cut-down environment, so they append their argv,
-# environment and working directory to uvx-tools.jsonl next to this file, and take their settings
-# from uvx-tools.json there: "stdout" and "stderr" to print, "status" to exit with, and "stub", a
-# directory with a stand-in agentic_ci package that usage.py runs against.
+# agentic-ci would leave it, under the workdir's out/. Only the agent runs through uvx: the usage
+# totals and the MLflow export run in the agentic-ci image (see RUN_TOOL).
 FAKE_UVX = (
     """
 import json
 import os
-import subprocess
 import sys
 """
     + WRITE_OTEL
     + """
 args = sys.argv[1:]
-here = os.path.dirname(os.path.abspath(sys.argv[0]))
-if args[2:3] == ["python"] or args[2:4] == ["agentic-ci", "mlflow-push"]:
-    with open(os.path.join(here, "uvx-tools.jsonl"), "a", encoding="utf-8") as f:
-        f.write(json.dumps({"argv": args, "env": dict(os.environ), "cwd": os.getcwd()}) + "\\n")
-    config = {}
-    if os.path.exists(os.path.join(here, "uvx-tools.json")):
-        with open(os.path.join(here, "uvx-tools.json"), encoding="utf-8") as f:
-            config = json.load(f)
-    sys.stdout.write(config.get("stdout", ""))
-    sys.stderr.write(config.get("stderr", ""))
-    if "status" in config:
-        sys.exit(config["status"])
-    if args[2:3] == ["python"] and config.get("stub"):
-        # Drops -I, which would ignore PYTHONPATH and so the stand-in package.
-        rest = args[4:]
-        env = {**os.environ, "PYTHONPATH": config["stub"]}
-        sys.exit(subprocess.run([sys.executable, *rest], env=env, check=False).returncode)
-    sys.exit(0)
-
 env_keys = [
     "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GITHUB_TOKEN", "GH_TOKEN",
     "ACTIONS_ID_TOKEN_REQUEST_TOKEN", "ACTIONS_ID_TOKEN_REQUEST_URL", "UV_NO_CONFIG", "TMPDIR",
@@ -1900,7 +1953,9 @@ class ReviewTests(ReviewTestCase):
 
     def test_fails_without_the_plugin_copy(self):
         shutil.rmtree(os.path.join(self.ai_dir, "plugin"))
-        proc = self.review(AI_REVIEW_HARNESS="claude-code", ANTHROPIC_API_KEY="sk-a")
+        proc = self.review(
+            AI_REVIEW_HARNESS="claude-code", ANTHROPIC_API_KEY="fake-anthropic-key-0000"
+        )
         self.assertEqual(proc.returncode, 1)
         self.assertFalse(os.path.exists(self.log))
 
@@ -2380,7 +2435,8 @@ class CleanupTests(ScriptTestCase):
     def test_cleanup_without_containers_only_lists_them(self):
         proc = self.cleanup()
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertEqual([c.split()[0] for c in self.podman_calls()], ["ps"])
+        # One listing by the workdir label (the tool containers), one by name (the agent's).
+        self.assertEqual([c.split()[0] for c in self.podman_calls()], ["ps", "ps"])
 
     def test_a_failed_container_removal_still_removes_the_workdirs_and_fails(self):
         proc = self.cleanup(

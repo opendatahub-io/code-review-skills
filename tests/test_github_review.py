@@ -183,7 +183,7 @@ class GitHubTestCase(PanelTestCase):
             "GIT_CONFIG_GLOBAL": "/dev/null",
             "GIT_CONFIG_NOSYSTEM": "1",
             "GITHUB_ACTIONS": "true",
-            "GITHUB_TOKEN": "tok",
+            "GITHUB_TOKEN": "fake-github-token-0000",
             "GITHUB_REPOSITORY": "o/r",
             "GITHUB_EVENT_PATH": str(event),
             "GITHUB_SERVER_URL": "https://github.com",

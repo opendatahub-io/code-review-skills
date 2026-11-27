@@ -1,15 +1,16 @@
 """Token usage and estimated cost of one review run, read from agentic-ci's OTEL log.
 
-The action's review step runs this with the agentic-ci release that ran the agent, so the
-totals and the price map are that release's:
+The action's review step runs this in the agentic-ci image it already pulled, without network,
+so the totals and the price map are that image's release:
 
-    uvx --from agentic-ci==<version> python -I usage.py LOG OUT --job-name NAME --mode MODE
+    python3 -E -P usage.py LOG OUT --job-name NAME --mode MODE
 
 LOG is the runner's private copy of the log agentic-ci wrote. It came from a directory the agent
 could write, so it is untrusted data: only numbers and span ids are read from it, and a record of
-the wrong shape is skipped. The script prints the totals for the job log, writes them to OUT as a
-small JSON object for review.py's summary line, and appends a code-review-usage span under the
-run's root span to LOG, so an MLflow export can group runs by job and mode.
+the wrong shape is skipped. The script prints the agentic-ci release that prices the run, which
+the action compares with agentic_ci_version, and the totals for the job log, writes the totals
+to OUT as a small JSON object for review.py's summary line, and appends a code-review-usage span
+under the run's root span to LOG, so an MLflow export can group runs by job and mode.
 
 Exit status: 0 when OUT was written, 3 when the log holds no token data (OUT is not written),
 1 on any other failure.
@@ -20,6 +21,7 @@ Only the harnesses the action runs are covered: codex and claude-code.
 from __future__ import annotations
 
 import argparse
+import importlib.metadata
 import json
 import math
 import re
@@ -362,6 +364,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--mode", default="", help="standard or deep, for the MLflow span")
     args = parser.parse_args(argv)
+
+    # The release that prices the run, which the action compares with agentic_ci_version.
+    try:
+        print(f"agentic-ci version: {importlib.metadata.version('agentic-ci')}", flush=True)
+    except importlib.metadata.PackageNotFoundError:
+        print("agentic-ci version: unknown", flush=True)
 
     # Only the exception's type is printed: its message can quote the untrusted log, and a line
     # of it could start a workflow command.
