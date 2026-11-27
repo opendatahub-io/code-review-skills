@@ -47,10 +47,17 @@ jobs:
         id: start
         run: echo "time=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >>"$GITHUB_OUTPUT"
 
+      # A stub rules file, so the input reaches prepare and the mount end to end. The harness
+      # is codex here, so the review step drops it with the documented warning.
+      - name: Write a stub org rules file
+        run: |
+          printf 'tone_instructions: Be brief.\n' >"$RUNNER_TEMP/org-rules.yaml"
+
       - name: Run the action
         uses: ./
         with:
           recommend_deep_review: 'true'
+          org_review_rules: ${{ runner.temp }}/org-rules.yaml
           # The deep job below also runs on Renovate pull requests, after this one. A name no job
           # has keeps this review from standing down for it, so both paths are tested on the
           # same commit.

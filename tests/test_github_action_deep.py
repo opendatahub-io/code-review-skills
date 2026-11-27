@@ -54,13 +54,15 @@ SAFE_DIRECTORY = (
 )
 
 
-def deep_prompt(harness: str, base: str, head: str) -> str:
+def deep_prompt(harness: str, base: str, head: str, org_rules: bool = False) -> str:
     task = (
         f"the committed changes in /workspace/repo from base {base} to head {head}. "
         f"{SAFE_DIRECTORY} Run its triage from inside /workspace/repo with --base {base} "
         f"--head {head}, pass --gitlab-json /workspace/out/ai-review-output.json to its final "
         "report command, and do not post anything."
     )
+    if org_rules and harness == "claude-code":
+        task += " Apply the org review rules at /workspace/org-rules.yaml."
     if harness == "claude-code":
         return f"/code-review-skills:code-review-panel Review {task}"
     return f"Invoke the /code-review-skills:code-review-panel skill to review {task}"
@@ -197,9 +199,15 @@ class DeepReviewTests(ReviewTestCase):
         # Stands in for the .git prepare builds. The review step only tests that it exists.
         os.makedirs(os.path.join(self.repo_dir, ".git"))
 
-    def deep_argv(self, harness: str = "codex", minutes: int = 75) -> list[str]:
-        prompt = deep_prompt(harness, self.BASE, self.HEAD)
+    def deep_argv(
+        self, harness: str = "codex", minutes: int = 75, org_rules: bool = False
+    ) -> list[str]:
+        prompt = deep_prompt(harness, self.BASE, self.HEAD, org_rules=org_rules)
         return self.expected_argv(harness=harness, minutes=minutes, prompt=prompt)
+
+    def deep_prompt_from_record(self) -> str:
+        argv = self.record()["argv"]
+        return argv[argv.index("--effort") + 2]
 
     def test_deep_argv_for_claude_code(self):
         proc = self.review(AI_REVIEW_MODE="deep", AI_REVIEW_HARNESS="claude-code")
@@ -261,6 +269,38 @@ class DeepReviewTests(ReviewTestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual(self.record()["argv"], self.deep_argv())
         self.assertNotIn("::warning::", proc.stdout)
+
+    def test_deep_argv_names_the_org_rules_file_for_claude_code(self):
+        write(self.ai_dir, "org-rules.yaml", "tone_instructions: Be brief.\n")
+        proc = self.review(AI_REVIEW_MODE="deep", AI_REVIEW_HARNESS="claude-code")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(
+            self.record()["argv"], self.deep_argv(harness="claude-code", org_rules=True)
+        )
+        prompt = self.deep_prompt_from_record()
+        self.assertIn("Apply the org review rules at /workspace/org-rules.yaml.", prompt)
+        self.assertNotIn("instructions", prompt)
+        self.assertNotIn("\n", prompt)
+        self.assertNotIn("::warning::", proc.stdout)
+
+    def test_codex_deep_prompt_does_not_get_the_org_rules_sentence(self):
+        write(self.ai_dir, "org-rules.yaml", "tone_instructions: Be brief.\n")
+        proc = self.review(AI_REVIEW_MODE="deep", AI_REVIEW_HARNESS="codex", OPENAI_API_KEY="k")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(self.record()["argv"], self.deep_argv(harness="codex"))
+        prompt = self.deep_prompt_from_record()
+        self.assertNotIn("org review rules", prompt)
+        self.assertNotIn("/workspace/org-rules.yaml", prompt)
+        self.assertIn("::warning::org_review_rules is not passed to the codex harness", proc.stdout)
+
+    def test_the_deep_prompt_has_no_org_rules_sentence_without_the_file(self):
+        for harness in ("claude-code", "codex"):
+            with self.subTest(harness):
+                Path(self.log).unlink(missing_ok=True)
+                proc = self.review(AI_REVIEW_MODE="deep", AI_REVIEW_HARNESS=harness)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertNotIn("org review rules", self.deep_prompt_from_record())
+                self.assertNotIn("::warning::", proc.stdout)
 
     def test_standard_mode_with_instructions_does_not_warn(self):
         write(self.ai_dir, "instructions.md", "Focus on tests\n")
@@ -492,6 +532,19 @@ class ContainerRepoTests(PrepareTestCase):
                 _repo, _base, head = self.prepared(AI_REVIEW_MODE=mode)
                 self.assertEqual(self.container_git("rev-parse", "HEAD"), head)
                 self.assertLessEqual(self.config_keys(), CONFIG_ALLOW_LIST)
+
+    def test_deep_mode_still_writes_the_org_rules(self):
+        repo, base, head = self.make_pr()
+        write(self.tmp, "org-rules-src.yaml", "x\n")
+        proc = self.prepare(
+            repo,
+            base,
+            head,
+            AI_REVIEW_MODE="deep",
+            AI_REVIEW_ORG_RULES=os.path.join(self.tmp, "org-rules-src.yaml"),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(Path(self.ai_dir, "org-rules.yaml").read_text(encoding="utf-8"), "x\n")
 
     def test_deep_mode_writes_no_instructions_into_the_mount(self):
         repo, base, head = self.make_pr()

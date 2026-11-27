@@ -100,6 +100,8 @@ on:
       deep_review_label:
         type: string
         default: deep-review
+      # The org review rules need harness: claude-code until the codex images ship the
+      # updated skill; with codex the action drops them with a warning.
       harness:
         type: string
         default: codex
@@ -127,6 +129,11 @@ on:
         required: false
       AI_REVIEW_APP_PRIVATE_KEY:
         required: false
+      # A fine-grained, read-only token scoped to the security-config repository alone,
+      # for the org review rules fetch below. Optional: without it the fetch warns and
+      # the reviews run without the org rules.
+      ORG_RULES_TOKEN:
+        required: false
 
 jobs:
   review:
@@ -147,6 +154,28 @@ jobs:
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
       GCP_SERVICE_ACCOUNT_KEY: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
     steps:
+      # The org-wide review rules, fetched here once with the org's read-only token, so the
+      # action itself holds no token for them and every caller gets the same rules. The step
+      # outputs the file's path, never its content: the runner prints step env values into
+      # viewable logs. A failure or an over-cap file only warns and the review runs without
+      # the rules, so one oversized rules file never fails every caller at once; fork pull
+      # requests are skipped before any review runs.
+      - name: Fetch the org review rules
+        id: org_rules
+        env:
+          GH_TOKEN: ${{ secrets.ORG_RULES_TOKEN }}
+        run: |
+          if timeout 30 gh api --hostname github.com -H "Accept: application/vnd.github.raw" \
+            "repos/opendatahub-io/security-config/contents/configs/.coderabbit.yaml?ref=main" \
+            >"$RUNNER_TEMP/org-rules.yaml" 2>"$RUNNER_TEMP/org-rules.err"; then
+            if [ "$(wc -c <"$RUNNER_TEMP/org-rules.yaml")" -le 102400 ]; then
+              echo "path=$RUNNER_TEMP/org-rules.yaml" >>"$GITHUB_OUTPUT"
+            else
+              echo '::warning::Org review rules are over 100 KiB: reviewing without them.'
+            fi
+          else
+            echo "::warning::Org review rules unavailable: $(cat "$RUNNER_TEMP/org-rules.err")"
+          fi
       # Replace with the full commit SHA of the code-review-skills version you reviewed.
       - uses: opendatahub-io/code-review-skills@0000000000000000000000000000000000000000
         with:
@@ -156,6 +185,7 @@ jobs:
           harness: ${{ inputs.harness }}
           model: ${{ inputs.model }}
           review_instructions: ${{ inputs.review_instructions }}
+          org_review_rules: ${{ steps.org_rules.outputs.path }}
           recommend_deep_review: ${{ inputs.recommend_deep_review }}
           suggest_reviewers: ${{ inputs.suggest_reviewers }}
           app_id: ${{ secrets.AI_REVIEW_APP_ID }}
@@ -169,6 +199,8 @@ Notes:
 - A called workflow sees the caller's event, so `github.event_name` is still `pull_request` and the action works unchanged.
 - `runs-on: ubuntu-latest` suits the default `openshell` backend, which starts a privileged Docker container. On a self-hosted runner that container is root on the host. See [Backends](../README.md#backends) in the README for the backend choice and the `podman` fallback.
 - Pin the action by full commit SHA here, and have callers pin this workflow by full commit SHA too. A branch reference would let anyone who can push to the central repository run new code with every caller's secrets.
+- `ORG_RULES_TOKEN` is a fine-grained, read-only GitHub token scoped to the security-config repository alone. The example caller below passes its secrets with `secrets: inherit`, so an organization-level secret reaches the central workflow; a calling repository without access to it simply reviews without the org rules.
+- The org review rules reach the review only with `harness: claude-code`. The default `codex` harness drops them with a runner warning until the codex images ship the updated `github-code-review` skill, so a workflow that keeps the default posts reviews without the rules in the meantime.
 
 ## The caller in each repository
 
